@@ -1,37 +1,23 @@
 {
   "name": "gdsii-view",
   "displayName": "GDSII View",
-  "description": "",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.125.0"
   },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [],
-  "main": "./extension.js",
+  "main": "./extension.cjs",
   "contributes": {
-    "commands": [{
-      "command": "gdsii-view.helloWorld",
-      "title": "Hello World"
-    }]
-  },
-  "scripts": {
-    "lint": "eslint .",
-    "pretest": "npm run lint",
-    "test": "vscode-test"
-  },
-  "devDependencies": {
-    "@types/vscode": "^1.125.0",
-    "@types/mocha": "^10.0.10",
-    "@types/node": "24.x",
-    "eslint": "^10.5.0",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0"
-  },
-  "overrides": {
-    "diff": "^8.0.4",
-    "serialize-javascript": "^7.0.6"
+    "customEditors": [
+      {
+        "viewType": "gdsii-view.editor",
+        "displayName": "GDSII Viewer",
+        "selector": [
+          {
+            "filenamePattern": "*.gds"
+          }
+        ],
+        "priority": "default"
+      }
+    ]
   }
 }
