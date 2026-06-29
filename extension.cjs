@@ -27,12 +27,26 @@ class GdsEditorProvider {
         };
     }
 
-    async resolveCustomEditor(document, webviewPanel, _token) {
+        async resolveCustomEditor(document, webviewPanel, _token) {
         try {
-            webviewPanel.webview.options = { enableScripts: true };
+            // 1. Grant permission to execute scripts and access local extensions directories
+            webviewPanel.webview.options = { 
+                enableScripts: true,
+                localResourceRoots: [vscode.Uri.file(this.context.extensionPath)]
+            };
 
+            // 2. Fetch the absolute disk file path vectors
             const htmlPath = path.join(this.context.extensionPath, 'viewer.html');
-            webviewPanel.webview.html = fs.readFileSync(htmlPath, 'utf8');
+            const jsPath = path.join(this.context.extensionPath, 'viewer.js');
+
+            // 3. Convert the native viewer.js file path into an authenticated Webview URI
+            const jsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(jsPath));
+
+            // 4. Load the base HTML text and dynamically swap out the standard script reference
+            let htmlContent = fs.readFileSync(htmlPath, 'utf8');
+            htmlContent = htmlContent.replace('src="viewer.js"', 'src="' + jsWebviewUri.toString() + '"');
+            
+            webviewPanel.webview.html = htmlContent;
 
             logger.appendLine('\n>>> Intercepted layout open call for file: ' + document.uri.fsPath);
             const fileData = await vscode.workspace.fs.readFile(document.uri);
@@ -47,6 +61,24 @@ class GdsEditorProvider {
 
             const result = this.parseWithOfficialLibrary(fileData, parseGDS, RecordType);
 
+            webviewPanel.webview.onDidReceiveMessage(async (message) => {
+                if (message.command === 'loadLypFile') {
+                    const options = {
+                        canSelectMany: false,
+                        openLabel: 'Load Layer Properties',
+                        filters: { 'KLayout Properties': ['lyp'] }
+                    };
+                    const fileUri = await vscode.window.showOpenDialog(options);
+                    if (fileUri && fileUri[0]) {
+                        const lypRawText = fs.readFileSync(fileUri[0].fsPath, 'utf8');
+                        webviewPanel.webview.postMessage({
+                            type: 'lypLoaded',
+                            text: lypRawText
+                        });
+                    }
+                }
+            });
+
             logger.appendLine('>>> Streaming parsed data payload down into WebGL Webview context...');
             webviewPanel.webview.postMessage({
                 type: 'init',
@@ -58,6 +90,7 @@ class GdsEditorProvider {
             vscode.window.showErrorMessage("GDSII Viewer Error: " + err.message);
         }
     }
+
 
     parseWithOfficialLibrary(fileBuffer, parseGDS, RecordType) {
         logger.appendLine('>>> Iterating over official library binary generator stream...');
