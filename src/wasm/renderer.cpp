@@ -57,15 +57,34 @@ struct PolygonRange {
     GLsizei count;
 };
 
-// One VBO per layer holding all of that layer's polygons back-to-back, plus
-// per-polygon (first, count) ranges so each polygon still draws as its own
-// LINE_LOOP (loops can't be naively concatenated -- the loop-closing edge
-// would connect unrelated polygons).
+// One pair of VBOs per layer (fill triangles + outline points) holding all
+// of that layer's polygons back-to-back, plus per-polygon (first, count)
+// ranges so each polygon still draws as its own primitive group -- LINE_LOOP
+// loops can't be naively concatenated (the loop-closing edge would connect
+// unrelated polygons), and triangle fans from ear-clipping are similarly
+// per-polygon.
 struct LayerBuffer {
     uint32_t layer;
-    GLuint vbo = 0;
-    std::vector<PolygonRange> polygons;
-    std::array<float, 4> color{};
+    GLuint outline_vbo = 0;
+    GLuint fill_vbo = 0;
+    std::vector<PolygonRange> outline_polygons;
+    std::vector<PolygonRange> fill_polygons;
+    std::array<float, 4> fill_color{};
+    std::array<float, 4> frame_color{};
+    bool visible = true;
+};
+
+// Parsed out of a single <properties> block in a .lyp file. Persists across
+// GDS reloads (same as the old g_lyp_colors did) so re-opening/replacing the
+// GDS file keeps previously-applied layer styling.
+struct LypEntry {
+    std::string name;
+    std::array<float, 4> fill_color{};
+    std::array<float, 4> frame_color{};
+    bool has_fill = false;
+    bool has_frame = false;
+    bool visible = true;
+    int order = 0;
 };
 
 GLuint g_program = 0;
@@ -77,7 +96,8 @@ GLint g_loc_offset = -1;
 GLint g_loc_zoom = -1;
 
 std::vector<LayerBuffer> g_layers;
-std::unordered_map<uint32_t, std::array<float, 4>> g_lyp_colors;
+std::unordered_map<uint32_t, LypEntry> g_lyp_info;
+int g_lyp_order_counter = 0;
 
 float g_zoom = 1.0f;
 float g_pan_x = 0.0f;
@@ -128,6 +148,9 @@ bool init_gl() {
 
     glGenVertexArrays(1, &g_vao);
     glBindVertexArray(g_vao);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     return true;
 }
 
@@ -138,6 +161,127 @@ std::array<float, 4> default_color(uint32_t layer) {
     float g = (float)((layer * 115) % 200 + 55) / 255.0f;
     float b = (float)((layer * 175) % 200 + 55) / 255.0f;
     return {r, g, b, 0.8f};
+}
+
+// Resolves a layer's fill/frame color + visibility from g_lyp_info (falling
+// back to the hash color above for layers with no .lyp entry, or for the
+// half of a fill/frame pair that's missing from the entry).
+void apply_layer_colors(LayerBuffer& layer) {
+    auto it = g_lyp_info.find(layer.layer);
+    if (it == g_lyp_info.end()) {
+        std::array<float, 4> base = default_color(layer.layer);
+        layer.fill_color = {base[0], base[1], base[2], 0.4f};
+        layer.frame_color = {base[0], base[1], base[2], 0.9f};
+        layer.visible = true;
+        return;
+    }
+    const LypEntry& e = it->second;
+    std::array<float, 4> base = default_color(layer.layer);
+    if (e.has_fill) {
+        layer.fill_color = e.fill_color;
+    } else if (e.has_frame) {
+        layer.fill_color = {e.frame_color[0], e.frame_color[1], e.frame_color[2], 0.45f};
+    } else {
+        layer.fill_color = {base[0], base[1], base[2], 0.4f};
+    }
+    if (e.has_frame) {
+        layer.frame_color = e.frame_color;
+    } else if (e.has_fill) {
+        layer.frame_color = {e.fill_color[0], e.fill_color[1], e.fill_color[2], 0.9f};
+    } else {
+        layer.frame_color = {base[0], base[1], base[2], 0.9f};
+    }
+    layer.visible = e.visible;
+}
+
+void apply_lyp_to_layers() {
+    for (LayerBuffer& layer : g_layers) apply_layer_colors(layer);
+}
+
+std::string rgba_to_css(const std::array<float, 4>& c) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "rgba(%d,%d,%d,%.3f)", (int)std::lround(c[0] * 255.0f),
+             (int)std::lround(c[1] * 255.0f), (int)std::lround(c[2] * 255.0f), c[3]);
+    return buf;
+}
+
+// Ear-clipping triangulation for filled rendering. GDS polygons are simple
+// (non-self-intersecting) by convention -- including the "comb" slits some
+// tools use to represent holes -- so plain ear clipping is sufficient; no
+// need for a general/robust tessellator. Capped at kMaxTriangulatePoints
+// since this is naive O(n^3) in the worst case (each of the ~n ear removals
+// rescans the remaining ~n vertices against ~n inside-triangle tests); large
+// polygons just render outline-only rather than risk stalling the load on a
+// single pathological shape. Appends triangle vertex indices (into pts) to
+// out_indices; leaves it untouched (empty, if previously cleared by the
+// caller) on failure.
+constexpr uint64_t kMaxTriangulatePoints = 512;
+
+void triangulate(const Array<Vec2>& pts, std::vector<uint32_t>& out_indices) {
+    uint64_t n = pts.count;
+    if (n < 3 || n > kMaxTriangulatePoints) return;
+
+    std::vector<uint32_t> remaining(n);
+    for (uint64_t i = 0; i < n; i++) remaining[i] = (uint32_t)i;
+
+    double area2 = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const Vec2& a = pts[i];
+        const Vec2& b = pts[(i + 1) % n];
+        area2 += a.x * b.y - b.x * a.y;
+    }
+    if (area2 < 0) std::reverse(remaining.begin(), remaining.end());
+
+    auto cross = [](const Vec2& o, const Vec2& a, const Vec2& b) {
+        return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    };
+    auto point_in_tri = [&](const Vec2& p, const Vec2& a, const Vec2& b, const Vec2& c) {
+        double d1 = cross(a, b, p);
+        double d2 = cross(b, c, p);
+        double d3 = cross(c, a, p);
+        bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+        bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+        return !(has_neg && has_pos);
+    };
+
+    uint64_t guard = 0;
+    uint64_t max_iters = n * n + 16;
+    while (remaining.size() > 3 && guard++ < max_iters) {
+        uint64_t m = remaining.size();
+        bool ear_found = false;
+        for (uint64_t i = 0; i < m; i++) {
+            uint64_t iprev = (i + m - 1) % m;
+            uint64_t inext = (i + 1) % m;
+            const Vec2& a = pts[remaining[iprev]];
+            const Vec2& b = pts[remaining[i]];
+            const Vec2& c = pts[remaining[inext]];
+            if (cross(a, b, c) <= 0) continue;  // reflex/collinear vertex, not a convex ear tip
+            bool any_inside = false;
+            for (uint64_t j = 0; j < m; j++) {
+                if (j == iprev || j == i || j == inext) continue;
+                if (point_in_tri(pts[remaining[j]], a, b, c)) {
+                    any_inside = true;
+                    break;
+                }
+            }
+            if (any_inside) continue;
+            out_indices.push_back(remaining[iprev]);
+            out_indices.push_back(remaining[i]);
+            out_indices.push_back(remaining[inext]);
+            remaining.erase(remaining.begin() + i);
+            ear_found = true;
+            break;
+        }
+        // Degenerate input (e.g. self-touching/duplicate points) can leave no
+        // valid ear -- bail with whatever triangles were already found rather
+        // than looping; partial fill is fine, the outline still draws fully.
+        if (!ear_found) return;
+    }
+    if (remaining.size() == 3) {
+        out_indices.push_back(remaining[0]);
+        out_indices.push_back(remaining[1]);
+        out_indices.push_back(remaining[2]);
+    }
 }
 
 void set_inner_html(const char* id, const std::string& html) {
@@ -196,11 +340,23 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
     glUniform1f(g_loc_zoom, g_zoom);
 
     for (const LayerBuffer& layer : g_layers) {
-        glBindBuffer(GL_ARRAY_BUFFER, layer.vbo);
+        if (!layer.visible) continue;
+
+        if (layer.fill_vbo) {
+            glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
+            glEnableVertexAttribArray(g_loc_position);
+            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glUniform4fv(g_loc_color, 1, layer.fill_color.data());
+            for (const PolygonRange& range : layer.fill_polygons) {
+                glDrawArrays(GL_TRIANGLES, range.first, range.count);
+            }
+        }
+
+        glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
         glEnableVertexAttribArray(g_loc_position);
         glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-        glUniform4fv(g_loc_color, 1, layer.color.data());
-        for (const PolygonRange& range : layer.polygons) {
+        glUniform4fv(g_loc_color, 1, layer.frame_color.data());
+        for (const PolygonRange& range : layer.outline_polygons) {
             glDrawArrays(GL_LINE_LOOP, range.first, range.count);
         }
     }
@@ -233,7 +389,8 @@ void resize_canvas() {
 
 void clear_layers() {
     for (LayerBuffer& layer : g_layers) {
-        if (layer.vbo) glDeleteBuffers(1, &layer.vbo);
+        if (layer.outline_vbo) glDeleteBuffers(1, &layer.outline_vbo);
+        if (layer.fill_vbo) glDeleteBuffers(1, &layer.fill_vbo);
     }
     g_layers.clear();
 }
@@ -271,9 +428,9 @@ std::string trim(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
-// alpha == 0 signals "invalid hex" to the caller (mirrors the old
-// hexToRgb() returning null).
-std::array<float, 4> hex_to_rgba(const std::string& hex_in) {
+// alpha output of 0 signals "invalid hex" to the caller (mirrors the old
+// hexToRgb() returning null); the requested alpha is otherwise always > 0.
+std::array<float, 4> hex_to_rgba(const std::string& hex_in, float alpha) {
     std::string hex = trim(hex_in);
     if (!hex.empty() && hex[0] == '#') hex = hex.substr(1);
     if (hex.size() != 6) return {0.0f, 0.0f, 0.0f, 0.0f};
@@ -284,7 +441,7 @@ std::array<float, 4> hex_to_rgba(const std::string& hex_in) {
         byte_buf[1] = hex[pos + 1];
         return (float)strtol(byte_buf, nullptr, 16);
     };
-    return {hex_byte(0) / 255.0f, hex_byte(2) / 255.0f, hex_byte(4) / 255.0f, 0.8f};
+    return {hex_byte(0) / 255.0f, hex_byte(2) / 255.0f, hex_byte(4) / 255.0f, alpha};
 }
 
 bool on_mousedown(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*userData*/) {
@@ -377,6 +534,8 @@ void loadAndRenderGds(const std::string& path) {
 
         std::vector<float> vertices;
         vertices.reserve(point_total * 2);
+        std::vector<float> fill_vertices;
+        std::vector<uint32_t> tri_indices;
 
         for (Polygon* poly : polys) {
             GLint first = (GLint)(vertices.size() / 2);
@@ -389,16 +548,34 @@ void loadAndRenderGds(const std::string& path) {
                 min_y = std::min(min_y, pt.y);
                 max_y = std::max(max_y, pt.y);
             }
-            layer_buffer.polygons.push_back({first, (GLsizei)poly->point_array.count});
+            layer_buffer.outline_polygons.push_back({first, (GLsizei)poly->point_array.count});
             total_polygons++;
+
+            tri_indices.clear();
+            triangulate(poly->point_array, tri_indices);
+            if (!tri_indices.empty()) {
+                GLint fill_first = (GLint)(fill_vertices.size() / 2);
+                for (uint32_t idx : tri_indices) {
+                    const Vec2& pt = poly->point_array[idx];
+                    fill_vertices.push_back((float)pt.x);
+                    fill_vertices.push_back((float)pt.y);
+                }
+                layer_buffer.fill_polygons.push_back({fill_first, (GLsizei)tri_indices.size()});
+            }
         }
 
-        glGenBuffers(1, &layer_buffer.vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, layer_buffer.vbo);
+        glGenBuffers(1, &layer_buffer.outline_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, layer_buffer.outline_vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertices.size() * sizeof(float)), vertices.data(), GL_STATIC_DRAW);
 
-        auto color_it = g_lyp_colors.find(layer_number);
-        layer_buffer.color = color_it != g_lyp_colors.end() ? color_it->second : default_color(layer_number);
+        if (!fill_vertices.empty()) {
+            glGenBuffers(1, &layer_buffer.fill_vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, layer_buffer.fill_vbo);
+            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(fill_vertices.size() * sizeof(float)), fill_vertices.data(),
+                         GL_STATIC_DRAW);
+        }
+
+        apply_layer_colors(layer_buffer);
 
         g_layers.push_back(std::move(layer_buffer));
 
@@ -430,11 +607,13 @@ void loadAndRenderGds(const std::string& path) {
 }
 
 void loadLypText(const std::string& xml_text) {
-    g_lyp_colors.clear();
+    g_lyp_info.clear();
+    g_lyp_order_counter = 0;
 
-    // Mirrors the old JS parseLypText(): split on "<properties>" and, within
-    // each chunk up to the next occurrence, look for a <source>/layer number
-    // alongside a <fill-color> or <frame-color>.
+    // Split on "<properties>" and, within each chunk up to the next
+    // occurrence, pull out <source> (layer[/datatype]), <name>, <visible>,
+    // and <fill-color>/<frame-color>. Nested group members (<group-members>)
+    // aren't handled -- same limitation the old color-only parser had.
     const std::string marker = "<properties>";
     size_t marker_pos = 0;
     while ((marker_pos = xml_text.find(marker, marker_pos)) != std::string::npos) {
@@ -444,26 +623,91 @@ void loadLypText(const std::string& xml_text) {
         std::string block = xml_text.substr(content_start, content_end - content_start);
         marker_pos = content_end;
 
-        std::string source_text, color_text;
-        bool has_source = extract_tag_value(block, "source", source_text);
-        bool has_color = extract_tag_value(block, "fill-color", color_text) ||
-                          extract_tag_value(block, "frame-color", color_text);
-        if (!has_source || !has_color) continue;
-
+        std::string source_text;
+        if (!extract_tag_value(block, "source", source_text)) continue;
         std::string layer_text = trim(source_text.substr(0, source_text.find('/')));
         if (layer_text.empty()) continue;
         char* endptr = nullptr;
         long layer_number = strtol(layer_text.c_str(), &endptr, 10);
         if (endptr == layer_text.c_str()) continue;
 
-        std::array<float, 4> rgba = hex_to_rgba(color_text);
-        if (rgba[3] > 0) g_lyp_colors[(uint32_t)layer_number] = rgba;
+        LypEntry entry;
+        entry.order = g_lyp_order_counter++;
+
+        std::string fill_text, frame_text;
+        entry.has_fill = extract_tag_value(block, "fill-color", fill_text);
+        entry.has_frame = extract_tag_value(block, "frame-color", frame_text);
+        if (entry.has_fill) {
+            entry.fill_color = hex_to_rgba(fill_text, 0.55f);
+            if (entry.fill_color[3] == 0.0f) entry.has_fill = false;
+        }
+        if (entry.has_frame) {
+            entry.frame_color = hex_to_rgba(frame_text, 0.9f);
+            if (entry.frame_color[3] == 0.0f) entry.has_frame = false;
+        }
+        if (!entry.has_fill && !entry.has_frame) continue;
+
+        std::string name_text;
+        if (extract_tag_value(block, "name", name_text)) entry.name = trim(name_text);
+
+        std::string visible_text;
+        if (extract_tag_value(block, "visible", visible_text)) {
+            std::string v = trim(visible_text);
+            entry.visible = !(v == "false" || v == "0");
+        }
+
+        g_lyp_info[(uint32_t)layer_number] = entry;
     }
 
-    for (LayerBuffer& layer : g_layers) {
-        auto it = g_lyp_colors.find(layer.layer);
-        if (it != g_lyp_colors.end()) layer.color = it->second;
+    apply_lyp_to_layers();
+    request_redraw();
+}
+
+// Small UI-facing summary (layer number, display name, CSS colors,
+// visibility) for building the sidebar layer list in JS -- no per-polygon
+// geometry crosses this boundary, just one short string/bool/number tuple
+// per layer. Ordered with .lyp-defined layers first (in the order they
+// appeared in the file, matching KLayout's own layer panel), then any
+// .lyp-less layers present in the GDS, sorted numerically.
+val getLayers() {
+    std::vector<const LayerBuffer*> ordered;
+    ordered.reserve(g_layers.size());
+    for (const LayerBuffer& l : g_layers) ordered.push_back(&l);
+
+    std::sort(ordered.begin(), ordered.end(), [](const LayerBuffer* a, const LayerBuffer* b) {
+        auto ita = g_lyp_info.find(a->layer);
+        auto itb = g_lyp_info.find(b->layer);
+        bool has_a = ita != g_lyp_info.end();
+        bool has_b = itb != g_lyp_info.end();
+        if (has_a != has_b) return has_a;
+        if (has_a && has_b) return ita->second.order < itb->second.order;
+        return a->layer < b->layer;
+    });
+
+    val result = val::array();
+    int idx = 0;
+    for (const LayerBuffer* l : ordered) {
+        val obj = val::object();
+        obj.set("layer", l->layer);
+        auto it = g_lyp_info.find(l->layer);
+        obj.set("name", it != g_lyp_info.end() ? it->second.name : std::string());
+        obj.set("fillColor", rgba_to_css(l->fill_color));
+        obj.set("frameColor", rgba_to_css(l->frame_color));
+        obj.set("visible", l->visible);
+        result.set(idx++, obj);
     }
+    return result;
+}
+
+void setLayerVisible(uint32_t layer_number, bool visible) {
+    for (LayerBuffer& l : g_layers) {
+        if (l.layer == layer_number) {
+            l.visible = visible;
+            break;
+        }
+    }
+    auto it = g_lyp_info.find(layer_number);
+    if (it != g_lyp_info.end()) it->second.visible = visible;
     request_redraw();
 }
 
@@ -482,4 +726,6 @@ int main() {
 EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("loadAndRenderGds", &loadAndRenderGds);
     function("loadLypText", &loadLypText);
+    function("getLayers", &getLayers);
+    function("setLayerVisible", &setLayerVisible);
 }
