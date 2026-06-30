@@ -45,12 +45,61 @@ const char* kVertexShaderSrc =
     "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
     "}";
 
+// Fill polygons are stippled rather than solid-filled so that overlapping
+// layers (and whatever is drawn underneath them) stay visible through the
+// gaps -- a flat semi-transparent fill makes stacked layers blur into mud
+// once you have more than two or three on screen. Several pattern *kinds*
+// (not just one hatch angle) exist because two adjacent layers both doing
+// 45-degree lines are still hard to tell apart at a glance; KLayout's .lyp
+// stipple patterns solve the same problem the same way. Patterns are
+// computed in screen space (gl_FragCoord) rather than world space so the
+// pitch stays a constant pixel cadence regardless of zoom; world-space
+// patterns would turn into solid fill when zoomed in and disappear when
+// zoomed out. Outlines (u_useHatch=0) are unaffected.
 const char* kFragmentShaderSrc =
     "#version 300 es\n"
     "precision highp float;\n"
     "uniform vec4 u_color;\n"
+    "uniform float u_useHatch;\n"
+    "uniform float u_patternType;\n"
+    "uniform float u_hatchAngle;\n"
+    "uniform float u_hatchSpacing;\n"
+    "uniform float u_hatchWidth;\n"
     "out vec4 fragColor;\n"
-    "void main() { fragColor = u_color; }";
+    "float lineMask(float coord, float spacing, float halfWidth) {\n"
+    "    float t = mod(coord, spacing);\n"
+    "    float d = min(t, spacing - t);\n"
+    "    float aa = fwidth(coord) * 0.5 + 0.001;\n"
+    "    return 1.0 - smoothstep(halfWidth - aa, halfWidth + aa, d);\n"
+    "}\n"
+    "void main() {\n"
+    "    float alpha = u_color.a;\n"
+    "    if (u_useHatch > 0.5) {\n"
+    "        float c = cos(u_hatchAngle);\n"
+    "        float s = sin(u_hatchAngle);\n"
+    "        vec2 p = gl_FragCoord.xy;\n"
+    "        float u = p.x * c + p.y * s;\n"
+    "        float v = -p.x * s + p.y * c;\n"
+    "        int patternType = int(u_patternType + 0.5);\n"
+    "        float mask;\n"
+    "        if (patternType == 0) {\n"
+    "            mask = lineMask(u, u_hatchSpacing, u_hatchWidth);\n"
+    "        } else if (patternType == 1) {\n"
+    "            mask = max(lineMask(u, u_hatchSpacing, u_hatchWidth), lineMask(v, u_hatchSpacing, u_hatchWidth));\n"
+    "        } else if (patternType == 2) {\n"
+    "            float du = mod(u, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
+    "            float dv = mod(v, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
+    "            float dist = length(vec2(du, dv));\n"
+    "            float aa = fwidth(dist) + 0.001;\n"
+    "            float dotRadius = u_hatchWidth * 1.7;\n"
+    "            mask = 1.0 - smoothstep(dotRadius - aa, dotRadius + aa, dist);\n"
+    "        } else {\n"
+    "            mask = max(lineMask(p.x, u_hatchSpacing, u_hatchWidth), lineMask(p.y, u_hatchSpacing, u_hatchWidth));\n"
+    "        }\n"
+    "        alpha = min(u_color.a * 1.4, 0.7) * mask;\n"
+    "    }\n"
+    "    fragColor = vec4(u_color.rgb, alpha);\n"
+    "}";
 
 struct PolygonRange {
     GLint first;
@@ -71,6 +120,8 @@ struct LayerBuffer {
     std::vector<PolygonRange> fill_polygons;
     std::array<float, 4> fill_color{};
     std::array<float, 4> frame_color{};
+    float hatch_angle = 0.0f;
+    float pattern_type = 0.0f;  // see kFragmentShaderSrc's patternType branches
     bool visible = true;
 };
 
@@ -94,6 +145,18 @@ GLint g_loc_resolution = -1;
 GLint g_loc_color = -1;
 GLint g_loc_offset = -1;
 GLint g_loc_zoom = -1;
+GLint g_loc_use_hatch = -1;
+GLint g_loc_pattern_type = -1;
+GLint g_loc_hatch_angle = -1;
+GLint g_loc_hatch_spacing = -1;
+GLint g_loc_hatch_width = -1;
+
+// Constant pixel pitch for every layer's pattern -- only the angle and
+// pattern kind vary per layer (see pattern_for_layer) so stacked layers
+// stay visually distinguishable from each other.
+constexpr float kHatchSpacingPx = 10.0f;
+constexpr float kHatchHalfWidthPx = 0.25f;
+constexpr int kPatternTypeCount = 4;  // diagonal, cross-hatch, dots, grid
 
 std::vector<LayerBuffer> g_layers;
 std::unordered_map<uint32_t, LypEntry> g_lyp_info;
@@ -145,6 +208,11 @@ bool init_gl() {
     g_loc_color = glGetUniformLocation(g_program, "u_color");
     g_loc_offset = glGetUniformLocation(g_program, "u_offset");
     g_loc_zoom = glGetUniformLocation(g_program, "u_zoom");
+    g_loc_use_hatch = glGetUniformLocation(g_program, "u_useHatch");
+    g_loc_pattern_type = glGetUniformLocation(g_program, "u_patternType");
+    g_loc_hatch_angle = glGetUniformLocation(g_program, "u_hatchAngle");
+    g_loc_hatch_spacing = glGetUniformLocation(g_program, "u_hatchSpacing");
+    g_loc_hatch_width = glGetUniformLocation(g_program, "u_hatchWidth");
 
     glGenVertexArrays(1, &g_vao);
     glBindVertexArray(g_vao);
@@ -163,10 +231,24 @@ std::array<float, 4> default_color(uint32_t layer) {
     return {r, g, b, 0.8f};
 }
 
+// Spreads layers across the 4 pattern kinds and 6 hatch angles
+// (0/30/60/90/120/150 degrees) so adjacent layer numbers -- which is how
+// overlapping layers are usually numbered in real GDS decks -- don't end up
+// looking like the same pattern. Angle is ignored by the dot/grid kinds
+// (they're already rotation-symmetric-ish), but assigning one anyway keeps
+// this a single deterministic function of the layer number.
+void pattern_for_layer(uint32_t layer, float& out_pattern_type, float& out_angle) {
+    constexpr float kPi = 3.14159265358979323846f;
+    out_pattern_type = (float)(layer % kPatternTypeCount);
+    uint32_t angle_index = (layer / kPatternTypeCount) % 6;
+    out_angle = (float)angle_index * (kPi / 6.0f);
+}
+
 // Resolves a layer's fill/frame color + visibility from g_lyp_info (falling
 // back to the hash color above for layers with no .lyp entry, or for the
 // half of a fill/frame pair that's missing from the entry).
 void apply_layer_colors(LayerBuffer& layer) {
+    pattern_for_layer(layer.layer, layer.pattern_type, layer.hatch_angle);
     auto it = g_lyp_info.find(layer.layer);
     if (it == g_lyp_info.end()) {
         std::array<float, 4> base = default_color(layer.layer);
@@ -347,6 +429,11 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
             glEnableVertexAttribArray(g_loc_position);
             glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
             glUniform4fv(g_loc_color, 1, layer.fill_color.data());
+            glUniform1f(g_loc_use_hatch, 1.0f);
+            glUniform1f(g_loc_pattern_type, layer.pattern_type);
+            glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
+            glUniform1f(g_loc_hatch_spacing, kHatchSpacingPx);
+            glUniform1f(g_loc_hatch_width, kHatchHalfWidthPx);
             for (const PolygonRange& range : layer.fill_polygons) {
                 glDrawArrays(GL_TRIANGLES, range.first, range.count);
             }
@@ -356,6 +443,7 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
         glEnableVertexAttribArray(g_loc_position);
         glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
         glUniform4fv(g_loc_color, 1, layer.frame_color.data());
+        glUniform1f(g_loc_use_hatch, 0.0f);
         for (const PolygonRange& range : layer.outline_polygons) {
             glDrawArrays(GL_LINE_LOOP, range.first, range.count);
         }
