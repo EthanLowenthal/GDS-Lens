@@ -2,3 +2,6 @@ node_modules
 .vscode-test/
 *.vsix
 .env
+.DS_Store
+src/wasm/build/
+src/wasm/build-debug/

@@ -2,6 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src {{cspSource}} 'wasm-unsafe-eval';">
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0c0c0d; user-select: none; }
         canvas { width: 100%; height: 100%; display: block; }
@@ -19,13 +21,14 @@
         <button id="lypBtn">Load KLayout .lyp File</button>
     </div>
     <canvas id="glCanvas"></canvas>
-    
+
     <div id="scaleContainer">
         <div id="scaleLabel">0 μm</div>
         <div id="scaleBar" style="width: 100px;"></div>
     </div>
 
     <!-- Webview Local Script Injection Pipeline -->
+    <script src="wasm/build/gdstk_wasm.js"></script>
     <script src="viewer.js"></script>
 </body>
 </html>

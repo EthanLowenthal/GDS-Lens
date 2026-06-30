@@ -1,65 +1,57 @@
-# gdsii-view README
+# GDSII View
 
-This is the README for your extension "gdsii-view". After writing up a brief description, we recommend including the following sections.
+A VS Code extension that adds a custom editor for `.gds` (GDSII layout)
+files: open one and it's parsed and rendered in a WebGL2 canvas, with
+support for loading a KLayout `.lyp` file to drive layer colors.
+
+## Project layout
+
+- `src/extension.cjs` — the extension host (Node). Opens the `.gds` file,
+  streams its raw bytes into the webview, and relays the `.lyp` file picker.
+- `src/viewer.html` / `src/viewer.js` — the webview: bootstraps the wasm
+  module and wires up `postMessage` from the extension host.
+- `src/wasm/` — C++ source (`bindings.cpp`, `renderer.cpp`, `gds_common.hpp`)
+  compiled with Emscripten into `src/wasm/build/gdstk_wasm.js`, which does
+  GDS parsing and WebGL rendering. See `docs/rendering-rewrite.md` for the
+  design history of this C++/WASM architecture.
+- `third_party/gdstk`, `third_party/qhull` — git submodules the wasm build
+  links against.
+- `test/` — extension test suite.
+
+## Building
+
+GDS parsing and WebGL rendering run in a C++/WebAssembly module (`src/wasm/`,
+built against the bundled `gdstk` submodule). Building it requires the
+[Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html)
+(`emcc`/`emcmake` on `PATH`). After installing the SDK and initializing
+submodules (`git submodule update --init --recursive`):
+
+```sh
+npm run build:wasm
+```
+
+This configures and builds `src/wasm/build/gdstk_wasm.js`, which
+`src/extension.cjs` loads into the webview at runtime. Re-run it after
+changing any `src/wasm/*.cpp` file or the `gdstk`/`third_party/qhull`
+submodules.
+
+## Running
+
+Press `F5` in VS Code to launch an Extension Development Host with the
+extension loaded, then open a `.gds` file.
 
 ## Features
 
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
+- Parses and renders GDSII layouts directly in a VS Code webview.
+- Optional KLayout `.lyp` file loading for custom layer colors.
+- Handles SREF/AREF (including array references), rotation, mirroring, and
+  magnification via gdstk's flattening.
 
-For example if there is an image subfolder under your extension project workspace:
+## Known issues
 
-\!\[feature X\]\(images/feature-x.png\)
+- `eslint.config.mjs` imports `globals`, which isn't a declared dependency —
+  `npx eslint` currently fails with `ERR_MODULE_NOT_FOUND`.
 
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
+## Release notes
 
-## Requirements
-
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
-
-## Extension Settings
-
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
-
-For example:
-
-This extension contributes the following settings:
-
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
-
-## Known Issues
-
-Calling out known issues can help limit users opening duplicate issues against your extension.
-
-## Release Notes
-
-Users appreciate release notes as you update your extension.
-
-### 1.0.0
-
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
-
----
-
-## Working with Markdown
-
-You can author your README using Visual Studio Code.  Here are some useful editor keyboard shortcuts:
-
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux)
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux)
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets
-
-## For more information
-
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
-
-**Enjoy!**
+See `CHANGELOG.md`.

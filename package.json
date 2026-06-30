@@ -5,7 +5,18 @@
   "engines": {
     "vscode": "^1.125.0"
   },
-  "main": "./extension.cjs",
+  "main": "./src/extension.cjs",
+  "scripts": {
+    "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "eslint": "^10.5.0"
+  },
   "contributes": {
     "customEditors": [
       {
