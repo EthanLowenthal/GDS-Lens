@@ -39,14 +39,17 @@ class GdsEditorProvider {
             const htmlPath = path.join(this.context.extensionPath, 'src', 'viewer.html');
             const jsPath = path.join(this.context.extensionPath, 'src', 'viewer.js');
             const wasmJsPath = path.join(this.context.extensionPath, 'src', 'wasm', 'build', 'gdstk_wasm.js');
+            const datGuiJsPath = path.join(this.context.extensionPath, 'src', 'vendor', 'dat.gui.min.js');
 
             // 3. Convert the native viewer.js/wasm file paths into authenticated Webview URIs
             const jsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(jsPath));
             const wasmJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(wasmJsPath));
+            const datGuiJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(datGuiJsPath));
 
             // 4. Load the base HTML text and dynamically swap out the standard script references
             let htmlContent = fs.readFileSync(htmlPath, 'utf8');
             htmlContent = htmlContent.replace('src="wasm/build/gdstk_wasm.js"', 'src="' + wasmJsWebviewUri.toString() + '"');
+            htmlContent = htmlContent.replace('src="vendor/dat.gui.min.js"', 'src="' + datGuiJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="viewer.js"', 'src="' + jsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('{{cspSource}}', webviewPanel.webview.cspSource);
 
