@@ -1,8 +1,14 @@
 // Owns everything viewer.js's WebGL2 code used to do: GL context + shader
 // setup, layer-batched vertex buffers, camera (pan/zoom) state, input
-// handling, .lyp color parsing, and scale-bar text/width. JS now only
-// instantiates the module and relays postMessage payloads into
-// loadAndRenderGds()/loadLypText() -- it never touches per-polygon data.
+// handling, .lyp color parsing, and scale-bar text/width. JS never touches
+// per-polygon data directly.
+//
+// parseGdsToLayers() (parse + flatten + triangulate, no GL/DOM) runs inside
+// a Worker instantiated from this same module (see wasm-worker.js) so large
+// files don't block the main thread; its result crosses back over
+// postMessage and uploadLayers() (GL upload only) applies it on the main
+// thread, which owns the canvas. loadAndRenderGds() still does both in one
+// synchronous call for callers that don't need a Worker.
 //
 // GDS bytes still arrive via MEMFS (see bindings.cpp's parseGds, which is
 // kept around for non-graphical testing of the parse path in isolation).
@@ -497,6 +503,32 @@ void flatten_cell_by_layer(Cell* cell, std::unordered_map<uint32_t, std::vector<
     polygons.clear();
 }
 
+// Fresh JS-owned Float32Array copied out of a wasm-heap vector -- mirrors
+// bindings.cpp's to_float64_array. The returned array doesn't alias wasm
+// memory, so it's safe for a caller (e.g. the Worker script) to hold onto or
+// postMessage-transfer after this call returns.
+val to_float32_array(const std::vector<float>& data) {
+    val array = val::global("Float32Array").new_(data.size());
+    array.call<void>("set", typed_memory_view(data.size(), data.data()));
+    return array;
+}
+
+// Fire-and-forget progress ping: self.postMessage in the Worker that runs
+// parseGdsToLayers (the normal case), window.postMessage on the main thread
+// otherwise. Workers deliver postMessage to the other thread as soon as it's
+// called, not when the sender goes idle, so the listener sees these
+// near-real-time even though this function is called from deep inside a
+// single long synchronous C++ call.
+void report_progress(const char* phase, uint64_t current, uint64_t total) {
+    EM_ASM(
+        {
+            if (typeof postMessage === 'function') {
+                postMessage({type : 'gdsProgress', phase : UTF8ToString($0), current : $1, total : $2});
+            }
+        },
+        phase, (double)current, (double)total);
+}
+
 bool extract_tag_value(const std::string& block, const char* tag, std::string& out) {
     std::string open_tag = std::string("<") + tag + ">";
     std::string close_tag = std::string("</") + tag + ">";
@@ -571,27 +603,34 @@ bool on_resize(int /*eventType*/, const EmscriptenUiEvent* /*e*/, void* /*userDa
 
 }  // namespace
 
-void loadAndRenderGds(const std::string& path) {
-    if (!g_gl_ready) {
-        // No WebGL2-capable canvas (e.g. running under plain Node) -- use
-        // parseGds() instead for headless parse-path testing.
-        return;
-    }
-    clear_layers();
+// Parses, flattens, and triangulates a GDS file into plain per-layer vertex
+// data -- no GL/DOM touched, so this is safe to run inside a Worker (see
+// wasm-worker.js) as well as on the main thread. Reports progress via
+// report_progress() as it goes; the caller (JS) is expected to relay
+// 'gdsProgress' postMessages to whatever's driving a progress bar.
+val parseGdsToLayers(const std::string& path) {
+    val result = val::object();
 
+    report_progress("parsing", 0, 1);
     ErrorCode error_code = ErrorCode::NoError;
     Library lib = read_gds(path.c_str(), 1e-6, 1e-2, NULL, &error_code);
+    report_progress("parsing", 1, 1);
 
     if (gds_common::is_fatal(error_code)) {
-        set_inner_html("ui", std::string("<b>Error</b><br>") + gds_common::error_string(error_code));
+        result.set("ok", false);
+        result.set("error", std::string(gds_common::error_string(error_code)));
         lib.free_all();
-        request_redraw();
-        return;
+        return result;
     }
 
     Array<Cell*> top_cells = {};
     Array<RawCell*> top_rawcells = {};
     lib.top_level(top_cells, top_rawcells);
+
+    uint64_t renderable_cells = 0;
+    for (uint64_t i = 0; i < top_cells.count; i++) {
+        if (!gds_common::is_metadata_cell(top_cells[i])) renderable_cells++;
+    }
 
     std::unordered_map<uint32_t, std::vector<Polygon*>> by_layer;
     uint64_t rendered_top_cells = 0;
@@ -599,9 +638,11 @@ void loadAndRenderGds(const std::string& path) {
         if (gds_common::is_metadata_cell(top_cells[i])) continue;
         flatten_cell_by_layer(top_cells[i], by_layer);
         rendered_top_cells++;
+        report_progress("flattening", rendered_top_cells, renderable_cells);
     }
     if (rendered_top_cells == 0 && lib.cell_array.count > 0) {
         flatten_cell_by_layer(lib.cell_array[lib.cell_array.count - 1], by_layer);
+        report_progress("flattening", 1, 1);
     }
     top_cells.clear();
     top_rawcells.clear();
@@ -610,51 +651,131 @@ void loadAndRenderGds(const std::string& path) {
     double min_y = HUGE_VAL, max_y = -HUGE_VAL;
     uint64_t total_polygons = 0;
 
+    val layers = val::array();
+    uint64_t layer_index = 0;
+    uint64_t layer_total = by_layer.size();
+
     for (auto& entry : by_layer) {
         uint32_t layer_number = entry.first;
         std::vector<Polygon*>& polys = entry.second;
 
-        LayerBuffer layer_buffer;
-        layer_buffer.layer = layer_number;
-
         uint64_t point_total = 0;
         for (Polygon* poly : polys) point_total += poly->point_array.count;
 
-        std::vector<float> vertices;
-        vertices.reserve(point_total * 2);
+        std::vector<float> outline_vertices;
+        outline_vertices.reserve(point_total * 2);
         std::vector<float> fill_vertices;
+        val outline_ranges = val::array();
+        val fill_ranges = val::array();
         std::vector<uint32_t> tri_indices;
 
         for (Polygon* poly : polys) {
-            GLint first = (GLint)(vertices.size() / 2);
+            uint32_t first = (uint32_t)(outline_vertices.size() / 2);
             for (uint64_t i = 0; i < poly->point_array.count; i++) {
                 const Vec2& pt = poly->point_array[i];
-                vertices.push_back((float)pt.x);
-                vertices.push_back((float)pt.y);
+                outline_vertices.push_back((float)pt.x);
+                outline_vertices.push_back((float)pt.y);
                 min_x = std::min(min_x, pt.x);
                 max_x = std::max(max_x, pt.x);
                 min_y = std::min(min_y, pt.y);
                 max_y = std::max(max_y, pt.y);
             }
-            layer_buffer.outline_polygons.push_back({first, (GLsizei)poly->point_array.count});
+            val outline_range = val::array();
+            outline_range.set(0, first);
+            outline_range.set(1, (uint32_t)poly->point_array.count);
+            outline_ranges.call<void>("push", outline_range);
             total_polygons++;
 
             tri_indices.clear();
             triangulate(poly->point_array, tri_indices);
             if (!tri_indices.empty()) {
-                GLint fill_first = (GLint)(fill_vertices.size() / 2);
+                uint32_t fill_first = (uint32_t)(fill_vertices.size() / 2);
                 for (uint32_t idx : tri_indices) {
                     const Vec2& pt = poly->point_array[idx];
                     fill_vertices.push_back((float)pt.x);
                     fill_vertices.push_back((float)pt.y);
                 }
-                layer_buffer.fill_polygons.push_back({fill_first, (GLsizei)tri_indices.size()});
+                val fill_range = val::array();
+                fill_range.set(0, fill_first);
+                fill_range.set(1, (uint32_t)tri_indices.size());
+                fill_ranges.call<void>("push", fill_range);
             }
+        }
+
+        val layer_entry = val::object();
+        layer_entry.set("layer", layer_number);
+        layer_entry.set("outlineVertices", to_float32_array(outline_vertices));
+        layer_entry.set("outlineRanges", outline_ranges);
+        layer_entry.set("fillVertices", to_float32_array(fill_vertices));
+        layer_entry.set("fillRanges", fill_ranges);
+        layers.call<void>("push", layer_entry);
+
+        for (Polygon* poly : polys) {
+            poly->clear();
+            free_allocation(poly);
+        }
+
+        layer_index++;
+        report_progress("triangulating", layer_index, layer_total);
+    }
+
+    lib.free_all();
+
+    val bbox = val::object();
+    bbox.set("minX", total_polygons > 0 && min_x <= max_x ? min_x : 0.0);
+    bbox.set("maxX", total_polygons > 0 && min_x <= max_x ? max_x : 0.0);
+    bbox.set("minY", total_polygons > 0 && min_x <= max_x ? min_y : 0.0);
+    bbox.set("maxY", total_polygons > 0 && min_x <= max_x ? max_y : 0.0);
+
+    result.set("ok", true);
+    result.set("error", std::string(gds_common::error_string(error_code)));
+    result.set("layers", layers);
+    result.set("bbox", bbox);
+    result.set("totalPolygons", total_polygons);
+    return result;
+}
+
+// GL-upload half of the old loadAndRenderGds: takes the plain per-layer
+// vertex data produced by parseGdsToLayers() (either called directly, or
+// reconstructed from a Worker's 'gdsResult' postMessage) and turns it into
+// VBOs + camera framing. Must run on the main thread (owns the GL context).
+void uploadLayers(val layers_data, val bbox_data) {
+    if (!g_gl_ready) return;
+    clear_layers();
+
+    unsigned layer_count = layers_data["length"].as<unsigned>();
+    uint64_t total_polygons = 0;
+    for (unsigned i = 0; i < layer_count; i++) {
+        val entry = layers_data[i];
+        LayerBuffer layer_buffer;
+        layer_buffer.layer = entry["layer"].as<uint32_t>();
+
+        // convertJSArrayToNumberVector does one bulk typed_memory_view copy;
+        // vecFromJSArray would marshal one element at a time, which is too
+        // slow for vertex buffers that can run into the millions of floats.
+        std::vector<float> outline_vertices = convertJSArrayToNumberVector<float>(entry["outlineVertices"]);
+        std::vector<float> fill_vertices = convertJSArrayToNumberVector<float>(entry["fillVertices"]);
+
+        val outline_ranges = entry["outlineRanges"];
+        unsigned outline_range_count = outline_ranges["length"].as<unsigned>();
+        for (unsigned r = 0; r < outline_range_count; r++) {
+            val range = outline_ranges[r];
+            layer_buffer.outline_polygons.push_back(
+                {(GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>()});
+        }
+        total_polygons += outline_range_count;
+
+        val fill_ranges = entry["fillRanges"];
+        unsigned fill_range_count = fill_ranges["length"].as<unsigned>();
+        for (unsigned r = 0; r < fill_range_count; r++) {
+            val range = fill_ranges[r];
+            layer_buffer.fill_polygons.push_back({(GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>()});
         }
 
         glGenBuffers(1, &layer_buffer.outline_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, layer_buffer.outline_vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertices.size() * sizeof(float)), vertices.data(), GL_STATIC_DRAW);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(outline_vertices.size() * sizeof(float)), outline_vertices.data(),
+                     GL_STATIC_DRAW);
 
         if (!fill_vertices.empty()) {
             glGenBuffers(1, &layer_buffer.fill_vbo);
@@ -664,16 +785,13 @@ void loadAndRenderGds(const std::string& path) {
         }
 
         apply_layer_colors(layer_buffer);
-
         g_layers.push_back(std::move(layer_buffer));
-
-        for (Polygon* poly : polys) {
-            poly->clear();
-            free_allocation(poly);
-        }
     }
 
-    lib.free_all();
+    double min_x = bbox_data["minX"].as<double>();
+    double max_x = bbox_data["maxX"].as<double>();
+    double min_y = bbox_data["minY"].as<double>();
+    double max_y = bbox_data["maxY"].as<double>();
 
     if (total_polygons > 0 && min_x <= max_x) {
         double total_width = max_x - min_x;
@@ -692,6 +810,30 @@ void loadAndRenderGds(const std::string& path) {
     set_inner_html("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons));
     update_scale_bar();
     request_redraw();
+}
+
+void showLoadError(const std::string& message) {
+    if (!g_gl_ready) return;
+    clear_layers();
+    set_inner_html("ui", std::string("<b>Error</b><br>") + message);
+    request_redraw();
+}
+
+// Synchronous single-call path kept for callers that don't need progress
+// reporting -- parseGdsToLayers()/uploadLayers() are what viewer.js actually
+// drives via the Worker now.
+void loadAndRenderGds(const std::string& path) {
+    if (!g_gl_ready) {
+        // No WebGL2-capable canvas (e.g. running under plain Node) -- use
+        // parseGds() instead for headless parse-path testing.
+        return;
+    }
+    val r = parseGdsToLayers(path);
+    if (!r["ok"].as<bool>()) {
+        showLoadError(r["error"].as<std::string>());
+        return;
+    }
+    uploadLayers(r["layers"], r["bbox"]);
 }
 
 void loadLypText(const std::string& xml_text) {
@@ -813,6 +955,9 @@ int main() {
 
 EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("loadAndRenderGds", &loadAndRenderGds);
+    function("parseGdsToLayers", &parseGdsToLayers);
+    function("uploadLayers", &uploadLayers);
+    function("showLoadError", &showLoadError);
     function("loadLypText", &loadLypText);
     function("getLayers", &getLayers);
     function("setLayerVisible", &setLayerVisible);
