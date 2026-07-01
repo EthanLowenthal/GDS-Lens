@@ -184,6 +184,25 @@ float g_pan_y = 0.0f;
 int g_canvas_width = 0;
 int g_canvas_height = 0;
 
+// Camera state captured the last time the view was framed to the design
+// (see uploadLayers) -- what the "Reset View" button restores.
+float g_fit_zoom = 1.0f;
+float g_fit_pan_x = 0.0f;
+float g_fit_pan_y = 0.0f;
+
+// Design bbox in world space, used to keep pan/zoom from wandering off into
+// empty space. min > max (the HUGE_VALF/-HUGE_VALF sentinel pair) means "no
+// geometry loaded yet" -- clamp_pan() is a no-op in that case.
+float g_bbox_min_x = HUGE_VALF;
+float g_bbox_max_x = -HUGE_VALF;
+float g_bbox_min_y = HUGE_VALF;
+float g_bbox_max_y = -HUGE_VALF;
+
+// Zoom bounds are relative to the fit-to-window zoom rather than absolute,
+// so they scale with whatever unit the design happens to be drawn in.
+constexpr float kMinZoomRatio = 0.05f;
+constexpr float kMaxZoomRatio = 2000.0f;
+
 bool g_dragging = false;
 int g_last_mouse_x = 0;
 int g_last_mouse_y = 0;
@@ -459,6 +478,24 @@ bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, co
     return min_x <= view.max_x && max_x >= view.min_x && min_y <= view.max_y && max_y >= view.min_y;
 }
 
+float clamp_zoom_value(float zoom) {
+    float min_zoom = g_fit_zoom * kMinZoomRatio;
+    float max_zoom = g_fit_zoom * kMaxZoomRatio;
+    return std::clamp(zoom, min_zoom, max_zoom);
+}
+
+// Keeps the design bbox from being panned entirely out of view: pan is
+// clamped so the current viewport (half_w/half_h around it, same math as
+// current_view_rect) always overlaps the bbox by at least a hair, rather
+// than letting the user scroll off into empty space indefinitely.
+void clamp_pan() {
+    if (g_bbox_min_x > g_bbox_max_x) return;
+    float half_w = (float)g_canvas_width * 0.5f / g_zoom;
+    float half_h = (float)g_canvas_height * 0.5f / g_zoom;
+    g_pan_x = std::clamp(g_pan_x, g_bbox_min_x - half_w, g_bbox_max_x + half_w);
+    g_pan_y = std::clamp(g_pan_y, g_bbox_min_y - half_h, g_bbox_max_y + half_h);
+}
+
 bool draw_frame(double /*time*/, void* /*userData*/) {
     g_frame_requested = false;
     if (g_layers.empty()) return false;
@@ -527,6 +564,7 @@ void resize_canvas() {
     canvas.set("height", height);
 
     glViewport(0, 0, width, height);
+    clamp_pan();
     update_scale_bar();
     request_redraw();
 }
@@ -627,6 +665,7 @@ bool on_mousemove(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*user
     int dy = e->clientY - g_last_mouse_y;
     g_pan_x -= dx / g_zoom;
     g_pan_y += dy / g_zoom;
+    clamp_pan();
     g_last_mouse_x = e->clientX;
     g_last_mouse_y = e->clientY;
     request_redraw();
@@ -638,12 +677,35 @@ bool on_mouseup(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*us
     return true;
 }
 
+// Zooms around the cursor rather than the view center: the world point
+// currently under the mouse (computed from the vertex shader's inverse --
+// see kVertexShaderSrc) is held fixed on screen across the zoom change by
+// solving for the new pan that keeps it there.
 bool on_wheel(int /*eventType*/, const EmscriptenWheelEvent* e, void* /*userData*/) {
-    if (e->deltaY < 0) g_zoom *= 1.15f;
-    else g_zoom /= 1.15f;
+    float old_zoom = g_zoom;
+    float factor = (e->deltaY < 0) ? 1.15f : (1.0f / 1.15f);
+    float new_zoom = clamp_zoom_value(old_zoom * factor);
+    if (new_zoom != old_zoom) {
+        float px = (float)e->mouse.targetX - (float)g_canvas_width * 0.5f;
+        float py = (float)g_canvas_height * 0.5f - (float)e->mouse.targetY;
+        float world_x = g_pan_x + px / old_zoom;
+        float world_y = g_pan_y + py / old_zoom;
+        g_zoom = new_zoom;
+        g_pan_x = world_x - px / new_zoom;
+        g_pan_y = world_y - py / new_zoom;
+        clamp_pan();
+    }
     update_scale_bar();
     request_redraw();
     return true;
+}
+
+void reset_view() {
+    g_zoom = g_fit_zoom;
+    g_pan_x = g_fit_pan_x;
+    g_pan_y = g_fit_pan_y;
+    update_scale_bar();
+    request_redraw();
 }
 
 bool on_resize(int /*eventType*/, const EmscriptenUiEvent* /*e*/, void* /*userData*/) {
@@ -856,11 +918,22 @@ void uploadLayers(val layers_data, val bbox_data) {
         double zoom_x = g_canvas_width / (total_width > 0 ? total_width : 1.0);
         double zoom_y = g_canvas_height / (total_height > 0 ? total_height : 1.0);
         g_zoom = (float)(std::min(zoom_x, zoom_y) * 0.85);
+        g_bbox_min_x = (float)min_x;
+        g_bbox_max_x = (float)max_x;
+        g_bbox_min_y = (float)min_y;
+        g_bbox_max_y = (float)max_y;
     } else {
         g_zoom = 1.0f;
         g_pan_x = 0.0f;
         g_pan_y = 0.0f;
+        g_bbox_min_x = HUGE_VALF;
+        g_bbox_max_x = -HUGE_VALF;
+        g_bbox_min_y = HUGE_VALF;
+        g_bbox_max_y = -HUGE_VALF;
     }
+    g_fit_zoom = g_zoom;
+    g_fit_pan_x = g_pan_x;
+    g_fit_pan_y = g_pan_y;
 
     set_inner_html("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons));
     update_scale_bar();
@@ -1016,4 +1089,5 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("loadLypText", &loadLypText);
     function("getLayers", &getLayers);
     function("setLayerVisible", &setLayerVisible);
+    function("resetView", &reset_view);
 }
