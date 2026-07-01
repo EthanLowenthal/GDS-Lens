@@ -50,6 +50,13 @@ console.error = (...args) => {
 // HTML from before this panel existed) must not throw and abort the rest of
 // this script -- everything below, including the window "message" listener
 // that shows the loading bar at all, depends on this file finishing setup.
+const debugPanelEl = document.getElementById("debugPanel");
+const debugToggleBtn = document.getElementById("debugToggleBtn");
+if (debugToggleBtn && debugPanelEl) {
+    debugToggleBtn.addEventListener("click", () => {
+        debugPanelEl.classList.toggle("hidden");
+    });
+}
 const debugCopyBtn = document.getElementById("debugCopyBtn");
 if (debugCopyBtn) {
     debugCopyBtn.addEventListener("click", () => {
