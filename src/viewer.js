@@ -92,9 +92,11 @@ console.log("[GDS] acquireVsCodeApi() OK, typeof createGdstkModule:", typeof cre
 
 const gui = new dat.GUI({ width: 260 });
 const actions = {
-    loadLypFile: () => vscode.postMessage({ command: "loadLypFile" })
+    loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
+    resetView: () => modulePromise.then((Module) => Module.resetView())
 };
 gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
+gui.add(actions, "resetView").name("Reset View");
 
 let layersFolder = null;
 
@@ -108,7 +110,6 @@ function renderLayerList(layers) {
         gui.removeFolder(layersFolder);
     }
     layersFolder = gui.addFolder("Layers");
-    layersFolder.open();
 
     for (const layer of layers) {
         const label = layer.name ? `${layer.layer} – ${layer.name}` : `Layer ${layer.layer}`;
