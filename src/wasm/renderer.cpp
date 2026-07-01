@@ -110,6 +110,12 @@ const char* kFragmentShaderSrc =
 struct PolygonRange {
     GLint first;
     GLsizei count;
+    // World-space bounding box, used to skip glDrawArrays calls for polygons
+    // outside the current viewport (see is_range_visible/draw_frame) --
+    // large designs can have millions of off-screen polygons while zoomed
+    // in, and issuing a draw call per polygon regardless is the dominant
+    // per-frame cost at that point.
+    float min_x, max_x, min_y, max_y;
 };
 
 // One pair of VBOs per layer (fill triangles + outline points) holding all
@@ -129,6 +135,10 @@ struct LayerBuffer {
     float hatch_angle = 0.0f;
     float pattern_type = 0.0f;  // see kFragmentShaderSrc's patternType branches
     bool visible = true;
+    // Union of every polygon's bbox on this layer, so draw_frame can skip
+    // the whole layer with one check instead of scanning every polygon when
+    // the layer isn't on screen at all.
+    float min_x = HUGE_VAL, max_x = -HUGE_VAL, min_y = HUGE_VAL, max_y = -HUGE_VAL;
 };
 
 // Parsed out of a single <properties> block in a .lyp file. Persists across
@@ -372,6 +382,22 @@ void triangulate(const Array<Vec2>& pts, std::vector<uint32_t>& out_indices) {
     }
 }
 
+// Computes a PolygonRange's world-space bbox from the flat [x0,y0,x1,y1,...]
+// vertex buffer it indexes into (shared by both outline and fill ranges,
+// since fill vertices are a subset of the same polygon points).
+PolygonRange make_range(const std::vector<float>& verts, GLint first, GLsizei count) {
+    PolygonRange range{first, count, HUGE_VALF, -HUGE_VALF, HUGE_VALF, -HUGE_VALF};
+    for (GLsizei i = 0; i < count; i++) {
+        float x = verts[(size_t)(first + i) * 2];
+        float y = verts[(size_t)(first + i) * 2 + 1];
+        range.min_x = std::min(range.min_x, x);
+        range.max_x = std::max(range.max_x, x);
+        range.min_y = std::min(range.min_y, y);
+        range.max_y = std::max(range.max_y, y);
+    }
+    return range;
+}
+
 void set_inner_html(const char* id, const std::string& html) {
     val el = val::global("document").call<val>("getElementById", std::string(id));
     if (!el.isNull() && !el.isUndefined()) el.set("innerHTML", html);
@@ -414,6 +440,25 @@ void update_scale_bar() {
     set_inner_text("scaleLabel", buf);
 }
 
+struct ViewRect {
+    float min_x, max_x, min_y, max_y;
+};
+
+// World-space extent of the current viewport, derived from the same
+// pan/zoom the vertex shader applies (see kVertexShaderSrc). Padded by one
+// hatch spacing so screen-space fill patterns (computed from gl_FragCoord,
+// not world position) don't visibly pop at the edge of the view as a
+// polygon crosses the cull boundary.
+ViewRect current_view_rect() {
+    float half_w = (float)g_canvas_width * 0.5f / g_zoom + kHatchSpacingPx;
+    float half_h = (float)g_canvas_height * 0.5f / g_zoom + kHatchSpacingPx;
+    return {g_pan_x - half_w, g_pan_x + half_w, g_pan_y - half_h, g_pan_y + half_h};
+}
+
+bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, const ViewRect& view) {
+    return min_x <= view.max_x && max_x >= view.min_x && min_y <= view.max_y && max_y >= view.min_y;
+}
+
 bool draw_frame(double /*time*/, void* /*userData*/) {
     g_frame_requested = false;
     if (g_layers.empty()) return false;
@@ -427,8 +472,11 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
     glUniform2f(g_loc_offset, g_pan_x, g_pan_y);
     glUniform1f(g_loc_zoom, g_zoom);
 
+    const ViewRect view = current_view_rect();
+
     for (const LayerBuffer& layer : g_layers) {
         if (!layer.visible) continue;
+        if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
 
         if (layer.fill_vbo) {
             glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
@@ -441,6 +489,7 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
             glUniform1f(g_loc_hatch_spacing, kHatchSpacingPx);
             glUniform1f(g_loc_hatch_width, kHatchHalfWidthPx);
             for (const PolygonRange& range : layer.fill_polygons) {
+                if (!bbox_intersects_view(range.min_x, range.max_x, range.min_y, range.max_y, view)) continue;
                 glDrawArrays(GL_TRIANGLES, range.first, range.count);
             }
         }
@@ -451,6 +500,7 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
         glUniform4fv(g_loc_color, 1, layer.frame_color.data());
         glUniform1f(g_loc_use_hatch, 0.0f);
         for (const PolygonRange& range : layer.outline_polygons) {
+            if (!bbox_intersects_view(range.min_x, range.max_x, range.min_y, range.max_y, view)) continue;
             glDrawArrays(GL_LINE_LOOP, range.first, range.count);
         }
     }
@@ -760,8 +810,12 @@ void uploadLayers(val layers_data, val bbox_data) {
         unsigned outline_range_count = outline_ranges["length"].as<unsigned>();
         for (unsigned r = 0; r < outline_range_count; r++) {
             val range = outline_ranges[r];
-            layer_buffer.outline_polygons.push_back(
-                {(GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>()});
+            PolygonRange pr = make_range(outline_vertices, (GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>());
+            layer_buffer.min_x = std::min(layer_buffer.min_x, pr.min_x);
+            layer_buffer.max_x = std::max(layer_buffer.max_x, pr.max_x);
+            layer_buffer.min_y = std::min(layer_buffer.min_y, pr.min_y);
+            layer_buffer.max_y = std::max(layer_buffer.max_y, pr.max_y);
+            layer_buffer.outline_polygons.push_back(pr);
         }
         total_polygons += outline_range_count;
 
@@ -769,7 +823,8 @@ void uploadLayers(val layers_data, val bbox_data) {
         unsigned fill_range_count = fill_ranges["length"].as<unsigned>();
         for (unsigned r = 0; r < fill_range_count; r++) {
             val range = fill_ranges[r];
-            layer_buffer.fill_polygons.push_back({(GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>()});
+            layer_buffer.fill_polygons.push_back(
+                make_range(fill_vertices, (GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>()));
         }
 
         glGenBuffers(1, &layer_buffer.outline_vbo);
