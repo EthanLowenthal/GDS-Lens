@@ -128,8 +128,21 @@ struct LayerBuffer {
     uint32_t layer;
     GLuint outline_vbo = 0;
     GLuint fill_vbo = 0;
-    std::vector<PolygonRange> outline_polygons;
-    std::vector<PolygonRange> fill_polygons;
+    // Index buffer over outline_vbo, one GL_LINE_LOOP per polygon joined by
+    // restart markers (see kRestartIndex) -- lets draw_frame draw every
+    // outline polygon on the layer in a single glDrawElements call when the
+    // whole layer is on screen, instead of one glDrawArrays per polygon.
+    GLuint outline_ebo = 0;
+    GLsizei outline_index_count = 0;
+    // Total vertex count in fill_vbo -- triangle lists have no loop-closing
+    // constraint, so the whole buffer can be drawn in one glDrawArrays call
+    // with no indices needed.
+    GLsizei fill_vertex_count = 0;
+    // Polygon count on this layer -- every layer draws unconditionally in
+    // one call each for fill/outline (see draw_frame), so per-polygon
+    // geometry doesn't need to stick around at runtime, just this count for
+    // the UI/stats readout.
+    uint32_t polygon_count = 0;
     std::array<float, 4> fill_color{};
     std::array<float, 4> frame_color{};
     float hatch_angle = 0.0f;
@@ -140,6 +153,13 @@ struct LayerBuffer {
     // the layer isn't on screen at all.
     float min_x = HUGE_VAL, max_x = -HUGE_VAL, min_y = HUGE_VAL, max_y = -HUGE_VAL;
 };
+
+// Index value that marks a primitive-restart boundary in an outline_ebo.
+// WebGL2 (like GLES 3.0) always treats the max value of the index type as a
+// restart marker for indexed draws -- unlike desktop GL, there's no
+// GL_PRIMITIVE_RESTART capability to glEnable and no way to disable it, so
+// no setup call is needed beyond using this value.
+constexpr uint32_t kRestartIndex = 0xFFFFFFFFu;
 
 // Parsed out of a single <properties> block in a .lyp file. Persists across
 // GDS reloads (same as the old g_lyp_colors did) so re-opening/replacing the
@@ -177,6 +197,11 @@ constexpr int kPatternTypeCount = 4;  // diagonal, cross-hatch, dots, grid
 std::vector<LayerBuffer> g_layers;
 std::unordered_map<uint32_t, LypEntry> g_lyp_info;
 int g_lyp_order_counter = 0;
+
+// Total polygon count across all layers (set once in uploadLayers), used as
+// the denominator for the "visible polygons" stat draw_frame recomputes
+// every frame (see update_render_stats).
+uint64_t g_total_polygons = 0;
 
 float g_zoom = 1.0f;
 float g_pan_x = 0.0f;
@@ -478,6 +503,17 @@ bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, co
     return min_x <= view.max_x && max_x >= view.min_x && min_y <= view.max_y && max_y >= view.min_y;
 }
 
+// Writes the per-frame "visible polygons" readout into #renderStats (a span
+// inside #ui, see uploadLayers). layers_drawn/layers_total count only the
+// layer-level visibility/bbox skip in draw_frame -- there's no per-polygon
+// culling anymore, so every drawn layer's polygons are all visible.
+void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers_total) {
+    char buf[160];
+    snprintf(buf, sizeof(buf), "Visible: %llu / %llu polygons<br>Render: no culling (%d / %d layers on screen)",
+             (unsigned long long)visible_polygons, (unsigned long long)g_total_polygons, layers_drawn, layers_total);
+    set_inner_html("renderStats", buf);
+}
+
 float clamp_zoom_value(float zoom) {
     float min_zoom = g_fit_zoom * kMinZoomRatio;
     float max_zoom = g_fit_zoom * kMaxZoomRatio;
@@ -511,9 +547,24 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
 
     const ViewRect view = current_view_rect();
 
+    // No per-polygon or per-tile culling: every on-screen layer draws in
+    // exactly one glDrawArrays (fill) + one glDrawElements (outline) call,
+    // full stop. An earlier version tried to fall back to a per-polygon
+    // culled draw loop when a layer was only partially on screen (i.e. most
+    // zoom levels between "fit to window" and "zoomed in on a small area"),
+    // but that fallback issued one draw call per remaining visible polygon
+    // and was the actual bottleneck -- worse than just drawing everything
+    // unconditionally. The only skip left is the layer-level bbox check
+    // below, which is O(number of layers), not O(number of polygons).
+    uint64_t frame_visible_polygons = 0;
+    int frame_layers_drawn = 0;
+
     for (const LayerBuffer& layer : g_layers) {
         if (!layer.visible) continue;
         if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
+
+        frame_layers_drawn++;
+        frame_visible_polygons += layer.polygon_count;
 
         if (layer.fill_vbo) {
             glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
@@ -525,22 +576,28 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
             glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
             glUniform1f(g_loc_hatch_spacing, kHatchSpacingPx);
             glUniform1f(g_loc_hatch_width, kHatchHalfWidthPx);
-            for (const PolygonRange& range : layer.fill_polygons) {
-                if (!bbox_intersects_view(range.min_x, range.max_x, range.min_y, range.max_y, view)) continue;
-                glDrawArrays(GL_TRIANGLES, range.first, range.count);
-            }
+            // Fill vertices are triangles laid back-to-back with no
+            // loop-closing constraint, so the whole layer draws correctly
+            // in one shot -- no indices needed.
+            glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
         }
 
-        glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
-        glEnableVertexAttribArray(g_loc_position);
-        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-        glUniform4fv(g_loc_color, 1, layer.frame_color.data());
-        glUniform1f(g_loc_use_hatch, 0.0f);
-        for (const PolygonRange& range : layer.outline_polygons) {
-            if (!bbox_intersects_view(range.min_x, range.max_x, range.min_y, range.max_y, view)) continue;
-            glDrawArrays(GL_LINE_LOOP, range.first, range.count);
+        if (layer.outline_ebo) {
+            glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
+            glEnableVertexAttribArray(g_loc_position);
+            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glUniform4fv(g_loc_color, 1, layer.frame_color.data());
+            glUniform1f(g_loc_use_hatch, 0.0f);
+            // outline_ebo strings every polygon's LINE_LOOP together with
+            // primitive-restart markers (kRestartIndex) -- WebGL2 always
+            // honors these for indexed draws, so this one glDrawElements
+            // call draws every outline polygon on the layer without
+            // connecting unrelated polygons' loop-closing edges.
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
+            glDrawElements(GL_LINE_LOOP, layer.outline_index_count, GL_UNSIGNED_INT, 0);
         }
     }
+    update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size());
     return false;
 }
 
@@ -572,6 +629,7 @@ void resize_canvas() {
 void clear_layers() {
     for (LayerBuffer& layer : g_layers) {
         if (layer.outline_vbo) glDeleteBuffers(1, &layer.outline_vbo);
+        if (layer.outline_ebo) glDeleteBuffers(1, &layer.outline_ebo);
         if (layer.fill_vbo) glDeleteBuffers(1, &layer.fill_vbo);
     }
     g_layers.clear();
@@ -870,29 +928,39 @@ void uploadLayers(val layers_data, val bbox_data) {
 
         val outline_ranges = entry["outlineRanges"];
         unsigned outline_range_count = outline_ranges["length"].as<unsigned>();
+        // Indices for outline_ebo: each polygon's vertex range followed by a
+        // restart marker, so the whole layer can be drawn as one
+        // GL_LINE_LOOP glDrawElements call (see draw_frame).
+        std::vector<uint32_t> outline_indices;
+        outline_indices.reserve(outline_vertices.size() / 2 + outline_range_count);
         for (unsigned r = 0; r < outline_range_count; r++) {
             val range = outline_ranges[r];
-            PolygonRange pr = make_range(outline_vertices, (GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>());
+            uint32_t first = range[0].as<uint32_t>();
+            uint32_t count = range[1].as<uint32_t>();
+            PolygonRange pr = make_range(outline_vertices, (GLint)first, (GLsizei)count);
             layer_buffer.min_x = std::min(layer_buffer.min_x, pr.min_x);
             layer_buffer.max_x = std::max(layer_buffer.max_x, pr.max_x);
             layer_buffer.min_y = std::min(layer_buffer.min_y, pr.min_y);
             layer_buffer.max_y = std::max(layer_buffer.max_y, pr.max_y);
-            layer_buffer.outline_polygons.push_back(pr);
+            for (uint32_t k = 0; k < count; k++) outline_indices.push_back(first + k);
+            outline_indices.push_back(kRestartIndex);
         }
+        layer_buffer.polygon_count = outline_range_count;
         total_polygons += outline_range_count;
-
-        val fill_ranges = entry["fillRanges"];
-        unsigned fill_range_count = fill_ranges["length"].as<unsigned>();
-        for (unsigned r = 0; r < fill_range_count; r++) {
-            val range = fill_ranges[r];
-            layer_buffer.fill_polygons.push_back(
-                make_range(fill_vertices, (GLint)range[0].as<uint32_t>(), (GLsizei)range[1].as<uint32_t>()));
-        }
+        layer_buffer.fill_vertex_count = (GLsizei)(fill_vertices.size() / 2);
 
         glGenBuffers(1, &layer_buffer.outline_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, layer_buffer.outline_vbo);
         glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(outline_vertices.size() * sizeof(float)), outline_vertices.data(),
                      GL_STATIC_DRAW);
+
+        if (!outline_indices.empty()) {
+            glGenBuffers(1, &layer_buffer.outline_ebo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer_buffer.outline_ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)),
+                         outline_indices.data(), GL_STATIC_DRAW);
+            layer_buffer.outline_index_count = (GLsizei)outline_indices.size();
+        }
 
         if (!fill_vertices.empty()) {
             glGenBuffers(1, &layer_buffer.fill_vbo);
@@ -934,8 +1002,14 @@ void uploadLayers(val layers_data, val bbox_data) {
     g_fit_zoom = g_zoom;
     g_fit_pan_x = g_pan_x;
     g_fit_pan_y = g_pan_y;
+    g_total_polygons = total_polygons;
 
-    set_inner_html("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons));
+    // #renderStats is a placeholder draw_frame overwrites every redraw (see
+    // update_render_stats) with the live visible-polygon-count / rendering-
+    // mode readout -- kept as a separate span so draw_frame's per-frame
+    // update doesn't have to re-set the static title/count text above it.
+    set_inner_html("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons) +
+                              "<br><span id=\"renderStats\"></span>");
     update_scale_bar();
     request_redraw();
 }
