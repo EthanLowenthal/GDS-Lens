@@ -38,14 +38,28 @@ using namespace gdstk;
 
 namespace {
 
+// The three a_instance* attributes carry a per-instance 2x3 affine (2x2
+// linear part split into two columns + a translation) mapping an instanced
+// batch's unit-shape local coordinates to world space (see InstancedBatch /
+// draw_frame). Their array pointers are only enabled for instanced draws; for
+// every other (static) draw the arrays stay disabled and each attribute reads
+// its context-level "generic" value instead, which init_gl sets to the
+// identity map (col0=(1,0), col1=(0,1), translate=(0,0)) so a_position passes
+// through unchanged -- no separate non-instanced shader needed.
 const char* kVertexShaderSrc =
     "#version 300 es\n"
     "in vec2 a_position;\n"
+    "in vec2 a_iCol0;\n"
+    "in vec2 a_iCol1;\n"
+    "in vec2 a_iTranslate;\n"
     "uniform vec2 u_resolution;\n"
     "uniform vec2 u_offset;\n"
     "uniform float u_zoom;\n"
     "void main() {\n"
-    "    vec2 centeredPos = a_position - u_offset;\n"
+    "    vec2 worldPos = vec2(\n"
+    "        a_iCol0.x * a_position.x + a_iCol1.x * a_position.y + a_iTranslate.x,\n"
+    "        a_iCol0.y * a_position.x + a_iCol1.y * a_position.y + a_iTranslate.y);\n"
+    "    vec2 centeredPos = worldPos - u_offset;\n"
     "    vec2 zoomedPos = centeredPos * u_zoom;\n"
     "    vec2 clipSpace = (zoomedPos / u_resolution) * 2.0;\n"
     "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
@@ -118,12 +132,39 @@ struct PolygonRange {
     float min_x, max_x, min_y, max_y;
 };
 
+// One reused cell's geometry, uploaded once and drawn instance_count times
+// via glDraw*Instanced with a per-instance 2x3 affine (see a_iCol0/a_iCol1/
+// a_iTranslate in kVertexShaderSrc) -- built from an instance group produced
+// by collect_instanced() so that a cell placed 100,000 times (whether as one
+// AREF or 100,000 individual SREFs at different positions/rotations) costs
+// one unique shape's worth of triangulation/VBO memory instead of 100,000
+// copies of it. fill_vbo/outline_vbo/outline_ebo hold the *unit* shape (the
+// cell's geometry in its own local frame); instance_vbo holds 6 floats
+// (col0.xy, col1.xy, translate.xy) per instance, bound with
+// glVertexAttribDivisor so it advances once per instance.
+struct InstancedBatch {
+    GLuint fill_vbo = 0;
+    GLsizei fill_vertex_count = 0;
+    GLuint outline_vbo = 0;
+    GLuint outline_ebo = 0;
+    GLsizei outline_index_count = 0;
+    // Shared across every layer touched by the same instance group (a group
+    // can span multiple layers, e.g. metal + via) -- deleting the same GL
+    // buffer name more than once is a defined no-op per the GL/WebGL2 spec,
+    // so clear_layers() doesn't need to track ownership per copy.
+    GLuint instance_vbo = 0;
+    GLsizei instance_count = 0;
+};
+
+constexpr GLsizei kInstanceStrideFloats = 6;  // col0.xy, col1.xy, translate.xy
+
 // One pair of VBOs per layer (fill triangles + outline points) holding all
-// of that layer's polygons back-to-back, plus per-polygon (first, count)
-// ranges so each polygon still draws as its own primitive group -- LINE_LOOP
-// loops can't be naively concatenated (the loop-closing edge would connect
-// unrelated polygons), and triangle fans from ear-clipping are similarly
-// per-polygon.
+// of that layer's non-instanced polygons back-to-back, plus per-polygon
+// (first, count) ranges so each polygon still draws as its own primitive
+// group -- LINE_LOOP loops can't be naively concatenated (the loop-closing
+// edge would connect unrelated polygons), and triangle fans from ear-clipping
+// are similarly per-polygon. Repeated references on this layer are drawn
+// separately via instanced_batches instead of being flattened in here.
 struct LayerBuffer {
     uint32_t layer;
     GLuint outline_vbo = 0;
@@ -138,10 +179,13 @@ struct LayerBuffer {
     // constraint, so the whole buffer can be drawn in one glDrawArrays call
     // with no indices needed.
     GLsizei fill_vertex_count = 0;
-    // Polygon count on this layer -- every layer draws unconditionally in
-    // one call each for fill/outline (see draw_frame), so per-polygon
-    // geometry doesn't need to stick around at runtime, just this count for
-    // the UI/stats readout.
+    // Repeated references on this layer -- see InstancedBatch.
+    std::vector<InstancedBatch> instanced_batches;
+    // Logical polygon count on this layer, including instanced copies
+    // (unit-shape polygon count * instance_count for each batch) -- every
+    // layer draws unconditionally in one call each for fill/outline (see
+    // draw_frame), so per-polygon geometry doesn't need to stick around at
+    // runtime, just this count for the UI/stats readout.
     uint32_t polygon_count = 0;
     std::array<float, 4> fill_color{};
     std::array<float, 4> frame_color{};
@@ -177,6 +221,9 @@ struct LypEntry {
 GLuint g_program = 0;
 GLuint g_vao = 0;
 GLint g_loc_position = -1;
+GLint g_loc_i_col0 = -1;
+GLint g_loc_i_col1 = -1;
+GLint g_loc_i_translate = -1;
 GLint g_loc_resolution = -1;
 GLint g_loc_color = -1;
 GLint g_loc_offset = -1;
@@ -264,6 +311,9 @@ bool init_gl() {
     glLinkProgram(g_program);
 
     g_loc_position = glGetAttribLocation(g_program, "a_position");
+    g_loc_i_col0 = glGetAttribLocation(g_program, "a_iCol0");
+    g_loc_i_col1 = glGetAttribLocation(g_program, "a_iCol1");
+    g_loc_i_translate = glGetAttribLocation(g_program, "a_iTranslate");
     g_loc_resolution = glGetUniformLocation(g_program, "u_resolution");
     g_loc_color = glGetUniformLocation(g_program, "u_color");
     g_loc_offset = glGetUniformLocation(g_program, "u_offset");
@@ -276,6 +326,15 @@ bool init_gl() {
 
     glGenVertexArrays(1, &g_vao);
     glBindVertexArray(g_vao);
+
+    // Generic (array-disabled) values for the per-instance affine attributes:
+    // the identity map, so static (non-instanced) draws -- which never enable
+    // these arrays -- pass a_position straight through (see kVertexShaderSrc).
+    // These are context state, not VAO state, so setting them once here holds
+    // for every later draw that leaves the arrays disabled.
+    if (g_loc_i_col0 >= 0) glVertexAttrib2f(g_loc_i_col0, 1.0f, 0.0f);
+    if (g_loc_i_col1 >= 0) glVertexAttrib2f(g_loc_i_col1, 0.0f, 1.0f);
+    if (g_loc_i_translate >= 0) glVertexAttrib2f(g_loc_i_translate, 0.0f, 0.0f);
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -596,6 +655,55 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
             glDrawElements(GL_LINE_LOOP, layer.outline_index_count, GL_UNSIGNED_INT, 0);
         }
+
+        // Reused cells: one unique unit shape drawn instance_count times,
+        // each placed by a per-instance 2x3 affine read from instance_vbo
+        // (see a_iCol0/a_iCol1/a_iTranslate in kVertexShaderSrc). The divisor
+        // makes those attributes advance once per instance instead of once
+        // per vertex; the arrays are disabled again after each batch so the
+        // affine reverts to the identity generic value (set in init_gl) for
+        // the non-instanced draws above/below.
+        for (const InstancedBatch& batch : layer.instanced_batches) {
+            const GLsizei stride = kInstanceStrideFloats * (GLsizei)sizeof(float);
+            glBindBuffer(GL_ARRAY_BUFFER, batch.instance_vbo);
+            glEnableVertexAttribArray(g_loc_i_col0);
+            glVertexAttribPointer(g_loc_i_col0, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+            glVertexAttribDivisor(g_loc_i_col0, 1);
+            glEnableVertexAttribArray(g_loc_i_col1);
+            glVertexAttribPointer(g_loc_i_col1, 2, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+            glVertexAttribDivisor(g_loc_i_col1, 1);
+            glEnableVertexAttribArray(g_loc_i_translate);
+            glVertexAttribPointer(g_loc_i_translate, 2, GL_FLOAT, GL_FALSE, stride, (void*)(4 * sizeof(float)));
+            glVertexAttribDivisor(g_loc_i_translate, 1);
+
+            if (batch.fill_vbo) {
+                glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
+                glEnableVertexAttribArray(g_loc_position);
+                glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+                glUniform4fv(g_loc_color, 1, layer.fill_color.data());
+                glUniform1f(g_loc_use_hatch, 1.0f);
+                glUniform1f(g_loc_pattern_type, layer.pattern_type);
+                glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
+                glUniform1f(g_loc_hatch_spacing, kHatchSpacingPx);
+                glUniform1f(g_loc_hatch_width, kHatchHalfWidthPx);
+                glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
+            }
+
+            if (batch.outline_ebo) {
+                glBindBuffer(GL_ARRAY_BUFFER, batch.outline_vbo);
+                glEnableVertexAttribArray(g_loc_position);
+                glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+                glUniform4fv(g_loc_color, 1, layer.frame_color.data());
+                glUniform1f(g_loc_use_hatch, 0.0f);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
+                glDrawElementsInstanced(GL_LINE_LOOP, batch.outline_index_count, GL_UNSIGNED_INT, 0,
+                                        batch.instance_count);
+            }
+
+            glDisableVertexAttribArray(g_loc_i_col0);
+            glDisableVertexAttribArray(g_loc_i_col1);
+            glDisableVertexAttribArray(g_loc_i_translate);
+        }
     }
     update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size());
     return false;
@@ -631,22 +739,255 @@ void clear_layers() {
         if (layer.outline_vbo) glDeleteBuffers(1, &layer.outline_vbo);
         if (layer.outline_ebo) glDeleteBuffers(1, &layer.outline_ebo);
         if (layer.fill_vbo) glDeleteBuffers(1, &layer.fill_vbo);
+        for (InstancedBatch& batch : layer.instanced_batches) {
+            if (batch.fill_vbo) glDeleteBuffers(1, &batch.fill_vbo);
+            if (batch.outline_vbo) glDeleteBuffers(1, &batch.outline_vbo);
+            if (batch.outline_ebo) glDeleteBuffers(1, &batch.outline_ebo);
+            if (batch.instance_vbo) glDeleteBuffers(1, &batch.instance_vbo);
+        }
     }
     g_layers.clear();
 }
 
-void flatten_cell_by_layer(Cell* cell, std::unordered_map<uint32_t, std::vector<Polygon*>>& by_layer) {
+// A 2D affine map x' = a*x + b*y + tx, y' = c*x + d*y + ty. Used to track the
+// accumulated transform down a reference tree without materializing
+// geometry at every level (see collect_instanced) -- gdstk's own
+// Reference::transform composes Reference structs directly, but we need to
+// split a reference's transform into its linear part (mag/x_reflection/
+// rotation) and translation part (origin) separately, since only the
+// translation varies across one repeated reference's instances.
+struct Affine2D {
+    double a = 1.0, b = 0.0, c = 0.0, d = 1.0;
+    double tx = 0.0, ty = 0.0;
+
+    Vec2 apply_point(const Vec2& p) const { return {a * p.x + b * p.y + tx, c * p.x + d * p.y + ty}; }
+    Vec2 apply_linear(const Vec2& p) const { return {a * p.x + b * p.y, c * p.x + d * p.y}; }
+};
+
+// Composes two affine maps so that the result's apply_point matches
+// outer.apply_point(inner.apply_point(p)) for any point p.
+Affine2D compose_affine(const Affine2D& outer, const Affine2D& inner) {
+    Affine2D r;
+    r.a = outer.a * inner.a + outer.b * inner.c;
+    r.b = outer.a * inner.b + outer.b * inner.d;
+    r.c = outer.c * inner.a + outer.d * inner.c;
+    r.d = outer.c * inner.b + outer.d * inner.d;
+    Vec2 t = outer.apply_point({inner.tx, inner.ty});
+    r.tx = t.x;
+    r.ty = t.y;
+    return r;
+}
+
+// Linear-only part (magnification, x_reflection, rotation) of a Reference's
+// own transform -- mirrors the per-point math in
+// Reference::repeat_and_transform, minus the +origin/+offset translation
+// term, which collect_instanced applies separately per instance.
+Affine2D reference_linear_transform(const Reference* ref) {
+    double mag = ref->magnification;
+    double ca = cos(ref->rotation), sa = sin(ref->rotation);
+    double sy = ref->x_reflection ? -1.0 : 1.0;
+    Affine2D t;
+    t.a = mag * ca;
+    t.b = -mag * sy * sa;
+    t.c = mag * sa;
+    t.d = mag * sy * ca;
+    return t;
+}
+
+void transform_points(Array<Vec2>& points, const Affine2D& t, bool with_translation) {
+    for (uint64_t i = 0; i < points.count; i++) {
+        points[i] = with_translation ? t.apply_point(points[i]) : t.apply_linear(points[i]);
+    }
+}
+
+// The full transform (linear part + origin translation) a reference applies
+// to its target cell's local coordinates. offset is the extra per-copy
+// displacement from the reference's repetition (see get_offsets); (0,0) for a
+// plain non-repeated reference.
+Affine2D reference_placement(const Reference* ref, const Vec2& offset) {
+    Affine2D t = reference_linear_transform(ref);
+    t.tx = ref->origin.x + offset.x;
+    t.ty = ref->origin.y + offset.y;
+    return t;
+}
+
+// One reused cell's worth of geometry: a single "unit shape" in the cell's
+// own local frame (see build_instance_templates) plus one per-instance 2x3
+// affine mapping that unit shape into world space -- one entry per place the
+// cell ends up drawn. The unit shape is triangulated/uploaded once regardless
+// of how many instances there are, which is the whole point: a cell placed
+// 800k times (as one AREF or 800k separate SREFs) costs one shape plus 800k
+// cheap affines instead of 800k full copies.
+struct InstanceGroupPolys {
+    std::unordered_map<uint32_t, std::vector<Polygon*>> by_layer_unit;
+    std::vector<Affine2D> instances;
+};
+
+// Fully flattens cell's whole subtree into concrete polygons in the cell's
+// own local frame (every reference and repetition expanded, no instancing) --
+// the unit shape baked once per instanced cell. Any reuse *inside* this
+// subtree is materialized here rather than sub-instanced, which keeps GPU
+// instancing to a single level (an instanced cell's template may itself
+// contain other instanced cells, but along any path collect_instanced stops
+// at the outermost one -- see its comment -- so nothing is double-drawn).
+void build_cell_template(Cell* cell, std::unordered_map<uint32_t, std::vector<Polygon*>>& out_by_layer) {
     Array<Polygon*> polygons = {};
-    // Same call shape as bindings.cpp's flatten_cell_into: apply_repetitions
-    // expands AREF/array repetitions, include_paths converts
-    // FlexPath/RobustPath outlines to polygons, depth=-1 recurses the full
-    // reference tree.
     cell->get_polygons(true, true, -1, false, 0, polygons);
     for (uint64_t i = 0; i < polygons.count; i++) {
         Polygon* poly = polygons[i];
-        by_layer[get_layer(poly->tag)].push_back(poly);
+        out_by_layer[get_layer(poly->tag)].push_back(poly);
     }
     polygons.clear();
+}
+
+// Number of expanded instances of each cell across the whole rendered design
+// -- i.e. how many times its own geometry would appear if the hierarchy were
+// fully flattened. Used to decide which cells are worth GPU-instancing (see
+// choose_instanced_cells): a cell placed thousands of times is; a cell placed
+// once or twice isn't (instancing it would only add draw calls). Computed as
+// a saturating double because the true count can overflow any integer for
+// deep arrayed hierarchies -- and overflowing is itself a strong "instance
+// this" signal, so saturation at the threshold is harmless.
+constexpr double kInstanceCountCap = 1e18;
+
+// A cell is GPU-instanced when it's placed at least this many times. Below
+// this, flattening the few copies into the static per-layer buffers is
+// cheaper than the extra per-batch draw calls instancing would add.
+constexpr double kInstanceThreshold = 8.0;
+
+// Fills counts[C] = expanded instance count of C, via memoized recursion over
+// the reference DAG (GDS references never form a cycle). roots are the cells
+// rendered directly at top level (each contributes 1); every reference
+// multiplies its target's count by the parent's count times the reference's
+// repetition count.
+double compute_instance_count(Cell* cell, const std::unordered_map<Cell*, double>& base_counts,
+                              std::unordered_map<Cell*, double>& memo,
+                              std::unordered_map<Cell*, int>& visiting);
+
+double count_contributions_from_parents(Cell* cell, const std::unordered_map<Cell*, double>& base_counts,
+                                         std::unordered_map<Cell*, double>& memo,
+                                         std::unordered_map<Cell*, int>& visiting,
+                                         const std::unordered_map<Cell*, std::vector<std::pair<Cell*, double>>>& preds) {
+    double total = base_counts.count(cell) ? base_counts.at(cell) : 0.0;
+    auto it = preds.find(cell);
+    if (it != preds.end()) {
+        for (const auto& pr : it->second) {
+            double parent_count = compute_instance_count(pr.first, base_counts, memo, visiting);
+            total += parent_count * pr.second;
+            if (total >= kInstanceCountCap) return kInstanceCountCap;
+        }
+    }
+    return total;
+}
+
+// preds is captured via a thread-local-ish shim below; see choose_instanced_cells.
+const std::unordered_map<Cell*, std::vector<std::pair<Cell*, double>>>* g_preds_for_count = nullptr;
+
+double compute_instance_count(Cell* cell, const std::unordered_map<Cell*, double>& base_counts,
+                              std::unordered_map<Cell*, double>& memo,
+                              std::unordered_map<Cell*, int>& visiting) {
+    auto m = memo.find(cell);
+    if (m != memo.end()) return m->second;
+    // Guard against a malformed cyclic library (shouldn't happen in valid
+    // GDS): treat a cell currently being computed as contributing nothing on
+    // the back-edge rather than recursing forever.
+    if (visiting[cell]) return 0.0;
+    visiting[cell] = 1;
+    double total = count_contributions_from_parents(cell, base_counts, memo, visiting, *g_preds_for_count);
+    visiting[cell] = 0;
+    memo[cell] = total;
+    return total;
+}
+
+// Picks the set of cells to GPU-instance: those placed >= kInstanceThreshold
+// times across the design. Builds the reference DAG's reverse adjacency
+// (child -> [(parent, repetition_count)]) once, then evaluates
+// compute_instance_count for every cell.
+std::unordered_map<Cell*, bool> choose_instanced_cells(Library& lib,
+                                                       const std::unordered_map<Cell*, double>& base_counts) {
+    std::unordered_map<Cell*, std::vector<std::pair<Cell*, double>>> preds;
+    for (uint64_t i = 0; i < lib.cell_array.count; i++) {
+        Cell* parent = lib.cell_array[i];
+        for (uint64_t r = 0; r < parent->reference_array.count; r++) {
+            Reference* ref = parent->reference_array[r];
+            if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
+            // get_count() returns 0 for a plain (non-arrayed) reference; that
+            // reference still places one copy, so floor it at 1.
+            uint64_t rep_count = ref->repetition.get_count();
+            double rep = rep_count > 0 ? (double)rep_count : 1.0;
+            preds[ref->cell].push_back({parent, rep});
+        }
+    }
+    g_preds_for_count = &preds;
+
+    std::unordered_map<Cell*, double> memo;
+    std::unordered_map<Cell*, int> visiting;
+    std::unordered_map<Cell*, bool> instanced;
+    for (uint64_t i = 0; i < lib.cell_array.count; i++) {
+        Cell* cell = lib.cell_array[i];
+        double count = compute_instance_count(cell, base_counts, memo, visiting);
+        instanced[cell] = count >= kInstanceThreshold;
+    }
+    g_preds_for_count = nullptr;
+    return instanced;
+}
+
+// Walks cell's reference tree under the accumulated transform `current`,
+// splitting geometry into:
+//   * by_layer_static -- plain per-layer polygons already in world space, for
+//     cells not worth instancing (placed only a handful of times), same as a
+//     full flatten would produce; and
+//   * groups -- one InstanceGroupPolys per instanced cell (see `instanced`),
+//     accumulating a per-instance affine each time that cell is placed.
+// Descent stops at the first instanced cell on any path (its whole subtree is
+// captured by its template, built separately), so no polygon is emitted
+// twice. templates_needed collects which cells actually got instanced so the
+// caller only builds templates for those.
+void collect_instanced(Cell* cell, const Affine2D& current,
+                       const std::unordered_map<Cell*, bool>& instanced,
+                       std::unordered_map<uint32_t, std::vector<Polygon*>>& by_layer_static,
+                       std::unordered_map<Cell*, InstanceGroupPolys>& groups) {
+    // This cell's own polygons/paths only (depth=0); apply_repetitions still
+    // expands any repetition attached directly to a polygon/path (a rarer
+    // feature distinct from a Reference's repetition), left as static
+    // geometry.
+    Array<Polygon*> own_polygons = {};
+    cell->get_polygons(true, true, 0, false, 0, own_polygons);
+    for (uint64_t i = 0; i < own_polygons.count; i++) {
+        Polygon* poly = own_polygons[i];
+        transform_points(poly->point_array, current, /*with_translation=*/true);
+        by_layer_static[get_layer(poly->tag)].push_back(poly);
+    }
+    own_polygons.clear();
+
+    for (uint64_t i = 0; i < cell->reference_array.count; i++) {
+        Reference* ref = cell->reference_array[i];
+        if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
+
+        // One (0,0) offset for a plain reference, one per copy for an AREF.
+        Vec2 zero = {0, 0};
+        Array<Vec2> offsets = {};
+        if (ref->repetition.type != RepetitionType::None) {
+            ref->repetition.get_offsets(offsets);
+        } else {
+            offsets.count = 1;
+            offsets.items = &zero;
+        }
+
+        auto it = instanced.find(ref->cell);
+        bool is_instanced = it != instanced.end() && it->second;
+
+        for (uint64_t k = 0; k < offsets.count; k++) {
+            Affine2D placement = compose_affine(current, reference_placement(ref, offsets[k]));
+            if (is_instanced) {
+                groups[ref->cell].instances.push_back(placement);
+            } else {
+                collect_instanced(ref->cell, placement, instanced, by_layer_static, groups);
+            }
+        }
+
+        if (ref->repetition.type != RepetitionType::None) offsets.clear();
+    }
 }
 
 // Fresh JS-owned Float32Array copied out of a wasm-heap vector -- mirrors
@@ -771,6 +1112,149 @@ bool on_resize(int /*eventType*/, const EmscriptenUiEvent* /*e*/, void* /*userDa
     return true;
 }
 
+// Triangulates polys (already fully positioned in whatever coordinate frame
+// the caller wants -- world space for static layers, unit space for an
+// instance group's shape) into the same JS-facing
+// {outlineVertices,outlineRanges,fillVertices,fillRanges} layout
+// parseGdsToLayers has always produced, reusable for both. Reports the
+// bounding box of every point it consumed via out_min/max (min > max if
+// polys was empty) so the caller can fold it into whatever bbox accumulator
+// applies (design bbox for static layers, unit-shape bbox for a group -- see
+// parseGdsToLayers). Frees every Polygon* in polys before returning.
+val build_layer_entry(uint32_t layer_number, std::vector<Polygon*>& polys, uint64_t& out_polygon_count,
+                      double& out_min_x, double& out_max_x, double& out_min_y, double& out_max_y) {
+    out_polygon_count = polys.size();
+    out_min_x = HUGE_VAL;
+    out_max_x = -HUGE_VAL;
+    out_min_y = HUGE_VAL;
+    out_max_y = -HUGE_VAL;
+
+    uint64_t point_total = 0;
+    for (Polygon* poly : polys) point_total += poly->point_array.count;
+
+    std::vector<float> outline_vertices;
+    outline_vertices.reserve(point_total * 2);
+    std::vector<float> fill_vertices;
+    val outline_ranges = val::array();
+    val fill_ranges = val::array();
+    std::vector<uint32_t> tri_indices;
+
+    for (Polygon* poly : polys) {
+        uint32_t first = (uint32_t)(outline_vertices.size() / 2);
+        for (uint64_t i = 0; i < poly->point_array.count; i++) {
+            const Vec2& pt = poly->point_array[i];
+            outline_vertices.push_back((float)pt.x);
+            outline_vertices.push_back((float)pt.y);
+            out_min_x = std::min(out_min_x, pt.x);
+            out_max_x = std::max(out_max_x, pt.x);
+            out_min_y = std::min(out_min_y, pt.y);
+            out_max_y = std::max(out_max_y, pt.y);
+        }
+        val outline_range = val::array();
+        outline_range.set(0, first);
+        outline_range.set(1, (uint32_t)poly->point_array.count);
+        outline_ranges.call<void>("push", outline_range);
+
+        tri_indices.clear();
+        triangulate(poly->point_array, tri_indices);
+        if (!tri_indices.empty()) {
+            uint32_t fill_first = (uint32_t)(fill_vertices.size() / 2);
+            for (uint32_t idx : tri_indices) {
+                const Vec2& pt = poly->point_array[idx];
+                fill_vertices.push_back((float)pt.x);
+                fill_vertices.push_back((float)pt.y);
+            }
+            val fill_range = val::array();
+            fill_range.set(0, fill_first);
+            fill_range.set(1, (uint32_t)tri_indices.size());
+            fill_ranges.call<void>("push", fill_range);
+        }
+    }
+
+    val layer_entry = val::object();
+    layer_entry.set("layer", layer_number);
+    layer_entry.set("outlineVertices", to_float32_array(outline_vertices));
+    layer_entry.set("outlineRanges", outline_ranges);
+    layer_entry.set("fillVertices", to_float32_array(fill_vertices));
+    layer_entry.set("fillRanges", fill_ranges);
+
+    for (Polygon* poly : polys) {
+        poly->clear();
+        free_allocation(poly);
+    }
+
+    return layer_entry;
+}
+
+// Result of uploading one {outlineVertices,outlineRanges,fillVertices,
+// fillRanges} JS entry (as produced by build_layer_entry) to fresh GL
+// buffers -- shared by both uploadLayers' static per-layer path and its
+// per-(instance group, layer) path, which otherwise did the exact same VBO/
+// EBO construction.
+struct UploadedGeometry {
+    GLuint outline_vbo = 0;
+    GLuint outline_ebo = 0;
+    GLsizei outline_index_count = 0;
+    GLuint fill_vbo = 0;
+    GLsizei fill_vertex_count = 0;
+    uint32_t polygon_count = 0;
+    float min_x = HUGE_VAL, max_x = -HUGE_VAL, min_y = HUGE_VAL, max_y = -HUGE_VAL;
+};
+
+UploadedGeometry upload_geometry(val entry) {
+    UploadedGeometry g;
+
+    // convertJSArrayToNumberVector does one bulk typed_memory_view copy;
+    // vecFromJSArray would marshal one element at a time, which is too slow
+    // for vertex buffers that can run into the millions of floats.
+    std::vector<float> outline_vertices = convertJSArrayToNumberVector<float>(entry["outlineVertices"]);
+    std::vector<float> fill_vertices = convertJSArrayToNumberVector<float>(entry["fillVertices"]);
+
+    val outline_ranges = entry["outlineRanges"];
+    unsigned outline_range_count = outline_ranges["length"].as<unsigned>();
+    // Indices for outline_ebo: each polygon's vertex range followed by a
+    // restart marker, so the whole layer/batch can be drawn as one
+    // GL_LINE_LOOP glDraw(Elements|ElementsInstanced) call (see draw_frame).
+    std::vector<uint32_t> outline_indices;
+    outline_indices.reserve(outline_vertices.size() / 2 + outline_range_count);
+    for (unsigned r = 0; r < outline_range_count; r++) {
+        val range = outline_ranges[r];
+        uint32_t first = range[0].as<uint32_t>();
+        uint32_t count = range[1].as<uint32_t>();
+        PolygonRange pr = make_range(outline_vertices, (GLint)first, (GLsizei)count);
+        g.min_x = std::min(g.min_x, pr.min_x);
+        g.max_x = std::max(g.max_x, pr.max_x);
+        g.min_y = std::min(g.min_y, pr.min_y);
+        g.max_y = std::max(g.max_y, pr.max_y);
+        for (uint32_t k = 0; k < count; k++) outline_indices.push_back(first + k);
+        outline_indices.push_back(kRestartIndex);
+    }
+    g.polygon_count = outline_range_count;
+    g.fill_vertex_count = (GLsizei)(fill_vertices.size() / 2);
+
+    glGenBuffers(1, &g.outline_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g.outline_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(outline_vertices.size() * sizeof(float)), outline_vertices.data(),
+                GL_STATIC_DRAW);
+
+    if (!outline_indices.empty()) {
+        glGenBuffers(1, &g.outline_ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.outline_ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)),
+                    outline_indices.data(), GL_STATIC_DRAW);
+        g.outline_index_count = (GLsizei)outline_indices.size();
+    }
+
+    if (!fill_vertices.empty()) {
+        glGenBuffers(1, &g.fill_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, g.fill_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(fill_vertices.size() * sizeof(float)), fill_vertices.data(),
+                    GL_STATIC_DRAW);
+    }
+
+    return g;
+}
+
 }  // namespace
 
 // Parses, flattens, and triangulates a GDS file into plain per-layer vertex
@@ -797,25 +1281,40 @@ val parseGdsToLayers(const std::string& path) {
     Array<RawCell*> top_rawcells = {};
     lib.top_level(top_cells, top_rawcells);
 
-    uint64_t renderable_cells = 0;
+    // The cells we actually render at top level (each an instance-count root):
+    // every non-metadata top cell, or -- if the hierarchy has no clean root
+    // (e.g. a reference cycle) -- the last cell defined, mirroring common GDS
+    // tooling. base_counts seeds compute_instance_count with 1 per root.
+    std::vector<Cell*> roots;
     for (uint64_t i = 0; i < top_cells.count; i++) {
-        if (!gds_common::is_metadata_cell(top_cells[i])) renderable_cells++;
+        if (!gds_common::is_metadata_cell(top_cells[i])) roots.push_back(top_cells[i]);
     }
-
-    std::unordered_map<uint32_t, std::vector<Polygon*>> by_layer;
-    uint64_t rendered_top_cells = 0;
-    for (uint64_t i = 0; i < top_cells.count; i++) {
-        if (gds_common::is_metadata_cell(top_cells[i])) continue;
-        flatten_cell_by_layer(top_cells[i], by_layer);
-        rendered_top_cells++;
-        report_progress("flattening", rendered_top_cells, renderable_cells);
-    }
-    if (rendered_top_cells == 0 && lib.cell_array.count > 0) {
-        flatten_cell_by_layer(lib.cell_array[lib.cell_array.count - 1], by_layer);
-        report_progress("flattening", 1, 1);
+    if (roots.empty() && lib.cell_array.count > 0) {
+        roots.push_back(lib.cell_array[lib.cell_array.count - 1]);
     }
     top_cells.clear();
     top_rawcells.clear();
+
+    std::unordered_map<Cell*, double> base_counts;
+    for (Cell* root : roots) base_counts[root] += 1.0;
+
+    // Decide which cells are reused enough to GPU-instance, then split the
+    // design into static geometry + one instance group per instanced cell.
+    std::unordered_map<Cell*, bool> instanced = choose_instanced_cells(lib, base_counts);
+
+    std::unordered_map<uint32_t, std::vector<Polygon*>> by_layer_static;
+    std::unordered_map<Cell*, InstanceGroupPolys> groups;
+    uint64_t root_index = 0;
+    for (Cell* root : roots) {
+        collect_instanced(root, Affine2D{}, instanced, by_layer_static, groups);
+        root_index++;
+        report_progress("flattening", root_index, roots.size());
+    }
+
+    // Build the unit shape (once) for every cell that actually got instances.
+    for (auto& kv : groups) {
+        build_cell_template(kv.first, kv.second.by_layer_unit);
+    }
 
     double min_x = HUGE_VAL, max_x = -HUGE_VAL;
     double min_y = HUGE_VAL, max_y = -HUGE_VAL;
@@ -823,70 +1322,106 @@ val parseGdsToLayers(const std::string& path) {
 
     val layers = val::array();
     uint64_t layer_index = 0;
-    uint64_t layer_total = by_layer.size();
+    uint64_t layer_total = by_layer_static.size();
+    for (const auto& kv : groups) layer_total += kv.second.by_layer_unit.size();
 
-    for (auto& entry : by_layer) {
-        uint32_t layer_number = entry.first;
-        std::vector<Polygon*>& polys = entry.second;
-
-        uint64_t point_total = 0;
-        for (Polygon* poly : polys) point_total += poly->point_array.count;
-
-        std::vector<float> outline_vertices;
-        outline_vertices.reserve(point_total * 2);
-        std::vector<float> fill_vertices;
-        val outline_ranges = val::array();
-        val fill_ranges = val::array();
-        std::vector<uint32_t> tri_indices;
-
-        for (Polygon* poly : polys) {
-            uint32_t first = (uint32_t)(outline_vertices.size() / 2);
-            for (uint64_t i = 0; i < poly->point_array.count; i++) {
-                const Vec2& pt = poly->point_array[i];
-                outline_vertices.push_back((float)pt.x);
-                outline_vertices.push_back((float)pt.y);
-                min_x = std::min(min_x, pt.x);
-                max_x = std::max(max_x, pt.x);
-                min_y = std::min(min_y, pt.y);
-                max_y = std::max(max_y, pt.y);
-            }
-            val outline_range = val::array();
-            outline_range.set(0, first);
-            outline_range.set(1, (uint32_t)poly->point_array.count);
-            outline_ranges.call<void>("push", outline_range);
-            total_polygons++;
-
-            tri_indices.clear();
-            triangulate(poly->point_array, tri_indices);
-            if (!tri_indices.empty()) {
-                uint32_t fill_first = (uint32_t)(fill_vertices.size() / 2);
-                for (uint32_t idx : tri_indices) {
-                    const Vec2& pt = poly->point_array[idx];
-                    fill_vertices.push_back((float)pt.x);
-                    fill_vertices.push_back((float)pt.y);
-                }
-                val fill_range = val::array();
-                fill_range.set(0, fill_first);
-                fill_range.set(1, (uint32_t)tri_indices.size());
-                fill_ranges.call<void>("push", fill_range);
-            }
+    for (auto& entry : by_layer_static) {
+        uint64_t layer_polygon_count = 0;
+        double lmin_x, lmax_x, lmin_y, lmax_y;
+        val layer_entry = build_layer_entry(entry.first, entry.second, layer_polygon_count, lmin_x, lmax_x, lmin_y, lmax_y);
+        if (layer_polygon_count > 0 && lmin_x <= lmax_x) {
+            min_x = std::min(min_x, lmin_x);
+            max_x = std::max(max_x, lmax_x);
+            min_y = std::min(min_y, lmin_y);
+            max_y = std::max(max_y, lmax_y);
         }
-
-        val layer_entry = val::object();
-        layer_entry.set("layer", layer_number);
-        layer_entry.set("outlineVertices", to_float32_array(outline_vertices));
-        layer_entry.set("outlineRanges", outline_ranges);
-        layer_entry.set("fillVertices", to_float32_array(fill_vertices));
-        layer_entry.set("fillRanges", fill_ranges);
+        total_polygons += layer_polygon_count;
         layers.call<void>("push", layer_entry);
-
-        for (Polygon* poly : polys) {
-            poly->clear();
-            free_allocation(poly);
-        }
 
         layer_index++;
         report_progress("triangulating", layer_index, layer_total);
+    }
+
+    // Each instance group becomes one JS entry: a flat per-instance affine
+    // array (6 floats each -- col0.xy, col1.xy, translate.xy) plus the group's
+    // unit shape split by layer the same way static layers are. The group's
+    // world footprint is the unit-shape bbox's four corners mapped through
+    // every instance affine (rotation/mirror can vary per instance, so a
+    // simple min/max of translations isn't enough) -- used both to grow the
+    // design bbox here and, on the main thread, each touched layer's cull box.
+    val instance_groups_js = val::array();
+    for (auto& kv : groups) {
+        InstanceGroupPolys& group = kv.second;
+        double group_min_x = HUGE_VAL, group_max_x = -HUGE_VAL;
+        double group_min_y = HUGE_VAL, group_max_y = -HUGE_VAL;
+        val group_layers = val::array();
+        uint64_t unit_polygon_count_sum = 0;
+
+        for (auto& entry : group.by_layer_unit) {
+            uint64_t layer_polygon_count = 0;
+            double lmin_x, lmax_x, lmin_y, lmax_y;
+            val layer_entry =
+                build_layer_entry(entry.first, entry.second, layer_polygon_count, lmin_x, lmax_x, lmin_y, lmax_y);
+            if (layer_polygon_count > 0 && lmin_x <= lmax_x) {
+                group_min_x = std::min(group_min_x, lmin_x);
+                group_max_x = std::max(group_max_x, lmax_x);
+                group_min_y = std::min(group_min_y, lmin_y);
+                group_max_y = std::max(group_max_y, lmax_y);
+            }
+            unit_polygon_count_sum += layer_polygon_count;
+            group_layers.call<void>("push", layer_entry);
+
+            layer_index++;
+            report_progress("triangulating", layer_index, layer_total);
+        }
+
+        uint64_t instance_count = group.instances.size();
+        total_polygons += unit_polygon_count_sum * instance_count;
+
+        std::vector<float> instances_flat;
+        instances_flat.reserve(group.instances.size() * kInstanceStrideFloats);
+        double g_min_x = HUGE_VAL, g_max_x = -HUGE_VAL, g_min_y = HUGE_VAL, g_max_y = -HUGE_VAL;
+        bool have_unit_bbox = unit_polygon_count_sum > 0 && group_min_x <= group_max_x;
+        Vec2 unit_corners[4] = {{group_min_x, group_min_y},
+                                {group_max_x, group_min_y},
+                                {group_min_x, group_max_y},
+                                {group_max_x, group_max_y}};
+        for (const Affine2D& m : group.instances) {
+            instances_flat.push_back((float)m.a);
+            instances_flat.push_back((float)m.c);
+            instances_flat.push_back((float)m.b);
+            instances_flat.push_back((float)m.d);
+            instances_flat.push_back((float)m.tx);
+            instances_flat.push_back((float)m.ty);
+            if (have_unit_bbox) {
+                for (const Vec2& corner : unit_corners) {
+                    Vec2 w = m.apply_point(corner);
+                    g_min_x = std::min(g_min_x, w.x);
+                    g_max_x = std::max(g_max_x, w.x);
+                    g_min_y = std::min(g_min_y, w.y);
+                    g_max_y = std::max(g_max_y, w.y);
+                }
+            }
+        }
+
+        if (have_unit_bbox && instance_count > 0) {
+            min_x = std::min(min_x, g_min_x);
+            max_x = std::max(max_x, g_max_x);
+            min_y = std::min(min_y, g_min_y);
+            max_y = std::max(max_y, g_max_y);
+        }
+
+        val group_bbox = val::object();
+        group_bbox.set("minX", g_min_x);
+        group_bbox.set("maxX", g_max_x);
+        group_bbox.set("minY", g_min_y);
+        group_bbox.set("maxY", g_max_y);
+
+        val group_entry = val::object();
+        group_entry.set("instances", to_float32_array(instances_flat));
+        group_entry.set("layers", group_layers);
+        group_entry.set("bbox", group_bbox);
+        instance_groups_js.call<void>("push", group_entry);
     }
 
     lib.free_all();
@@ -900,6 +1435,7 @@ val parseGdsToLayers(const std::string& path) {
     result.set("ok", true);
     result.set("error", std::string(gds_common::error_string(error_code)));
     result.set("layers", layers);
+    result.set("instanceGroups", instance_groups_js);
     result.set("bbox", bbox);
     result.set("totalPolygons", total_polygons);
     return result;
@@ -909,68 +1445,116 @@ val parseGdsToLayers(const std::string& path) {
 // vertex data produced by parseGdsToLayers() (either called directly, or
 // reconstructed from a Worker's 'gdsResult' postMessage) and turns it into
 // VBOs + camera framing. Must run on the main thread (owns the GL context).
-void uploadLayers(val layers_data, val bbox_data) {
+void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     if (!g_gl_ready) return;
     clear_layers();
 
     unsigned layer_count = layers_data["length"].as<unsigned>();
+    unsigned group_count = instance_groups_data["length"].as<unsigned>();
+
+    // Reserve enough capacity that g_layers never reallocates while this
+    // function holds a raw pointer into it (see the group loop below) -- a
+    // layer that only appears inside a repeated reference, never directly at
+    // the top level, creates a brand new entry while processing groups.
+    uint64_t max_new_layers = layer_count;
+    for (unsigned gi = 0; gi < group_count; gi++) {
+        max_new_layers += instance_groups_data[gi]["layers"]["length"].as<unsigned>();
+    }
+    g_layers.reserve(g_layers.size() + max_new_layers);
+
+    std::unordered_map<uint32_t, size_t> layer_index_by_number;
     uint64_t total_polygons = 0;
+
     for (unsigned i = 0; i < layer_count; i++) {
         val entry = layers_data[i];
         LayerBuffer layer_buffer;
         layer_buffer.layer = entry["layer"].as<uint32_t>();
 
-        // convertJSArrayToNumberVector does one bulk typed_memory_view copy;
-        // vecFromJSArray would marshal one element at a time, which is too
-        // slow for vertex buffers that can run into the millions of floats.
-        std::vector<float> outline_vertices = convertJSArrayToNumberVector<float>(entry["outlineVertices"]);
-        std::vector<float> fill_vertices = convertJSArrayToNumberVector<float>(entry["fillVertices"]);
-
-        val outline_ranges = entry["outlineRanges"];
-        unsigned outline_range_count = outline_ranges["length"].as<unsigned>();
-        // Indices for outline_ebo: each polygon's vertex range followed by a
-        // restart marker, so the whole layer can be drawn as one
-        // GL_LINE_LOOP glDrawElements call (see draw_frame).
-        std::vector<uint32_t> outline_indices;
-        outline_indices.reserve(outline_vertices.size() / 2 + outline_range_count);
-        for (unsigned r = 0; r < outline_range_count; r++) {
-            val range = outline_ranges[r];
-            uint32_t first = range[0].as<uint32_t>();
-            uint32_t count = range[1].as<uint32_t>();
-            PolygonRange pr = make_range(outline_vertices, (GLint)first, (GLsizei)count);
-            layer_buffer.min_x = std::min(layer_buffer.min_x, pr.min_x);
-            layer_buffer.max_x = std::max(layer_buffer.max_x, pr.max_x);
-            layer_buffer.min_y = std::min(layer_buffer.min_y, pr.min_y);
-            layer_buffer.max_y = std::max(layer_buffer.max_y, pr.max_y);
-            for (uint32_t k = 0; k < count; k++) outline_indices.push_back(first + k);
-            outline_indices.push_back(kRestartIndex);
-        }
-        layer_buffer.polygon_count = outline_range_count;
-        total_polygons += outline_range_count;
-        layer_buffer.fill_vertex_count = (GLsizei)(fill_vertices.size() / 2);
-
-        glGenBuffers(1, &layer_buffer.outline_vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, layer_buffer.outline_vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(outline_vertices.size() * sizeof(float)), outline_vertices.data(),
-                     GL_STATIC_DRAW);
-
-        if (!outline_indices.empty()) {
-            glGenBuffers(1, &layer_buffer.outline_ebo);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer_buffer.outline_ebo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)),
-                         outline_indices.data(), GL_STATIC_DRAW);
-            layer_buffer.outline_index_count = (GLsizei)outline_indices.size();
-        }
-
-        if (!fill_vertices.empty()) {
-            glGenBuffers(1, &layer_buffer.fill_vbo);
-            glBindBuffer(GL_ARRAY_BUFFER, layer_buffer.fill_vbo);
-            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(fill_vertices.size() * sizeof(float)), fill_vertices.data(),
-                         GL_STATIC_DRAW);
-        }
+        UploadedGeometry g = upload_geometry(entry);
+        layer_buffer.outline_vbo = g.outline_vbo;
+        layer_buffer.outline_ebo = g.outline_ebo;
+        layer_buffer.outline_index_count = g.outline_index_count;
+        layer_buffer.fill_vbo = g.fill_vbo;
+        layer_buffer.fill_vertex_count = g.fill_vertex_count;
+        layer_buffer.polygon_count = g.polygon_count;
+        layer_buffer.min_x = g.min_x;
+        layer_buffer.max_x = g.max_x;
+        layer_buffer.min_y = g.min_y;
+        layer_buffer.max_y = g.max_y;
+        total_polygons += g.polygon_count;
 
         apply_layer_colors(layer_buffer);
+        layer_index_by_number[layer_buffer.layer] = g_layers.size();
         g_layers.push_back(std::move(layer_buffer));
+    }
+
+    // Instanced cells: one shared per-instance affine buffer per group (see
+    // InstancedBatch), plus one InstancedBatch per layer the group's unit
+    // shape touches -- possibly on a layer with no static geometry of its own
+    // at all, hence find-or-create rather than an index lookup. The whole
+    // group's precomputed world bbox (which already accounts for per-instance
+    // rotation/mirror -- see parseGdsToLayers) is folded into each touched
+    // layer's cull box.
+    for (unsigned gi = 0; gi < group_count; gi++) {
+        val group = instance_groups_data[gi];
+        std::vector<float> instances = convertJSArrayToNumberVector<float>(group["instances"]);
+        GLsizei instance_count = (GLsizei)(instances.size() / kInstanceStrideFloats);
+        if (instance_count == 0) continue;
+
+        val group_bbox = group["bbox"];
+        float gb_min_x = (float)group_bbox["minX"].as<double>();
+        float gb_max_x = (float)group_bbox["maxX"].as<double>();
+        float gb_min_y = (float)group_bbox["minY"].as<double>();
+        float gb_max_y = (float)group_bbox["maxY"].as<double>();
+        bool have_group_bbox = gb_min_x <= gb_max_x;
+
+        GLuint instance_vbo = 0;
+        glGenBuffers(1, &instance_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(instances.size() * sizeof(float)), instances.data(),
+                     GL_STATIC_DRAW);
+
+        val group_layers = group["layers"];
+        unsigned group_layer_count = group_layers["length"].as<unsigned>();
+        for (unsigned li = 0; li < group_layer_count; li++) {
+            val entry = group_layers[li];
+            uint32_t layer_number = entry["layer"].as<uint32_t>();
+            UploadedGeometry g = upload_geometry(entry);
+
+            LayerBuffer* layer_buffer;
+            auto it = layer_index_by_number.find(layer_number);
+            if (it != layer_index_by_number.end()) {
+                layer_buffer = &g_layers[it->second];
+            } else {
+                LayerBuffer new_layer;
+                new_layer.layer = layer_number;
+                apply_layer_colors(new_layer);
+                layer_index_by_number[layer_number] = g_layers.size();
+                g_layers.push_back(std::move(new_layer));
+                layer_buffer = &g_layers.back();
+            }
+
+            InstancedBatch batch;
+            batch.fill_vbo = g.fill_vbo;
+            batch.fill_vertex_count = g.fill_vertex_count;
+            batch.outline_vbo = g.outline_vbo;
+            batch.outline_ebo = g.outline_ebo;
+            batch.outline_index_count = g.outline_index_count;
+            batch.instance_vbo = instance_vbo;
+            batch.instance_count = instance_count;
+            layer_buffer->instanced_batches.push_back(batch);
+
+            uint64_t logical_count = (uint64_t)g.polygon_count * (uint64_t)instance_count;
+            layer_buffer->polygon_count += (uint32_t)logical_count;
+            total_polygons += logical_count;
+
+            if (g.polygon_count > 0 && have_group_bbox) {
+                layer_buffer->min_x = std::min(layer_buffer->min_x, gb_min_x);
+                layer_buffer->max_x = std::max(layer_buffer->max_x, gb_max_x);
+                layer_buffer->min_y = std::min(layer_buffer->min_y, gb_min_y);
+                layer_buffer->max_y = std::max(layer_buffer->max_y, gb_max_y);
+            }
+        }
     }
 
     double min_x = bbox_data["minX"].as<double>();
@@ -1035,7 +1619,7 @@ void loadAndRenderGds(const std::string& path) {
         showLoadError(r["error"].as<std::string>());
         return;
     }
-    uploadLayers(r["layers"], r["bbox"]);
+    uploadLayers(r["layers"], r["instanceGroups"], r["bbox"]);
 }
 
 void loadLypText(const std::string& xml_text) {

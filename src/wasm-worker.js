@@ -94,12 +94,21 @@ self.onmessage = (event) => {
             return;
         }
 
-        console.log("[GDS worker] layers:", result.layers.length, "-- posting gdsResult back to main thread");
+        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "-- posting gdsResult back to main thread");
         const transferList = [];
         for (const layer of result.layers) {
             transferList.push(layer.outlineVertices.buffer, layer.fillVertices.buffer);
         }
-        postMessage({type: "gdsResult", ok: true, layers: result.layers, bbox: result.bbox}, transferList);
+        for (const group of result.instanceGroups) {
+            transferList.push(group.instances.buffer);
+            for (const layer of group.layers) {
+                transferList.push(layer.outlineVertices.buffer, layer.fillVertices.buffer);
+            }
+        }
+        postMessage(
+            {type: "gdsResult", ok: true, layers: result.layers, instanceGroups: result.instanceGroups, bbox: result.bbox},
+            transferList
+        );
         console.log("[GDS worker] postMessage(gdsResult) call returned");
     }).catch((err) => {
         console.error("[GDS worker] createGdstkModule() chain rejected:", err, err && err.stack);

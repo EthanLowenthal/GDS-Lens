@@ -245,7 +245,7 @@ function startWorker(worker, fileData) {
             else console.log("[GDS] load succeeded, layer count:", workerMessage.layers.length);
             modulePromise.then((Module) => {
                 if (workerMessage.ok) {
-                    Module.uploadLayers(workerMessage.layers, workerMessage.bbox);
+                    Module.uploadLayers(workerMessage.layers, workerMessage.instanceGroups, workerMessage.bbox);
                 } else {
                     Module.showLoadError(workerMessage.error);
                 }
