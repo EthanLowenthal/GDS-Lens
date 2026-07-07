@@ -1,5 +1,7 @@
 # GDS Lens
 
+[Install GDS Lens](vscode:extension/ethml.GDS-Lens)
+
 A VS Code extension that adds a custom editor for `.gds` (GDSII layout)
 files: open one and it's parsed and rendered in a WebGL2 canvas, with
 support for loading a KLayout `.lyp` file to drive layer colors.
