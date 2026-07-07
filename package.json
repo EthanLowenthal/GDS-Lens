@@ -7,6 +7,7 @@
     "vscode": "^1.125.0"
   },
   "main": "./src/extension.cjs",
+  "publisher": "ethml",
   "scripts": {
     "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build"
   },

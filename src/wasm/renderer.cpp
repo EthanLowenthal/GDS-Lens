@@ -167,6 +167,12 @@ constexpr GLsizei kInstanceStrideFloats = 6;  // col0.xy, col1.xy, translate.xy
 // separately via instanced_batches instead of being flattened in here.
 struct LayerBuffer {
     uint32_t layer;
+    // GDS datatype: layers are keyed on the (layer, datatype) pair, not the
+    // layer number alone, since real PDKs put many distinct styles on the same
+    // layer number distinguished only by datatype. tag() packs the pair into
+    // gdstk's 64-bit Tag, the key used by g_lyp_info and every by-tag bucket.
+    uint32_t datatype = 0;
+    uint64_t tag() const { return make_tag(layer, datatype); }
     GLuint outline_vbo = 0;
     GLuint fill_vbo = 0;
     // Index buffer over outline_vbo, one GL_LINE_LOOP per polygon joined by
@@ -205,11 +211,16 @@ struct LayerBuffer {
 // no setup call is needed beyond using this value.
 constexpr uint32_t kRestartIndex = 0xFFFFFFFFu;
 
-// Parsed out of a single <properties> block in a .lyp file. Persists across
-// GDS reloads (same as the old g_lyp_colors did) so re-opening/replacing the
-// GDS file keeps previously-applied layer styling.
+// Parsed out of a single <properties>/<group-members> block in a .lyp file.
+// Keyed in g_lyp_info by the (layer, datatype) Tag it applies to. Persists
+// across GDS reloads (same as the old g_lyp_colors did) so re-opening/replacing
+// the GDS file keeps previously-applied layer styling.
 struct LypEntry {
     std::string name;
+    // Display name of the enclosing top-level <properties> group in the .lyp
+    // (e.g. "Metals", "Waveguide"), or empty for an ungrouped/flat entry. Used
+    // only to organize the sidebar into collapsible categories; empty otherwise.
+    std::string group;
     std::array<float, 4> fill_color{};
     std::array<float, 4> frame_color{};
     bool has_fill = false;
@@ -242,7 +253,7 @@ constexpr float kHatchHalfWidthPx = 0.25f;
 constexpr int kPatternTypeCount = 4;  // diagonal, cross-hatch, dots, grid
 
 std::vector<LayerBuffer> g_layers;
-std::unordered_map<uint32_t, LypEntry> g_lyp_info;
+std::unordered_map<uint64_t, LypEntry> g_lyp_info;
 int g_lyp_order_counter = 0;
 
 // Total polygon count across all layers (set once in uploadLayers), used as
@@ -347,10 +358,14 @@ bool init_gl() {
 
 // Mirrors the old JS per-layer color fallback hash (viewer.js:151-156) for
 // layers with no matching .lyp entry.
-std::array<float, 4> default_color(uint32_t layer) {
-    float r = (float)((layer * 65) % 200 + 55) / 255.0f;
-    float g = (float)((layer * 115) % 200 + 55) / 255.0f;
-    float b = (float)((layer * 175) % 200 + 55) / 255.0f;
+std::array<float, 4> default_color(uint32_t layer, uint32_t datatype) {
+    // Fold datatype into the seed so two datatypes on the same layer number
+    // don't collapse to one fallback color. datatype 0 leaves seed == layer,
+    // preserving the exact colors this used before datatype support existed.
+    uint32_t seed = layer + datatype * 97u;
+    float r = (float)((seed * 65) % 200 + 55) / 255.0f;
+    float g = (float)((seed * 115) % 200 + 55) / 255.0f;
+    float b = (float)((seed * 175) % 200 + 55) / 255.0f;
     return {r, g, b, 0.8f};
 }
 
@@ -360,10 +375,13 @@ std::array<float, 4> default_color(uint32_t layer) {
 // looking like the same pattern. Angle is ignored by the dot/grid kinds
 // (they're already rotation-symmetric-ish), but assigning one anyway keeps
 // this a single deterministic function of the layer number.
-void pattern_for_layer(uint32_t layer, float& out_pattern_type, float& out_angle) {
+void pattern_for_layer(uint32_t layer, uint32_t datatype, float& out_pattern_type, float& out_angle) {
     constexpr float kPi = 3.14159265358979323846f;
-    out_pattern_type = (float)(layer % kPatternTypeCount);
-    uint32_t angle_index = (layer / kPatternTypeCount) % 6;
+    // Same datatype-0-preserving seed as default_color, so distinct datatypes
+    // on one layer number also get distinguishable hatch patterns.
+    uint32_t seed = layer + datatype * 97u;
+    out_pattern_type = (float)(seed % kPatternTypeCount);
+    uint32_t angle_index = (seed / kPatternTypeCount) % 6;
     out_angle = (float)angle_index * (kPi / 6.0f);
 }
 
@@ -371,17 +389,17 @@ void pattern_for_layer(uint32_t layer, float& out_pattern_type, float& out_angle
 // back to the hash color above for layers with no .lyp entry, or for the
 // half of a fill/frame pair that's missing from the entry).
 void apply_layer_colors(LayerBuffer& layer) {
-    pattern_for_layer(layer.layer, layer.pattern_type, layer.hatch_angle);
-    auto it = g_lyp_info.find(layer.layer);
+    pattern_for_layer(layer.layer, layer.datatype, layer.pattern_type, layer.hatch_angle);
+    auto it = g_lyp_info.find(layer.tag());
     if (it == g_lyp_info.end()) {
-        std::array<float, 4> base = default_color(layer.layer);
+        std::array<float, 4> base = default_color(layer.layer, layer.datatype);
         layer.fill_color = {base[0], base[1], base[2], 0.4f};
         layer.frame_color = {base[0], base[1], base[2], 0.9f};
         layer.visible = true;
         return;
     }
     const LypEntry& e = it->second;
-    std::array<float, 4> base = default_color(layer.layer);
+    std::array<float, 4> base = default_color(layer.layer, layer.datatype);
     if (e.has_fill) {
         layer.fill_color = e.fill_color;
     } else if (e.has_frame) {
@@ -823,7 +841,8 @@ Affine2D reference_placement(const Reference* ref, const Vec2& offset) {
 // 800k times (as one AREF or 800k separate SREFs) costs one shape plus 800k
 // cheap affines instead of 800k full copies.
 struct InstanceGroupPolys {
-    std::unordered_map<uint32_t, std::vector<Polygon*>> by_layer_unit;
+    // Keyed by gdstk Tag (layer + datatype), not layer number -- see LayerBuffer.
+    std::unordered_map<uint64_t, std::vector<Polygon*>> by_layer_unit;
     std::vector<Affine2D> instances;
 };
 
@@ -834,12 +853,12 @@ struct InstanceGroupPolys {
 // instancing to a single level (an instanced cell's template may itself
 // contain other instanced cells, but along any path collect_instanced stops
 // at the outermost one -- see its comment -- so nothing is double-drawn).
-void build_cell_template(Cell* cell, std::unordered_map<uint32_t, std::vector<Polygon*>>& out_by_layer) {
+void build_cell_template(Cell* cell, std::unordered_map<uint64_t, std::vector<Polygon*>>& out_by_layer) {
     Array<Polygon*> polygons = {};
     cell->get_polygons(true, true, -1, false, 0, polygons);
     for (uint64_t i = 0; i < polygons.count; i++) {
         Polygon* poly = polygons[i];
-        out_by_layer[get_layer(poly->tag)].push_back(poly);
+        out_by_layer[poly->tag].push_back(poly);
     }
     polygons.clear();
 }
@@ -949,7 +968,7 @@ std::unordered_map<Cell*, bool> choose_instanced_cells(Library& lib,
 // caller only builds templates for those.
 void collect_instanced(Cell* cell, const Affine2D& current,
                        const std::unordered_map<Cell*, bool>& instanced,
-                       std::unordered_map<uint32_t, std::vector<Polygon*>>& by_layer_static,
+                       std::unordered_map<uint64_t, std::vector<Polygon*>>& by_layer_static,
                        std::unordered_map<Cell*, InstanceGroupPolys>& groups) {
     // This cell's own polygons/paths only (depth=0); apply_repetitions still
     // expands any repetition attached directly to a polygon/path (a rarer
@@ -960,7 +979,7 @@ void collect_instanced(Cell* cell, const Affine2D& current,
     for (uint64_t i = 0; i < own_polygons.count; i++) {
         Polygon* poly = own_polygons[i];
         transform_points(poly->point_array, current, /*with_translation=*/true);
-        by_layer_static[get_layer(poly->tag)].push_back(poly);
+        by_layer_static[poly->tag].push_back(poly);
     }
     own_polygons.clear();
 
@@ -1125,7 +1144,7 @@ bool on_resize(int /*eventType*/, const EmscriptenUiEvent* /*e*/, void* /*userDa
 // polys was empty) so the caller can fold it into whatever bbox accumulator
 // applies (design bbox for static layers, unit-shape bbox for a group -- see
 // parseGdsToLayers). Frees every Polygon* in polys before returning.
-val build_layer_entry(uint32_t layer_number, std::vector<Polygon*>& polys, uint64_t& out_polygon_count,
+val build_layer_entry(uint64_t tag, std::vector<Polygon*>& polys, uint64_t& out_polygon_count,
                       double& out_min_x, double& out_max_x, double& out_min_y, double& out_max_y) {
     out_polygon_count = polys.size();
     out_min_x = HUGE_VAL;
@@ -1176,7 +1195,8 @@ val build_layer_entry(uint32_t layer_number, std::vector<Polygon*>& polys, uint6
     }
 
     val layer_entry = val::object();
-    layer_entry.set("layer", layer_number);
+    layer_entry.set("layer", get_layer(tag));
+    layer_entry.set("datatype", get_type(tag));
     layer_entry.set("outlineVertices", to_float32_array(outline_vertices));
     layer_entry.set("outlineRanges", outline_ranges);
     layer_entry.set("fillVertices", to_float32_array(fill_vertices));
@@ -1306,7 +1326,7 @@ val parseGdsToLayers(const std::string& path) {
     // design into static geometry + one instance group per instanced cell.
     std::unordered_map<Cell*, bool> instanced = choose_instanced_cells(lib, base_counts);
 
-    std::unordered_map<uint32_t, std::vector<Polygon*>> by_layer_static;
+    std::unordered_map<uint64_t, std::vector<Polygon*>> by_layer_static;
     std::unordered_map<Cell*, InstanceGroupPolys> groups;
     uint64_t root_index = 0;
     for (Cell* root : roots) {
@@ -1466,13 +1486,14 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     }
     g_layers.reserve(g_layers.size() + max_new_layers);
 
-    std::unordered_map<uint32_t, size_t> layer_index_by_number;
+    std::unordered_map<uint64_t, size_t> layer_index_by_tag;
     uint64_t total_polygons = 0;
 
     for (unsigned i = 0; i < layer_count; i++) {
         val entry = layers_data[i];
         LayerBuffer layer_buffer;
         layer_buffer.layer = entry["layer"].as<uint32_t>();
+        layer_buffer.datatype = entry["datatype"].as<uint32_t>();
 
         UploadedGeometry g = upload_geometry(entry);
         layer_buffer.outline_vbo = g.outline_vbo;
@@ -1488,7 +1509,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
         total_polygons += g.polygon_count;
 
         apply_layer_colors(layer_buffer);
-        layer_index_by_number[layer_buffer.layer] = g_layers.size();
+        layer_index_by_tag[layer_buffer.tag()] = g_layers.size();
         g_layers.push_back(std::move(layer_buffer));
     }
 
@@ -1523,17 +1544,20 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
         for (unsigned li = 0; li < group_layer_count; li++) {
             val entry = group_layers[li];
             uint32_t layer_number = entry["layer"].as<uint32_t>();
+            uint32_t datatype = entry["datatype"].as<uint32_t>();
+            uint64_t tag = make_tag(layer_number, datatype);
             UploadedGeometry g = upload_geometry(entry);
 
             LayerBuffer* layer_buffer;
-            auto it = layer_index_by_number.find(layer_number);
-            if (it != layer_index_by_number.end()) {
+            auto it = layer_index_by_tag.find(tag);
+            if (it != layer_index_by_tag.end()) {
                 layer_buffer = &g_layers[it->second];
             } else {
                 LayerBuffer new_layer;
                 new_layer.layer = layer_number;
+                new_layer.datatype = datatype;
                 apply_layer_colors(new_layer);
-                layer_index_by_number[layer_number] = g_layers.size();
+                layer_index_by_tag[tag] = g_layers.size();
                 g_layers.push_back(std::move(new_layer));
                 layer_buffer = &g_layers.back();
             }
@@ -1626,57 +1650,108 @@ void loadAndRenderGds(const std::string& path) {
     uploadLayers(r["layers"], r["instanceGroups"], r["bbox"]);
 }
 
+// Parse one leaf .lyp block -- the region covering a single layer, containing
+// exactly one <source> -- and insert it into g_lyp_info under `category`. A
+// no-op when the block has no numeric <source> (e.g. a subgroup header, or
+// KLayout's catch-all "*/*") or defines no usable color.
+void parse_lyp_leaf(const std::string& block, const std::string& category) {
+    // <source> is "layer/datatype@layout-index" (e.g. "250/9@1"). Split off the
+    // layer at '/', then the datatype up to '@' (or end). A missing datatype
+    // defaults to 0.
+    std::string source_text;
+    if (!extract_tag_value(block, "source", source_text)) return;
+    size_t slash_pos = source_text.find('/');
+    std::string layer_text = trim(source_text.substr(0, slash_pos));
+    if (layer_text.empty()) return;
+    char* endptr = nullptr;
+    long layer_number = strtol(layer_text.c_str(), &endptr, 10);
+    if (endptr == layer_text.c_str()) return;
+
+    long datatype_number = 0;
+    if (slash_pos != std::string::npos) {
+        std::string dt_text = source_text.substr(slash_pos + 1);
+        size_t at_pos = dt_text.find('@');
+        if (at_pos != std::string::npos) dt_text = dt_text.substr(0, at_pos);
+        dt_text = trim(dt_text);
+        char* dt_endptr = nullptr;
+        long parsed = strtol(dt_text.c_str(), &dt_endptr, 10);
+        // Only take a fully numeric datatype; a wildcard ("*") leaves it 0.
+        if (dt_endptr != dt_text.c_str()) datatype_number = parsed;
+    }
+
+    LypEntry entry;
+    entry.order = g_lyp_order_counter++;
+    entry.group = category;
+
+    std::string fill_text, frame_text;
+    entry.has_fill = extract_tag_value(block, "fill-color", fill_text);
+    entry.has_frame = extract_tag_value(block, "frame-color", frame_text);
+    if (entry.has_fill) {
+        entry.fill_color = hex_to_rgba(fill_text, 0.55f);
+        if (entry.fill_color[3] == 0.0f) entry.has_fill = false;
+    }
+    if (entry.has_frame) {
+        entry.frame_color = hex_to_rgba(frame_text, 0.9f);
+        if (entry.frame_color[3] == 0.0f) entry.has_frame = false;
+    }
+    if (!entry.has_fill && !entry.has_frame) return;
+
+    std::string name_text;
+    if (extract_tag_value(block, "name", name_text)) entry.name = trim(name_text);
+
+    std::string visible_text;
+    if (extract_tag_value(block, "visible", visible_text)) {
+        std::string v = trim(visible_text);
+        entry.visible = !(v == "false" || v == "0");
+    }
+
+    g_lyp_info[make_tag((uint32_t)layer_number, (uint32_t)datatype_number)] = entry;
+}
+
 void loadLypText(const std::string& xml_text) {
     g_lyp_info.clear();
     g_lyp_order_counter = 0;
 
-    // Split on "<properties>" and, within each chunk up to the next
-    // occurrence, pull out <source> (layer[/datatype]), <name>, <visible>,
-    // and <fill-color>/<frame-color>. Nested group members (<group-members>)
-    // aren't handled -- same limitation the old color-only parser had.
-    const std::string marker = "<properties>";
-    size_t marker_pos = 0;
-    while ((marker_pos = xml_text.find(marker, marker_pos)) != std::string::npos) {
-        size_t content_start = marker_pos + marker.length();
-        size_t next_marker = xml_text.find(marker, content_start);
-        size_t content_end = (next_marker == std::string::npos) ? xml_text.length() : next_marker;
-        std::string block = xml_text.substr(content_start, content_end - content_start);
-        marker_pos = content_end;
+    // KLayout .lyp: the root <layer-properties> holds top-level <properties>
+    // blocks. A <properties> block is either a single layer (has <source>
+    // directly) or a group -- a <name> (the category, e.g. "Metals") plus one
+    // or more <group-members>, each itself a layer or a further nested subgroup.
+    // <properties> never nests; only <group-members> does. So: walk top-level
+    // <properties> blocks; when a block contains <group-members>, its leading
+    // <name> is the category; then flatten every <group-members> region into
+    // leaf entries. Splitting on "<group-members>" flattens nested subgroups
+    // too (a subgroup-header region carries no <source>, so parse_lyp_leaf skips
+    // it), and every leaf inherits the outermost category -- exactly the flat
+    // two-level (category -> layers) view the sidebar wants.
+    const std::string props = "<properties>";
+    const std::string members = "<group-members>";
+    size_t prop_pos = xml_text.find(props);
+    while (prop_pos != std::string::npos) {
+        size_t block_start = prop_pos + props.length();
+        size_t next_prop = xml_text.find(props, block_start);
+        size_t block_end = (next_prop == std::string::npos) ? xml_text.length() : next_prop;
+        std::string top_block = xml_text.substr(block_start, block_end - block_start);
+        prop_pos = next_prop;
 
-        std::string source_text;
-        if (!extract_tag_value(block, "source", source_text)) continue;
-        std::string layer_text = trim(source_text.substr(0, source_text.find('/')));
-        if (layer_text.empty()) continue;
-        char* endptr = nullptr;
-        long layer_number = strtol(layer_text.c_str(), &endptr, 10);
-        if (endptr == layer_text.c_str()) continue;
-
-        LypEntry entry;
-        entry.order = g_lyp_order_counter++;
-
-        std::string fill_text, frame_text;
-        entry.has_fill = extract_tag_value(block, "fill-color", fill_text);
-        entry.has_frame = extract_tag_value(block, "frame-color", frame_text);
-        if (entry.has_fill) {
-            entry.fill_color = hex_to_rgba(fill_text, 0.55f);
-            if (entry.fill_color[3] == 0.0f) entry.has_fill = false;
+        size_t first_members = top_block.find(members);
+        if (first_members == std::string::npos) {
+            // Flat single-layer entry, no category.
+            parse_lyp_leaf(top_block, "");
+            continue;
         }
-        if (entry.has_frame) {
-            entry.frame_color = hex_to_rgba(frame_text, 0.9f);
-            if (entry.frame_color[3] == 0.0f) entry.has_frame = false;
-        }
-        if (!entry.has_fill && !entry.has_frame) continue;
 
+        std::string category;
         std::string name_text;
-        if (extract_tag_value(block, "name", name_text)) entry.name = trim(name_text);
+        std::string header = top_block.substr(0, first_members);
+        if (extract_tag_value(header, "name", name_text)) category = trim(name_text);
 
-        std::string visible_text;
-        if (extract_tag_value(block, "visible", visible_text)) {
-            std::string v = trim(visible_text);
-            entry.visible = !(v == "false" || v == "0");
+        for (size_t m = first_members; m != std::string::npos;) {
+            size_t leaf_start = m + members.length();
+            size_t next_m = top_block.find(members, leaf_start);
+            size_t leaf_end = (next_m == std::string::npos) ? top_block.length() : next_m;
+            parse_lyp_leaf(top_block.substr(leaf_start, leaf_end - leaf_start), category);
+            m = next_m;
         }
-
-        g_lyp_info[(uint32_t)layer_number] = entry;
     }
 
     apply_lyp_to_layers();
@@ -1695,13 +1770,15 @@ val getLayers() {
     for (const LayerBuffer& l : g_layers) ordered.push_back(&l);
 
     std::sort(ordered.begin(), ordered.end(), [](const LayerBuffer* a, const LayerBuffer* b) {
-        auto ita = g_lyp_info.find(a->layer);
-        auto itb = g_lyp_info.find(b->layer);
+        auto ita = g_lyp_info.find(a->tag());
+        auto itb = g_lyp_info.find(b->tag());
         bool has_a = ita != g_lyp_info.end();
         bool has_b = itb != g_lyp_info.end();
         if (has_a != has_b) return has_a;
-        if (has_a && has_b) return ita->second.order < itb->second.order;
-        return a->layer < b->layer;
+        if (has_a && has_b && ita->second.order != itb->second.order)
+            return ita->second.order < itb->second.order;
+        if (a->layer != b->layer) return a->layer < b->layer;
+        return a->datatype < b->datatype;
     });
 
     val result = val::array();
@@ -1709,8 +1786,10 @@ val getLayers() {
     for (const LayerBuffer* l : ordered) {
         val obj = val::object();
         obj.set("layer", l->layer);
-        auto it = g_lyp_info.find(l->layer);
+        obj.set("datatype", l->datatype);
+        auto it = g_lyp_info.find(l->tag());
         obj.set("name", it != g_lyp_info.end() ? it->second.name : std::string());
+        obj.set("group", it != g_lyp_info.end() ? it->second.group : std::string());
         obj.set("fillColor", rgba_to_css(l->fill_color));
         obj.set("frameColor", rgba_to_css(l->frame_color));
         obj.set("visible", l->visible);
@@ -1719,14 +1798,17 @@ val getLayers() {
     return result;
 }
 
-void setLayerVisible(uint32_t layer_number, bool visible) {
+// Toggle a single (layer, datatype). g_lyp_info is updated too so the
+// visibility sticks across a GDS reload (apply_layer_colors reads it back).
+void setLayerVisible(uint32_t layer_number, uint32_t datatype, bool visible) {
+    uint64_t tag = make_tag(layer_number, datatype);
     for (LayerBuffer& l : g_layers) {
-        if (l.layer == layer_number) {
+        if (l.tag() == tag) {
             l.visible = visible;
             break;
         }
     }
-    auto it = g_lyp_info.find(layer_number);
+    auto it = g_lyp_info.find(tag);
     if (it != g_lyp_info.end()) it->second.visible = visible;
     request_redraw();
 }

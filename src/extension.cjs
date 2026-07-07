@@ -4,6 +4,12 @@ const path = require('path');
 
 const logger = vscode.window.createOutputChannel("GDSII Debugger");
 
+// globalState key holding the fsPath of the most recently loaded KLayout .lyp,
+// so it's re-applied automatically to every GDS viewer opened afterwards
+// (across windows and restarts). We store the path rather than the file text so
+// edits to the .lyp are picked up on reopen, and so the stored state stays tiny.
+const LAST_LYP_PATH_KEY = 'GDS-Lens.lastLypPath';
+
 function activate(context) {
     logger.show(true);
     logger.appendLine(">>> GDSII Extension Core Spinning Up (wasm parsing + rendering)...");
@@ -34,6 +40,25 @@ class GdsEditorProvider {
     toggleDebugTools() {
         for (const panel of this.panels) {
             panel.webview.postMessage({ type: 'toggleDebugTools' });
+        }
+    }
+
+    // Reads a .lyp from disk and pushes it to one viewer, tagged with its
+    // basename so the panel can show it as a "filename.lyp ✕" chip. Returns
+    // false (without throwing) if the file can't be read, so callers can drop a
+    // stale remembered path.
+    postLyp(webviewPanel, fsPath) {
+        try {
+            const text = fs.readFileSync(fsPath, 'utf8');
+            webviewPanel.webview.postMessage({
+                type: 'lypLoaded',
+                text: text,
+                name: path.basename(fsPath)
+            });
+            return true;
+        } catch (err) {
+            logger.appendLine('>>> Could not read .lyp at ' + fsPath + ': ' + err.message);
+            return false;
         }
     }
 
@@ -113,12 +138,14 @@ class GdsEditorProvider {
                     };
                     const fileUri = await vscode.window.showOpenDialog(options);
                     if (fileUri && fileUri[0]) {
-                        const lypRawText = fs.readFileSync(fileUri[0].fsPath, 'utf8');
-                        webviewPanel.webview.postMessage({
-                            type: 'lypLoaded',
-                            text: lypRawText
-                        });
+                        const fsPath = fileUri[0].fsPath;
+                        // Remember for next time (this and future viewers).
+                        await this.context.globalState.update(LAST_LYP_PATH_KEY, fsPath);
+                        this.postLyp(webviewPanel, fsPath);
                     }
+                } else if (message.command === 'unloadLypFile') {
+                    // Forget the remembered .lyp so it isn't re-applied next time.
+                    await this.context.globalState.update(LAST_LYP_PATH_KEY, undefined);
                 }
             });
 
@@ -133,6 +160,16 @@ class GdsEditorProvider {
                 type: 'init',
                 fileData: Uint8Array.from(fileData).buffer
             });
+
+            // Re-apply the most recently loaded .lyp, if any. Safe to post now:
+            // viewer.js's 'lypLoaded' handler waits on the wasm module, and the
+            // parsed styling persists until the GDS geometry finishes loading
+            // and picks it up. If the file has since moved/been deleted, drop
+            // the stale remembered path so it stops trying.
+            const savedLypPath = this.context.globalState.get(LAST_LYP_PATH_KEY);
+            if (savedLypPath && !this.postLyp(webviewPanel, savedLypPath)) {
+                await this.context.globalState.update(LAST_LYP_PATH_KEY, undefined);
+            }
         } catch (err) {
             logger.appendLine('[FATAL CRASH ERROR] ' + err.stack);
             vscode.window.showErrorMessage("GDSII Viewer Error: " + err.message);
