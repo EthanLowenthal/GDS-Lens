@@ -10,13 +10,31 @@ function activate(context) {
 
     const provider = new GdsEditorProvider(context);
     context.subscriptions.push(
-        vscode.window.registerCustomEditorProvider('gdsii-view.editor', provider)
+        vscode.window.registerCustomEditorProvider('GDS-Lens.editor', provider)
+    );
+
+    // "GDSLens: Toggle Debug Tools" -- shows/hides the upper-left readout and
+    // the debug-log panel/button (all hidden by default) in every open GDS
+    // viewer.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('GDS-Lens.showDebugTools', () => {
+            provider.toggleDebugTools();
+        })
     );
 }
 
 class GdsEditorProvider {
     constructor(context) {
         this.context = context;
+        // Every currently-open GDS webview panel, so showDebugTools() can
+        // reach them (removed on dispose, see resolveCustomEditor).
+        this.panels = new Set();
+    }
+
+    toggleDebugTools() {
+        for (const panel of this.panels) {
+            panel.webview.postMessage({ type: 'toggleDebugTools' });
+        }
     }
 
     async openCustomDocument(uri, openContext, token) {
@@ -78,6 +96,10 @@ class GdsEditorProvider {
             htmlContent = htmlContent.replace('{{workerBundleBase64}}', workerBundleBase64);
 
             webviewPanel.webview.html = htmlContent;
+
+            // Track this panel so the "Show Debug Tools" command can post to it.
+            this.panels.add(webviewPanel);
+            webviewPanel.onDidDispose(() => this.panels.delete(webviewPanel));
 
             logger.appendLine('\n>>> Intercepted layout open call for file: ' + document.uri.fsPath);
             const fileData = await vscode.workspace.fs.readFile(document.uri);

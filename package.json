@@ -2,6 +2,7 @@
   "name": "GDS-Lens",
   "displayName": "GDS Lens",
   "version": "0.0.1",
+  "icon": "images/logo.png",
   "engines": {
     "vscode": "^1.125.0"
   },
@@ -22,6 +23,12 @@
     "url": "https://github.com/EthanLowenthal/GDS-Lens"
   },
   "contributes": {
+    "commands": [
+      {
+        "command": "GDS-Lens.showDebugTools",
+        "title": "GDSLens: Toggle Debug Tools"
+      }
+    ],
     "customEditors": [
       {
         "viewType": "GDS-Lens.editor",

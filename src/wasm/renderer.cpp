@@ -281,6 +281,10 @@ int g_last_mouse_y = 0;
 
 bool g_frame_requested = false;
 
+// Toggles the hatched polygon fill (the "infill") on/off for every layer at
+// once -- see draw_frame and setShowInfill. Outlines are unaffected.
+bool g_show_infill = true;
+
 GLuint compile_shader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
@@ -625,7 +629,7 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
         frame_layers_drawn++;
         frame_visible_polygons += layer.polygon_count;
 
-        if (layer.fill_vbo) {
+        if (layer.fill_vbo && g_show_infill) {
             glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
             glEnableVertexAttribArray(g_loc_position);
             glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
@@ -676,7 +680,7 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
             glVertexAttribPointer(g_loc_i_translate, 2, GL_FLOAT, GL_FALSE, stride, (void*)(4 * sizeof(float)));
             glVertexAttribDivisor(g_loc_i_translate, 1);
 
-            if (batch.fill_vbo) {
+            if (batch.fill_vbo && g_show_infill) {
                 glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
                 glEnableVertexAttribArray(g_loc_position);
                 glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
@@ -1727,6 +1731,11 @@ void setLayerVisible(uint32_t layer_number, bool visible) {
     request_redraw();
 }
 
+void setShowInfill(bool show) {
+    g_show_infill = show;
+    request_redraw();
+}
+
 int main() {
     g_gl_ready = init_gl();
     if (!g_gl_ready) return 0;
@@ -1748,4 +1757,5 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("getLayers", &getLayers);
     function("setLayerVisible", &setLayerVisible);
     function("resetView", &reset_view);
+    function("setShowInfill", &setShowInfill);
 }

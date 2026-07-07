@@ -93,10 +93,13 @@ console.log("[GDS] acquireVsCodeApi() OK, typeof createGdstkModule:", typeof cre
 const gui = new dat.GUI({ width: 260 });
 const actions = {
     loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
-    resetView: () => modulePromise.then((Module) => Module.resetView())
+    resetView: () => modulePromise.then((Module) => Module.resetView()),
+    showInfill: true
 };
 gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 gui.add(actions, "resetView").name("Reset View");
+gui.add(actions, "showInfill").name("Infill")
+    .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
 
 let layersFolder = null;
 
@@ -197,6 +200,11 @@ window.addEventListener("message", (event) => {
             Module.loadLypText(message.text);
             renderLayerList(Module.getLayers());
         });
+    } else if (message.type === "toggleDebugTools") {
+        // "GDSLens: Toggle Debug Tools" command -- show/hide the upper-left
+        // #ui readout and the debug-log toggle button (both hidden by
+        // default, see viewer.html).
+        document.body.classList.toggle("debug");
     }
 });
 

@@ -8,6 +8,11 @@
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0c0c0d; user-select: none; }
         canvas { width: 100%; height: 100%; display: block; }
         #ui { color: #a5a5a5; position: absolute; top: 15px; left: 15px; font-family: monospace; font-size: 12px; pointer-events: none; line-height: 1.5; z-index: 10;}
+        /* Debug tools (#ui readout + debug log button) are hidden until the
+           "GDSLens: Show Debug Tools" command adds .debug to <body>. */
+        #ui, #debugToggleBtn { display: none; }
+        body.debug #ui { display: block; }
+        body.debug #debugToggleBtn { display: block; }
         #scaleContainer { position: absolute; bottom: 20px; right: 20px; font-family: monospace; font-size: 11px; color: #ffffff; text-align: center; z-index: 10; pointer-events: none; }
         #scaleBar { height: 4px; background: #ffffff; border: 1px solid #000; margin-top: 4px; }
         .dg.ac { z-index: 20 !important; }
