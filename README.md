@@ -1,6 +1,6 @@
 # GDS Lens
 
-[Install GDS Lens](vscode:extension/ethml.GDS-Lens)
+[View  GDS Lens on Marketplace](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
 
 A VS Code extension that adds a custom editor for `.gds` (GDSII layout)
 files: open one and it's parsed and rendered in a WebGL2 canvas, with
