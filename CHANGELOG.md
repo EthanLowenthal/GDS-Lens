@@ -1,6 +1,6 @@
 # Change Log
 
-All notable changes to the "gdsii-view" extension will be documented in this file.
+All notable changes to the "GDS Lens" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 

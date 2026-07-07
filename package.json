@@ -1,6 +1,6 @@
 {
-  "name": "gdsii-view",
-  "displayName": "GDSII View",
+  "name": "GDS-Lens",
+  "displayName": "GDS Lens",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.125.0"
@@ -17,11 +17,15 @@
     "@vscode/test-electron": "^3.0.0",
     "eslint": "^10.5.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EthanLowenthal/GDS-Lens"
+  },
   "contributes": {
     "customEditors": [
       {
-        "viewType": "gdsii-view.editor",
-        "displayName": "GDSII Viewer",
+        "viewType": "GDS-Lens.editor",
+        "displayName": "GDS Lens",
         "selector": [
           {
             "filenamePattern": "*.gds"
