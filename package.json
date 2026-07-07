@@ -1,7 +1,7 @@
 {
   "name": "GDS-Lens",
   "displayName": "GDS Lens",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "icon": "images/logo.png",
   "engines": {
     "vscode": "^1.125.0"
