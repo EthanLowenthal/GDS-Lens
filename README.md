@@ -30,7 +30,7 @@ Open any `.gds` file in VS Code and it opens in the GDS Lens viewer:
 
 ## Release notes
 
-See `CHANGELOG.md`.
+See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Contributing
 

@@ -1,19 +1,5 @@
 # Change Log
 
-## [Unreleased]
-
-- KLayout `.lyp` loading now handles grouped/nested `<group-members>` files, so
-  every layer in a group is imported (previously only the first member of each
-  group was), and colors/visibility are keyed on the full (layer, datatype)
-  pair instead of the layer number alone.
-- The layer panel is organized into collapsible categories from the `.lyp`'s
-  top-level groups (e.g. "Metals"), each with an "all" toggle plus a per
-  layer/datatype visibility toggle.
-- The last loaded `.lyp` is remembered and re-applied automatically to viewers
-  opened afterwards. The load control shows the loaded filename with an ✕ to
-  unload it (which also forgets it for next time); clicking the name swaps in a
-  different file.
-
 ## [1.0.0]
 
 Initial release.
