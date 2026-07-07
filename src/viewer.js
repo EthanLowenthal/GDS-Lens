@@ -92,40 +92,140 @@ console.log("[GDS] acquireVsCodeApi() OK, typeof createGdstkModule:", typeof cre
 
 const gui = new dat.GUI({ width: 260 });
 const actions = {
+    // Clicking the row always opens the file dialog (load, or replace the
+    // current .lyp); the injected ✕ (see setLypChip) handles unloading.
     loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
     resetView: () => modulePromise.then((Module) => Module.resetView()),
     showInfill: true
 };
-gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
+const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 gui.add(actions, "resetView").name("Reset View");
 gui.add(actions, "showInfill").name("Infill")
     .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
 
+// Reflects the loaded-.lyp state in the top control. With no .lyp it's a plain
+// "Load KLayout .lyp File" button. Once a .lyp is loaded it shows the filename
+// with an ✕ on the right that unloads it (clears styling in wasm, forgets the
+// remembered path in the extension host, and reverts the button). Clicking the
+// filename itself re-opens the dialog to swap in a different .lyp.
+function setLypChip(name) {
+    // Remove any ✕ from a previous loaded state before re-deciding.
+    const existingX = lypController.__li.querySelector(".lyp-unload");
+    if (existingX) existingX.remove();
+    lypController.__li.classList.toggle("lyp-loaded", !!name);
+
+    if (!name) {
+        lypController.name("Load KLayout .lyp File");
+        lypController.__li.title = "Load a KLayout .lyp layer-properties file";
+        return;
+    }
+
+    lypController.name(name);
+    lypController.__li.title = `${name} — click to replace, ✕ to unload`;
+    const x = document.createElement("span");
+    x.className = "lyp-unload";
+    x.textContent = "✕";
+    x.title = "Unload .lyp";
+    x.addEventListener("click", (event) => {
+        // Don't let the click also trigger the row's load-dialog handler.
+        event.stopPropagation();
+        modulePromise.then((Module) => {
+            // Empty text clears g_lyp_info and reverts layers to hash colors.
+            Module.loadLypText("");
+            renderLayerList(Module.getLayers());
+        });
+        vscode.postMessage({ command: "unloadLypFile" });
+        setLypChip(null);
+    });
+    lypController.__li.appendChild(x);
+}
+
 let layersFolder = null;
 
-// Rebuilds the layer folder from Module.getLayers() -- {layer, name,
-// fillColor, frameColor, visible}[], all plain scalars/strings (no
-// per-polygon geometry crosses into JS). Called after every
-// loadAndRenderGds()/loadLypText() call since either can change the layer
-// set, colors, or visibility.
+// Tints a dat.gui row/folder's 4px left border with a layer's frame color --
+// dat.gui has no built-in color swatch for booleans, so the border is the cue.
+function tintBorder(el, color) {
+    if (el) el.style.borderLeft = `4px solid ${color}`;
+}
+
+// Adds one visibility checkbox for a single (layer, datatype) item to `parent`.
+// onSync (optional) refreshes the enclosing category's "all" checkbox after a
+// toggle. Returns {controller, state} so the category toggle can drive it.
+function addLayerRow(parent, item, onSync) {
+    const label = item.name
+        ? `${item.layer}/${item.datatype} – ${item.name}`
+        : `${item.layer}/${item.datatype}`;
+    const state = { visible: item.visible };
+    const controller = parent.add(state, "visible")
+        .name(label)
+        .onChange((visible) => {
+            modulePromise.then((Module) => Module.setLayerVisible(item.layer, item.datatype, visible));
+            if (onSync) onSync();
+        });
+    tintBorder(controller.__li, item.frameColor);
+    controller.__li.title = label;
+    return { controller, state };
+}
+
+// Rebuilds the layer folder from Module.getLayers() -- {layer, datatype, name,
+// group, fillColor, frameColor, visible}[], all plain scalars/strings (no
+// per-polygon geometry crosses into JS). Layers are keyed on the (layer,
+// datatype) pair and organized into collapsible categories from the .lyp's
+// top-level groups (`group`, e.g. "Metals"): each category folder has an "all"
+// checkbox that toggles every layer under it, plus one checkbox per
+// layer/datatype. Layers with no category (ungrouped, or present in the GDS but
+// absent from the .lyp) go under "Other layers". Called after every
+// load/loadLypText() since either can change the layer set, colors, or
+// visibility.
 function renderLayerList(layers) {
     if (layersFolder) {
         gui.removeFolder(layersFolder);
     }
     layersFolder = gui.addFolder("Layers");
 
+    // Group by category, preserving getLayers()'s ordering (lyp order first).
+    // Ungrouped layers collect under a single trailing "Other layers" bucket.
+    const OTHER = "Other layers";
+    const categories = new Map();
     for (const layer of layers) {
-        const label = layer.name ? `${layer.layer} – ${layer.name}` : `Layer ${layer.layer}`;
-        const state = { visible: layer.visible };
-        const controller = layersFolder.add(state, "visible")
-            .name(label)
+        const key = layer.group || OTHER;
+        if (!categories.has(key)) categories.set(key, []);
+        categories.get(key).push(layer);
+    }
+
+    for (const [category, items] of categories) {
+        const folder = layersFolder.addFolder(`${category}  (${items.length})`);
+        folder.close();
+        // The <li.folder> wrapping this folder's <ul> carries a 4px border too.
+        tintBorder(folder.domElement.parentElement, items[0].frameColor);
+
+        const children = [];
+        const syncCategory = () => {
+            const all = children.every((c) => c.state.visible);
+            if (allState.visible !== all) {
+                allState.visible = all;
+                allController.updateDisplay();
+            }
+        };
+        const allState = { visible: items.every((it) => it.visible) };
+        const allController = folder.add(allState, "visible")
+            .name("◼ all")
             .onChange((visible) => {
-                modulePromise.then((Module) => Module.setLayerVisible(layer.layer, visible));
+                modulePromise.then((Module) => {
+                    for (const c of children) {
+                        c.state.visible = visible;
+                        c.controller.updateDisplay();
+                        Module.setLayerVisible(c.item.layer, c.item.datatype, visible);
+                    }
+                });
             });
-        // dat.gui has no built-in color swatch for booleans -- tint the row's
-        // left border with the layer's frame color as a visual cue.
-        controller.__li.style.borderLeft = `4px solid ${layer.frameColor}`;
-        controller.__li.title = label;
+        allController.__li.title = `Toggle all ${items.length} layers in ${category}`;
+
+        for (const item of items) {
+            const row = addLayerRow(folder, item, syncCategory);
+            row.item = item;
+            children.push(row);
+        }
     }
 }
 
@@ -200,6 +300,7 @@ window.addEventListener("message", (event) => {
             Module.loadLypText(message.text);
             renderLayerList(Module.getLayers());
         });
+        setLypChip(message.name || null);
     } else if (message.type === "toggleDebugTools") {
         // "GDSLens: Toggle Debug Tools" command -- show/hide the upper-left
         // #ui readout and the debug-log toggle button (both hidden by
