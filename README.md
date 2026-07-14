@@ -15,6 +15,7 @@ support for loading a KLayout `.lyp` file to drive layer colors.
 - Handles SREF/AREF (including array references), rotation, mirroring, and
   magnification via gdstk's flattening.
 - Per-layer visibility toggles and an infill (fill pattern) toggle.
+- Measure tool: click two points to read out the distance between them.
 
 ## Usage
 
@@ -24,6 +25,9 @@ Open any `.gds` file in VS Code and it opens in the GDS Lens viewer:
 - **Layers** — toggle individual layer visibility from the panel.
 - **Infill** — toggle the hatched layer fill on or off from the panel.
 - **Reset View** — refit the layout to the window from the panel.
+- **Measure** — enable from the panel (or press `M`), then click two points
+  to measure the distance between them (total, Δx, and Δy). Press `Escape`
+  to clear the measurement; toggle the mode off to go back to panning.
 - **Load KLayout .lyp File** — apply custom layer colors from a `.lyp` file.
 - **GDSLens: Toggle Debug Tools** — command palette entry that shows/hides
   the render stats readout and debug log.

@@ -1,5 +1,11 @@
 # Change Log
 
+## [Unreleased]
+
+- Measure tool: toggle from the panel (or press `M`), then click two points
+  to measure the distance between them (total, Δx, Δy). `Escape` clears the
+  current measurement.
+
 ## [1.0.0]
 
 Initial release.

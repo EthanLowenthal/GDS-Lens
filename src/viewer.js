@@ -96,12 +96,29 @@ const actions = {
     // current .lyp); the injected ✕ (see setLypChip) handles unloading.
     loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
     resetView: () => modulePromise.then((Module) => Module.resetView()),
-    showInfill: true
+    showInfill: true,
+    measure: false
 };
 const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 gui.add(actions, "resetView").name("Reset View");
 gui.add(actions, "showInfill").name("Infill")
     .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
+const measureController = gui.add(actions, "measure").name("Measure (M)")
+    .onChange((on) => modulePromise.then((Module) => Module.setMeasureMode(on)));
+
+// M toggles measure mode (via the dat.gui controller so the checkbox stays in
+// sync), Escape clears the current measurement without leaving the mode.
+window.addEventListener("keydown", (event) => {
+    // Don't steal keystrokes from text inputs (dat.gui has none today, but
+    // guard anyway).
+    const tag = event.target && event.target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    if (event.key === "m" || event.key === "M") {
+        measureController.setValue(!actions.measure);
+    } else if (event.key === "Escape") {
+        modulePromise.then((Module) => Module.clearMeasurement());
+    }
+});
 
 // Reflects the loaded-.lyp state in the top control. With no .lyp it's a plain
 // "Load KLayout .lyp File" button. Once a .lyp is loaded it shows the filename
