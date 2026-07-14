@@ -290,6 +290,19 @@ bool g_dragging = false;
 int g_last_mouse_x = 0;
 int g_last_mouse_y = 0;
 
+// Ruler ("measure") tool state -- see setMeasureMode/on_mousedown. While the
+// mode is active, clicks measure instead of pan: the first click anchors the
+// ruler's start point, the line then tracks the cursor (g_measure_pending),
+// and a second click freezes it. The measurement is world-space, so it stays
+// glued to the geometry across pan/zoom; only the readout label (#measureLabel,
+// repositioned every draw_frame) lives in screen space.
+bool g_measure_mode = false;
+bool g_measure_pending = false;   // first point placed, waiting for the second click
+bool g_measure_has_line = false;  // anything to draw at all (pending or finalized)
+float g_measure_x0 = 0.0f, g_measure_y0 = 0.0f;
+float g_measure_x1 = 0.0f, g_measure_y1 = 0.0f;
+GLuint g_measure_vbo = 0;
+
 bool g_frame_requested = false;
 
 // Toggles the hatched polygon fill (the "infill") on/off for every layer at
@@ -565,6 +578,103 @@ void update_scale_bar() {
     set_inner_text("scaleLabel", buf);
 }
 
+// Inverse of the vertex shader's camera transform (see kVertexShaderSrc):
+// canvas-relative pixel coordinates -> world coordinates. Same math on_wheel
+// inlines for its zoom-around-cursor anchor.
+void screen_to_world(float screen_x, float screen_y, float& world_x, float& world_y) {
+    float px = screen_x - (float)g_canvas_width * 0.5f;
+    float py = (float)g_canvas_height * 0.5f - screen_y;
+    world_x = g_pan_x + px / g_zoom;
+    world_y = g_pan_y + py / g_zoom;
+}
+
+// Forward camera transform: world -> canvas-relative pixel coordinates. Used
+// to pin the measure label to the ruler midpoint on every redraw.
+void world_to_screen(float world_x, float world_y, float& screen_x, float& screen_y) {
+    screen_x = (world_x - g_pan_x) * g_zoom + (float)g_canvas_width * 0.5f;
+    screen_y = (float)g_canvas_height * 0.5f - (world_y - g_pan_y) * g_zoom;
+}
+
+// World units are always microns (see update_scale_bar's dbuPerMicron note);
+// picks nm/µm/mm to keep the number readable. %.4g rather than a fixed
+// precision so short distances don't drown in trailing zeros.
+std::string format_distance_um(double microns) {
+    char buf[64];
+    if (microns >= 1000.0) {
+        snprintf(buf, sizeof(buf), "%.4g mm", microns / 1000.0);
+    } else if (microns >= 1.0) {
+        snprintf(buf, sizeof(buf), "%.4g \xC2\xB5m", microns);  // µm, UTF-8
+    } else {
+        snprintf(buf, sizeof(buf), "%.4g nm", microns * 1000.0);
+    }
+    return buf;
+}
+
+// Repositions/re-fills #measureLabel (viewer.html) at the ruler's midpoint,
+// or hides it when there's no measurement. Called from draw_frame so the
+// label follows the world-space ruler across pan/zoom without its own event
+// plumbing.
+void update_measure_label() {
+    val el = val::global("document").call<val>("getElementById", std::string("measureLabel"));
+    if (el.isNull() || el.isUndefined()) return;
+    if (!g_measure_has_line) {
+        el["classList"].call<void>("add", std::string("hidden"));
+        return;
+    }
+    float dx = g_measure_x1 - g_measure_x0;
+    float dy = g_measure_y1 - g_measure_y0;
+    double dist = std::sqrt((double)dx * dx + (double)dy * dy);
+    std::string html = "<b>" + format_distance_um(dist) + "</b><br>\xCE\x94x " +
+                       format_distance_um(std::fabs(dx)) + " \xC2\xB7 \xCE\x94y " +
+                       format_distance_um(std::fabs(dy));  // Δx · Δy
+    el.set("innerHTML", html);
+    float sx, sy;
+    world_to_screen((g_measure_x0 + g_measure_x1) * 0.5f, (g_measure_y0 + g_measure_y1) * 0.5f, sx, sy);
+    el["style"].set("left", std::to_string(sx) + "px");
+    el["style"].set("top", std::to_string(sy) + "px");
+    el["classList"].call<void>("remove", std::string("hidden"));
+}
+
+// Draws the ruler: the measurement segment plus a short perpendicular tick at
+// each endpoint (constant on-screen length, so world size is divided by
+// zoom). Reuses the layer shader -- the instance attributes' generic identity
+// values (see init_gl) pass positions through, and u_useHatch=0 gives a solid
+// line. The VBO is tiny and re-uploaded whenever the endpoints move.
+void draw_measure_line() {
+    if (!g_measure_has_line) return;
+    float verts[12];
+    int count = 4;
+    verts[0] = g_measure_x0;
+    verts[1] = g_measure_y0;
+    verts[2] = g_measure_x1;
+    verts[3] = g_measure_y1;
+    float dx = g_measure_x1 - g_measure_x0;
+    float dy = g_measure_y1 - g_measure_y0;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len > 0.0f) {
+        float tick = 6.0f / g_zoom;  // 6px half-length ticks
+        float nx = -dy / len * tick;
+        float ny = dx / len * tick;
+        verts[4] = g_measure_x0 - nx;
+        verts[5] = g_measure_y0 - ny;
+        verts[6] = g_measure_x0 + nx;
+        verts[7] = g_measure_y0 + ny;
+        verts[8] = g_measure_x1 - nx;
+        verts[9] = g_measure_y1 - ny;
+        verts[10] = g_measure_x1 + nx;
+        verts[11] = g_measure_y1 + ny;
+        count = 12;
+    }
+    if (!g_measure_vbo) glGenBuffers(1, &g_measure_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_measure_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(count * sizeof(float)), verts, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(g_loc_position);
+    glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glUniform4f(g_loc_color, 1.0f, 1.0f, 1.0f, 0.95f);
+    glUniform1f(g_loc_use_hatch, 0.0f);
+    glDrawArrays(GL_LINES, 0, count / 2);
+}
+
 struct ViewRect {
     float min_x, max_x, min_y, max_y;
 };
@@ -727,6 +837,8 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
             glDisableVertexAttribArray(g_loc_i_translate);
         }
     }
+    draw_measure_line();
+    update_measure_label();
     update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size());
     return false;
 }
@@ -1075,6 +1187,27 @@ std::array<float, 4> hex_to_rgba(const std::string& hex_in, float alpha) {
 }
 
 bool on_mousedown(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*userData*/) {
+    if (g_measure_mode) {
+        // Click-click measurement: first click anchors the start point (the
+        // line then tracks the cursor via on_mousemove), second click freezes
+        // it. A further click starts a fresh measurement.
+        float wx, wy;
+        screen_to_world((float)e->targetX, (float)e->targetY, wx, wy);
+        if (!g_measure_pending) {
+            g_measure_x0 = wx;
+            g_measure_y0 = wy;
+            g_measure_x1 = wx;
+            g_measure_y1 = wy;
+            g_measure_pending = true;
+            g_measure_has_line = true;
+        } else {
+            g_measure_x1 = wx;
+            g_measure_y1 = wy;
+            g_measure_pending = false;
+        }
+        request_redraw();
+        return true;
+    }
     g_dragging = true;
     g_last_mouse_x = e->clientX;
     g_last_mouse_y = e->clientY;
@@ -1082,6 +1215,11 @@ bool on_mousedown(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*user
 }
 
 bool on_mousemove(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*userData*/) {
+    if (g_measure_pending) {
+        screen_to_world((float)e->targetX, (float)e->targetY, g_measure_x1, g_measure_y1);
+        request_redraw();
+        return true;
+    }
     if (!g_dragging) return false;
     int dx = e->clientX - g_last_mouse_x;
     int dy = e->clientY - g_last_mouse_y;
@@ -1472,6 +1610,10 @@ val parseGdsToLayers(const std::string& path) {
 void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     if (!g_gl_ready) return;
     clear_layers();
+    // A measurement is anchored to the old file's geometry -- drop it rather
+    // than leaving a stale ruler floating over the new design.
+    g_measure_has_line = false;
+    g_measure_pending = false;
 
     unsigned layer_count = layers_data["length"].as<unsigned>();
     unsigned group_count = instance_groups_data["length"].as<unsigned>();
@@ -1629,6 +1771,11 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
 void showLoadError(const std::string& message) {
     if (!g_gl_ready) return;
     clear_layers();
+    // With no layers draw_frame early-returns and can't hide the label, so
+    // hide it here directly.
+    g_measure_has_line = false;
+    g_measure_pending = false;
+    update_measure_label();
     set_inner_html("ui", std::string("<b>Error</b><br>") + message);
     request_redraw();
 }
@@ -1818,6 +1965,35 @@ void setShowInfill(bool show) {
     request_redraw();
 }
 
+// Discards any in-progress or finalized measurement (the label hides on the
+// next draw_frame via update_measure_label). Bound to Escape in viewer.js;
+// also called on mode exit and when a new file replaces the geometry the
+// measurement referred to.
+void clearMeasurement() {
+    g_measure_has_line = false;
+    g_measure_pending = false;
+    // No DOM in headless (plain Node) runs -- mirror loadAndRenderGds's guard.
+    if (!g_gl_ready) return;
+    // draw_frame early-returns with no layers, so it can't hide the label
+    // itself in the load-error path -- hide it directly.
+    update_measure_label();
+    request_redraw();
+}
+
+// Ruler on/off (the dat.gui "Measure" checkbox / M key in viewer.js). While
+// on, canvas clicks measure instead of pan (see on_mousedown); wheel zoom
+// still works. The crosshair cursor is the mode's visual cue.
+void setMeasureMode(bool on) {
+    g_measure_mode = on;
+    g_dragging = false;
+    if (!on) clearMeasurement();
+    if (!g_gl_ready) return;  // no DOM in headless (plain Node) runs
+    val canvas = val::global("document").call<val>("getElementById", std::string("glCanvas"));
+    if (!canvas.isNull() && !canvas.isUndefined()) {
+        canvas["style"].set("cursor", std::string(on ? "crosshair" : "default"));
+    }
+}
+
 int main() {
     g_gl_ready = init_gl();
     if (!g_gl_ready) return 0;
@@ -1840,4 +2016,6 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setLayerVisible", &setLayerVisible);
     function("resetView", &reset_view);
     function("setShowInfill", &setShowInfill);
+    function("setMeasureMode", &setMeasureMode);
+    function("clearMeasurement", &clearMeasurement);
 }

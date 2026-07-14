@@ -15,6 +15,11 @@
         body.debug #debugToggleBtn { display: block; }
         #scaleContainer { position: absolute; bottom: 20px; right: 20px; font-family: monospace; font-size: 11px; color: #ffffff; text-align: center; z-index: 10; pointer-events: none; }
         #scaleBar { height: 4px; background: #ffffff; border: 1px solid #000; margin-top: 4px; }
+        /* Ruler readout: repositioned to the measurement's midpoint on every
+           redraw by update_measure_label (renderer.cpp). The translate lifts
+           it just above the line so it doesn't cover what's being measured. */
+        #measureLabel { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: #ffffff; background: rgba(0,0,0,0.75); border: 1px solid #555; border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
+        #measureLabel.hidden { display: none; }
         .dg.ac { z-index: 20 !important; }
         /* Loaded-.lyp chip: the row shows the filename with an ✕ on the right
            (injected by setLypChip in viewer.js) to unload it. */
@@ -60,6 +65,8 @@
         <div id="scaleLabel">0 μm</div>
         <div id="scaleBar" style="width: 100px;"></div>
     </div>
+
+    <div id="measureLabel" class="hidden"></div>
 
     <!-- Base64 of gdstk_wasm.js's + wasm-worker.js's concatenated text (see
          extension.cjs) -- inert (not executed) since "text/plain" isn't a JS
