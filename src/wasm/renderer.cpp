@@ -1516,15 +1516,120 @@ void report_progress(const char* phase, uint64_t current, uint64_t total) {
         phase, (double)current, (double)total);
 }
 
+// Locates the next opening <tag> or <tag attr="...">, tolerating attributes,
+// at or after `from`. Returns the position of the '<' (npos if absent) and
+// sets content_start to just past the tag's closing '>'. Self-closing tags
+// (<tag/>, <tag attr/>) are skipped: they carry no value, which for every tag
+// this parser reads is equivalent to the tag being absent.
+size_t find_open_tag(const std::string& text, const char* tag, size_t from, size_t& content_start) {
+    std::string prefix = std::string("<") + tag;
+    size_t pos = text.find(prefix, from);
+    while (pos != std::string::npos) {
+        size_t after = pos + prefix.length();
+        char c = after < text.length() ? text[after] : '\0';
+        if (c == '>') {
+            content_start = after + 1;
+            return pos;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            size_t gt = text.find('>', after);
+            if (gt == std::string::npos) return std::string::npos;
+            if (text[gt - 1] != '/') {
+                content_start = gt + 1;
+                return pos;
+            }
+        }
+        // '/' (self-closing), or a longer tag name that merely starts with
+        // `tag` (e.g. <name> vs <names>) -- keep scanning.
+        pos = text.find(prefix, pos + prefix.length());
+    }
+    return std::string::npos;
+}
+
+// Decodes the five predefined XML entities plus numeric character references
+// (&#nn; / &#xhh;) -- .lyp values are stored XML-escaped, so a layer named
+// "A&B" arrives here as "A&amp;B".
+std::string xml_unescape(const std::string& s) {
+    if (s.find('&') == std::string::npos) return s;
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] != '&') {
+            out += s[i++];
+            continue;
+        }
+        size_t semi = s.find(';', i + 1);
+        // Entities are short; a far-away ';' means this '&' is just a bare
+        // ampersand in the text (technically invalid XML, but tolerated).
+        if (semi == std::string::npos || semi - i > 10) {
+            out += s[i++];
+            continue;
+        }
+        std::string ent = s.substr(i + 1, semi - i - 1);
+        long code = -1;
+        if (ent == "amp") code = '&';
+        else if (ent == "lt") code = '<';
+        else if (ent == "gt") code = '>';
+        else if (ent == "quot") code = '"';
+        else if (ent == "apos") code = '\'';
+        else if (ent.size() > 1 && ent[0] == '#') {
+            code = (ent[1] == 'x' || ent[1] == 'X') ? strtol(ent.c_str() + 2, nullptr, 16)
+                                                    : strtol(ent.c_str() + 1, nullptr, 10);
+        }
+        if (code <= 0 || code > 0x10FFFF) {
+            out += s[i++];  // unknown entity -- pass the '&' through untouched
+            continue;
+        }
+        // UTF-8 encode; embind hands the result back to JS as UTF-8.
+        if (code < 0x80) {
+            out += (char)code;
+        } else if (code < 0x800) {
+            out += (char)(0xC0 | (code >> 6));
+            out += (char)(0x80 | (code & 0x3F));
+        } else if (code < 0x10000) {
+            out += (char)(0xE0 | (code >> 12));
+            out += (char)(0x80 | ((code >> 6) & 0x3F));
+            out += (char)(0x80 | (code & 0x3F));
+        } else {
+            out += (char)(0xF0 | (code >> 18));
+            out += (char)(0x80 | ((code >> 12) & 0x3F));
+            out += (char)(0x80 | ((code >> 6) & 0x3F));
+            out += (char)(0x80 | (code & 0x3F));
+        }
+        i = semi + 1;
+    }
+    return out;
+}
+
+// Strips <!-- --> comments up front so a commented-out block (which may well
+// contain <properties> or <group-members> tags) can't confuse the
+// string-level tag scanning in loadLypText.
+std::string strip_xml_comments(const std::string& text) {
+    size_t c = text.find("<!--");
+    if (c == std::string::npos) return text;
+    std::string out;
+    out.reserve(text.size());
+    size_t pos = 0;
+    while (c != std::string::npos) {
+        out.append(text, pos, c - pos);
+        size_t e = text.find("-->", c + 4);
+        if (e == std::string::npos) return out;  // unterminated -- drop the rest
+        pos = e + 3;
+        c = text.find("<!--", pos);
+    }
+    out.append(text, pos, text.size() - pos);
+    return out;
+}
+
 bool extract_tag_value(const std::string& block, const char* tag, std::string& out) {
-    std::string open_tag = std::string("<") + tag + ">";
-    std::string close_tag = std::string("</") + tag + ">";
-    size_t open_pos = block.find(open_tag);
+    size_t content_start = 0;
+    size_t open_pos = find_open_tag(block, tag, 0, content_start);
     if (open_pos == std::string::npos) return false;
-    open_pos += open_tag.length();
-    size_t close_pos = block.find(close_tag, open_pos);
+    std::string close_tag = std::string("</") + tag + ">";
+    size_t close_pos = block.find(close_tag, content_start);
     if (close_pos == std::string::npos) return false;
-    out = block.substr(open_pos, close_pos - open_pos);
+    out = xml_unescape(block.substr(content_start, close_pos - content_start));
     return true;
 }
 
@@ -1549,6 +1654,17 @@ std::array<float, 4> hex_to_rgba(const std::string& hex_in, float alpha) {
         return (float)strtol(byte_buf, nullptr, 16);
     };
     return {hex_byte(0) / 255.0f, hex_byte(2) / 255.0f, hex_byte(4) / 255.0f, alpha};
+}
+
+// KLayout's <frame-brightness>/<fill-brightness>: -255..255 shifts the color
+// toward black (negative) or white (positive), with +-255 reaching full
+// white/black. Alpha is left alone.
+void apply_brightness(std::array<float, 4>& color, long brightness) {
+    if (brightness == 0) return;
+    float t = (float)std::max(-255l, std::min(255l, brightness)) / 255.0f;
+    for (int i = 0; i < 3; i++) {
+        color[i] = t > 0 ? color[i] + (1.0f - color[i]) * t : color[i] * (1.0f + t);
+    }
 }
 
 bool on_mousedown(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*userData*/) {
@@ -2201,13 +2317,29 @@ void loadAndRenderGds(const std::string& path) {
 // Parse one leaf .lyp block -- the region covering a single layer, containing
 // exactly one <source> -- and insert it into g_lyp_info under `category`. A
 // no-op when the block has no numeric <source> (e.g. a subgroup header, or
-// KLayout's catch-all "*/*") or defines no usable color.
-void parse_lyp_leaf(const std::string& block, const std::string& category) {
+// KLayout's catch-all "*/*") or is bound to a layout other than the first.
+// An entry without colors is still kept (its name and visibility apply; the
+// colors fall back to the hash defaults in apply_layer_colors). group_visible
+// carries the enclosing group node's <visible> flag: KLayout hides every
+// child of an invisible group regardless of the child's own flag.
+void parse_lyp_leaf(const std::string& block, const std::string& category, bool group_visible) {
     // <source> is "layer/datatype@layout-index" (e.g. "250/9@1"). Split off the
     // layer at '/', then the datatype up to '@' (or end). A missing datatype
     // defaults to 0.
     std::string source_text;
     if (!extract_tag_value(block, "source", source_text)) return;
+
+    // A numeric layout index (@2, @3, ...) binds the entry to the Nth loaded
+    // layout -- this viewer only ever has one, so entries for other layouts
+    // are skipped rather than misapplied. "@1", "@*", and no index all apply.
+    size_t at_pos = source_text.find('@');
+    if (at_pos != std::string::npos) {
+        std::string idx_text = trim(source_text.substr(at_pos + 1));
+        char* idx_endptr = nullptr;
+        long layout_index = strtol(idx_text.c_str(), &idx_endptr, 10);
+        if (idx_endptr != idx_text.c_str() && layout_index != 1) return;
+    }
+
     size_t slash_pos = source_text.find('/');
     std::string layer_text = trim(source_text.substr(0, slash_pos));
     if (layer_text.empty()) return;
@@ -2218,8 +2350,7 @@ void parse_lyp_leaf(const std::string& block, const std::string& category) {
     long datatype_number = 0;
     if (slash_pos != std::string::npos) {
         std::string dt_text = source_text.substr(slash_pos + 1);
-        size_t at_pos = dt_text.find('@');
-        if (at_pos != std::string::npos) dt_text = dt_text.substr(0, at_pos);
+        if (at_pos != std::string::npos) dt_text = dt_text.substr(0, dt_text.find('@'));
         dt_text = trim(dt_text);
         char* dt_endptr = nullptr;
         long parsed = strtol(dt_text.c_str(), &dt_endptr, 10);
@@ -2242,7 +2373,14 @@ void parse_lyp_leaf(const std::string& block, const std::string& category) {
         entry.frame_color = hex_to_rgba(frame_text, 0.9f);
         if (entry.frame_color[3] == 0.0f) entry.has_frame = false;
     }
-    if (!entry.has_fill && !entry.has_frame) return;
+
+    std::string brightness_text;
+    if (entry.has_fill && extract_tag_value(block, "fill-brightness", brightness_text)) {
+        apply_brightness(entry.fill_color, strtol(trim(brightness_text).c_str(), nullptr, 10));
+    }
+    if (entry.has_frame && extract_tag_value(block, "frame-brightness", brightness_text)) {
+        apply_brightness(entry.frame_color, strtol(trim(brightness_text).c_str(), nullptr, 10));
+    }
 
     std::string name_text;
     if (extract_tag_value(block, "name", name_text)) entry.name = trim(name_text);
@@ -2252,13 +2390,32 @@ void parse_lyp_leaf(const std::string& block, const std::string& category) {
         std::string v = trim(visible_text);
         entry.visible = !(v == "false" || v == "0");
     }
+    entry.visible = entry.visible && group_visible;
 
     g_lyp_info[make_tag((uint32_t)layer_number, (uint32_t)datatype_number)] = entry;
 }
 
-void loadLypText(const std::string& xml_text) {
+void loadLypText(const std::string& xml_text_in) {
     g_lyp_info.clear();
     g_lyp_order_counter = 0;
+
+    std::string xml_text = strip_xml_comments(xml_text_in);
+
+    // Multi-tab files: <layer-properties-tabs> wraps one <layer-properties>
+    // element per tab. Parse only the first tab -- mirroring KLayout's initial
+    // view -- instead of letting later tabs' entries overwrite earlier ones.
+    // (find_open_tag can't match "<layer-properties-tabs" for the "<layer-
+    // properties" prefix search below since '-' follows the name, so the first
+    // hit is the first real tab.)
+    if (xml_text.find("<layer-properties-tabs") != std::string::npos) {
+        size_t tab_content = 0;
+        if (find_open_tag(xml_text, "layer-properties", 0, tab_content) != std::string::npos) {
+            size_t tab_close = xml_text.find("</layer-properties>", tab_content);
+            if (tab_close != std::string::npos) {
+                xml_text = xml_text.substr(tab_content, tab_close - tab_content);
+            }
+        }
+    }
 
     // KLayout .lyp: the root <layer-properties> holds top-level <properties>
     // blocks. A <properties> block is either a single layer (has <source>
@@ -2271,34 +2428,44 @@ void loadLypText(const std::string& xml_text) {
     // too (a subgroup-header region carries no <source>, so parse_lyp_leaf skips
     // it), and every leaf inherits the outermost category -- exactly the flat
     // two-level (category -> layers) view the sidebar wants.
-    const std::string props = "<properties>";
-    const std::string members = "<group-members>";
-    size_t prop_pos = xml_text.find(props);
+    size_t block_start = 0;
+    size_t prop_pos = find_open_tag(xml_text, "properties", 0, block_start);
     while (prop_pos != std::string::npos) {
-        size_t block_start = prop_pos + props.length();
-        size_t next_prop = xml_text.find(props, block_start);
+        size_t next_start = 0;
+        size_t next_prop = find_open_tag(xml_text, "properties", block_start, next_start);
         size_t block_end = (next_prop == std::string::npos) ? xml_text.length() : next_prop;
         std::string top_block = xml_text.substr(block_start, block_end - block_start);
         prop_pos = next_prop;
+        block_start = next_start;
 
-        size_t first_members = top_block.find(members);
+        size_t leaf_start = 0;
+        size_t first_members = find_open_tag(top_block, "group-members", 0, leaf_start);
         if (first_members == std::string::npos) {
             // Flat single-layer entry, no category.
-            parse_lyp_leaf(top_block, "");
+            parse_lyp_leaf(top_block, "", true);
             continue;
         }
 
+        // The group node's own <name>/<visible> live before the first
+        // <group-members>. Its visibility cascades to every leaf below.
+        std::string header = top_block.substr(0, first_members);
         std::string category;
         std::string name_text;
-        std::string header = top_block.substr(0, first_members);
         if (extract_tag_value(header, "name", name_text)) category = trim(name_text);
+        bool group_visible = true;
+        std::string visible_text;
+        if (extract_tag_value(header, "visible", visible_text)) {
+            std::string v = trim(visible_text);
+            group_visible = !(v == "false" || v == "0");
+        }
 
         for (size_t m = first_members; m != std::string::npos;) {
-            size_t leaf_start = m + members.length();
-            size_t next_m = top_block.find(members, leaf_start);
+            size_t next_leaf_start = 0;
+            size_t next_m = find_open_tag(top_block, "group-members", leaf_start, next_leaf_start);
             size_t leaf_end = (next_m == std::string::npos) ? top_block.length() : next_m;
-            parse_lyp_leaf(top_block.substr(leaf_start, leaf_end - leaf_start), category);
+            parse_lyp_leaf(top_block.substr(leaf_start, leaf_end - leaf_start), category, group_visible);
             m = next_m;
+            leaf_start = next_leaf_start;
         }
     }
 
