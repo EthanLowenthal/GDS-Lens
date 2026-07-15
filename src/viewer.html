@@ -21,6 +21,13 @@
         #measureLabel { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: #ffffff; background: rgba(0,0,0,0.75); border: 1px solid #555; border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
         #measureLabel.hidden { display: none; }
         .dg.ac { z-index: 20 !important; }
+        /* Checkbox rows (layer list + top-level toggles): dat.gui defaults
+           give the label only 40% of the row and let it word-wrap into the
+           hidden overflow, so "250/74 – SIN_WG_S" showed as "250/74 –" with
+           the whole name gone. nowrap makes the cut character-level with an
+           ellipsis, and the checkbox needs nowhere near 60% of the row. */
+        .dg .cr.boolean .property-name { width: 78%; white-space: nowrap; }
+        .dg .cr.boolean .c { width: 22%; }
         /* Loaded-.lyp chip: the row shows the filename with an ✕ on the right
            (injected by setLypChip in viewer.js) to unload it. */
         .dg li.lyp-loaded { position: relative; }
