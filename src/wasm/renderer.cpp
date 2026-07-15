@@ -372,6 +372,13 @@ GLint g_loc_hatch_angle = -1;
 GLint g_loc_hatch_spacing = -1;
 GLint g_loc_hatch_width = -1;
 
+// Frame-time readout for the stats overlay: EMA of the delta between
+// consecutive requestAnimationFrame timestamps. Only meaningful while frames
+// are being produced back-to-back (pan/zoom); deltas over 500ms are idle
+// gaps between interactions, not rendering time, and are skipped.
+double g_last_frame_timestamp = 0.0;
+float g_frame_ms_ema = 0.0f;
+
 // Merge mode's GL objects (see draw_layer_merged): the coverage-mask program
 // (kVertexShaderSrc + kMaskFragmentShaderSrc, so it needs its own copies of
 // the camera uniforms), the composite program, and one screen-sized R8 mask
@@ -459,7 +466,7 @@ bool g_frame_requested = false;
 
 // Toggles the hatched polygon fill (the "infill") on/off for every layer at
 // once -- see draw_frame and setShowInfill. Outlines are unaffected.
-bool g_show_infill = true;
+bool g_show_infill = false;
 
 // Merge-overlaps mode: when on, each layer draws as the union of its polygons
 // (screen-space coverage mask + composite pass, see draw_layer_merged) so
@@ -923,9 +930,15 @@ bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, co
 // layer-level visibility/bbox skip in draw_frame -- there's no per-polygon
 // culling anymore, so every drawn layer's polygons are all visible.
 void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers_total) {
-    char buf[160];
-    snprintf(buf, sizeof(buf), "Visible: %llu / %llu polygons<br>Render: no culling (%d / %d layers on screen)",
+    char buf[224];
+    int len = snprintf(buf, sizeof(buf), "Visible: %llu / %llu polygons<br>Render: no culling (%d / %d layers on screen)",
              (unsigned long long)visible_polygons, (unsigned long long)g_total_polygons, layers_drawn, layers_total);
+    // Frame time is only measured across back-to-back frames (see
+    // draw_frame); before any interaction there's nothing meaningful to show.
+    if (g_frame_ms_ema > 0.0f && len > 0 && (size_t)len < sizeof(buf)) {
+        snprintf(buf + len, sizeof(buf) - (size_t)len, "<br>Frame: %.1f ms (%.0f fps)", g_frame_ms_ema,
+                 1000.0f / g_frame_ms_ema);
+    }
     set_inner_html("renderStats", buf);
 }
 
@@ -1045,8 +1058,19 @@ void draw_layer_merged(const LayerBuffer& layer) {
     glUseProgram(g_program);
 }
 
-bool draw_frame(double /*time*/, void* /*userData*/) {
+bool draw_frame(double time, void* /*userData*/) {
     g_frame_requested = false;
+    // `time` is the rAF timestamp (ms); the delta between consecutive frames
+    // is the real end-to-end frame time while interaction keeps frames
+    // coming. Gaps over 500ms are idle time between interactions, not
+    // rendering -- skip those.
+    if (g_last_frame_timestamp > 0.0) {
+        double dt = time - g_last_frame_timestamp;
+        if (dt > 0.0 && dt < 500.0) {
+            g_frame_ms_ema = g_frame_ms_ema <= 0.0f ? (float)dt : g_frame_ms_ema * 0.8f + (float)dt * 0.2f;
+        }
+    }
+    g_last_frame_timestamp = time;
     if (g_layers.empty()) return false;
 
     glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
