@@ -121,6 +121,106 @@ const char* kFragmentShaderSrc =
     "    fragColor = vec4(u_color.rgb, alpha);\n"
     "}";
 
+// Fragment shader for merge mode's coverage pass: every covered fragment
+// writes 1 into the R8 mask texture, blending off, so any number of
+// overlapping polygons on the layer collapse into plain per-pixel coverage.
+// That mask *is* the union of the layer's polygons -- no CPU boolean ops
+// anywhere. Pairs with kVertexShaderSrc so static and instanced geometry
+// rasterize through the exact same camera/instancing path as normal draws.
+const char* kMaskFragmentShaderSrc =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "out vec4 fragColor;\n"
+    "void main() { fragColor = vec4(1.0); }";
+
+// Fullscreen triangle for merge mode's composite pass, derived from
+// gl_VertexID -- no vertex buffer, no attributes. (0,0)/(2,0)/(0,2) in UV
+// maps to clip-space (-1,-1)/(3,-1)/(-1,3), covering the screen with one
+// triangle.
+const char* kCompositeVertexShaderSrc =
+    "#version 300 es\n"
+    "void main() {\n"
+    "    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+    "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}";
+
+// Merge mode's composite pass: reads the layer's coverage mask and paints the
+// union boundary (any covered texel with an uncovered 8-neighbor) in the
+// layer's frame color, and the interior with the same screen-space hatch
+// patterns the normal fill path uses (duplicated from kFragmentShaderSrc,
+// with fwidth() replaced by exact analytic derivatives -- the pattern coords
+// are linear in gl_FragCoord, and derivatives after a discard are undefined).
+// Uncovered texels discard, so normal alpha blending stacks merged layers the
+// same way unmerged ones stack.
+const char* kCompositeFragmentShaderSrc =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "uniform sampler2D u_mask;\n"
+    "uniform vec4 u_fillColor;\n"
+    "uniform vec4 u_frameColor;\n"
+    "uniform float u_patternType;\n"
+    "uniform float u_hatchAngle;\n"
+    "uniform float u_hatchSpacing;\n"
+    "uniform float u_hatchWidth;\n"
+    "uniform float u_showFill;\n"
+    "out vec4 fragColor;\n"
+    // Clamped mask fetch: off-screen neighbors read as their nearest on-screen
+    // texel, so geometry running past the viewport edge doesn't grow a false
+    // outline along the screen border.
+    "float maskAt(ivec2 p) {\n"
+    "    ivec2 size = textureSize(u_mask, 0);\n"
+    "    return texelFetch(u_mask, clamp(p, ivec2(0), size - 1), 0).r;\n"
+    "}\n"
+    "float lineMask(float coord, float spacing, float halfWidth, float deriv) {\n"
+    "    float t = mod(coord, spacing);\n"
+    "    float d = min(t, spacing - t);\n"
+    "    float aa = deriv * 0.5 + 0.001;\n"
+    "    return 1.0 - smoothstep(halfWidth - aa, halfWidth + aa, d);\n"
+    "}\n"
+    "void main() {\n"
+    "    ivec2 pix = ivec2(gl_FragCoord.xy);\n"
+    "    if (maskAt(pix) < 0.5) discard;\n"
+    "    float outside = 0.0;\n"
+    "    for (int dy = -1; dy <= 1; dy++) {\n"
+    "        for (int dx = -1; dx <= 1; dx++) {\n"
+    "            if (dx == 0 && dy == 0) continue;\n"
+    "            outside = max(outside, 1.0 - maskAt(pix + ivec2(dx, dy)));\n"
+    "        }\n"
+    "    }\n"
+    "    if (outside > 0.5) {\n"
+    "        fragColor = u_frameColor;\n"
+    "        return;\n"
+    "    }\n"
+    "    if (u_showFill < 0.5) discard;\n"
+    "    float c = cos(u_hatchAngle);\n"
+    "    float s = sin(u_hatchAngle);\n"
+    "    vec2 p = gl_FragCoord.xy;\n"
+    "    float u = p.x * c + p.y * s;\n"
+    "    float v = -p.x * s + p.y * c;\n"
+    // d(u)/d(pixel) is exactly (|c|, |s|); fwidth would sum those, so pass
+    // |c|+|s| (same for v by symmetry) and 1.0 for the axis-aligned grid.
+    "    float duv = abs(c) + abs(s);\n"
+    "    int patternType = int(u_patternType + 0.5);\n"
+    "    float mask;\n"
+    "    if (patternType == 0) {\n"
+    "        mask = lineMask(u, u_hatchSpacing, u_hatchWidth, duv);\n"
+    "    } else if (patternType == 1) {\n"
+    "        mask = max(lineMask(u, u_hatchSpacing, u_hatchWidth, duv), lineMask(v, u_hatchSpacing, u_hatchWidth, duv));\n"
+    "    } else if (patternType == 2) {\n"
+    "        float du = mod(u, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
+    "        float dv = mod(v, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
+    "        float dist = length(vec2(du, dv));\n"
+    "        float aa = 1.0 + 0.001;\n"  // fwidth(dist) <= sqrt(2); 1.0 is close enough
+    "        float dotRadius = u_hatchWidth * 1.7;\n"
+    "        mask = 1.0 - smoothstep(dotRadius - aa, dotRadius + aa, dist);\n"
+    "    } else {\n"
+    "        mask = max(lineMask(p.x, u_hatchSpacing, u_hatchWidth, 1.0), lineMask(p.y, u_hatchSpacing, u_hatchWidth, 1.0));\n"
+    "    }\n"
+    "    float alpha = min(u_fillColor.a * 1.4, 0.7) * mask;\n"
+    "    if (alpha <= 0.0) discard;\n"
+    "    fragColor = vec4(u_fillColor.rgb, alpha);\n"
+    "}";
+
 struct PolygonRange {
     GLint first;
     GLsizei count;
@@ -245,6 +345,25 @@ GLint g_loc_hatch_angle = -1;
 GLint g_loc_hatch_spacing = -1;
 GLint g_loc_hatch_width = -1;
 
+// Merge mode's GL objects (see draw_layer_merged): the coverage-mask program
+// (kVertexShaderSrc + kMaskFragmentShaderSrc, so it needs its own copies of
+// the camera uniforms), the composite program, and one screen-sized R8 mask
+// texture + FBO reused by every merged layer every frame.
+GLuint g_mask_program = 0;
+GLint g_mask_loc_resolution = -1;
+GLint g_mask_loc_offset = -1;
+GLint g_mask_loc_zoom = -1;
+GLuint g_comp_program = 0;
+GLint g_comp_loc_fill_color = -1;
+GLint g_comp_loc_frame_color = -1;
+GLint g_comp_loc_pattern_type = -1;
+GLint g_comp_loc_hatch_angle = -1;
+GLint g_comp_loc_hatch_spacing = -1;
+GLint g_comp_loc_hatch_width = -1;
+GLint g_comp_loc_show_fill = -1;
+GLuint g_mask_fbo = 0;
+GLuint g_mask_tex = 0;
+
 // Constant pixel pitch for every layer's pattern -- only the angle and
 // pattern kind vary per layer (see pattern_for_layer) so stacked layers
 // stay visually distinguishable from each other.
@@ -309,11 +428,43 @@ bool g_frame_requested = false;
 // once -- see draw_frame and setShowInfill. Outlines are unaffected.
 bool g_show_infill = true;
 
+// Merge-overlaps mode: when on, each layer draws as the union of its polygons
+// (screen-space coverage mask + composite pass, see draw_layer_merged) so
+// edges interior to overlapping/abutting polygons disappear and only the
+// layer's true boundary shows. Purely a render-time effect -- the parsed
+// geometry is untouched, so toggling never re-parses or re-uploads anything.
+bool g_merge_mode = false;
+
 GLuint compile_shader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
     glCompileShader(shader);
     return shader;
+}
+
+// Attribute locations are bound to fixed indices before linking (rather than
+// queried after) so every program built from kVertexShaderSrc -- the main
+// layer program and merge mode's mask program -- agrees on them: attribute
+// enables, pointers, divisors, and the generic identity values set in
+// init_gl are all per-index context/VAO state, so agreeing on indices lets
+// draw_frame switch programs without redoing any of that setup. Harmless for
+// programs that don't declare these names (the composite pass has no
+// attributes at all).
+constexpr GLuint kAttrPosition = 0;
+constexpr GLuint kAttrICol0 = 1;
+constexpr GLuint kAttrICol1 = 2;
+constexpr GLuint kAttrITranslate = 3;
+
+GLuint link_program(const char* vs_src, const char* fs_src) {
+    GLuint program = glCreateProgram();
+    glAttachShader(program, compile_shader(GL_VERTEX_SHADER, vs_src));
+    glAttachShader(program, compile_shader(GL_FRAGMENT_SHADER, fs_src));
+    glBindAttribLocation(program, kAttrPosition, "a_position");
+    glBindAttribLocation(program, kAttrICol0, "a_iCol0");
+    glBindAttribLocation(program, kAttrICol1, "a_iCol1");
+    glBindAttribLocation(program, kAttrITranslate, "a_iTranslate");
+    glLinkProgram(program);
+    return program;
 }
 
 // False in environments with no real WebGL2-capable canvas -- notably plain
@@ -333,15 +484,12 @@ bool init_gl() {
     if (ctx <= 0) return false;
     if (emscripten_webgl_make_context_current(ctx) != EMSCRIPTEN_RESULT_SUCCESS) return false;
 
-    g_program = glCreateProgram();
-    glAttachShader(g_program, compile_shader(GL_VERTEX_SHADER, kVertexShaderSrc));
-    glAttachShader(g_program, compile_shader(GL_FRAGMENT_SHADER, kFragmentShaderSrc));
-    glLinkProgram(g_program);
+    g_program = link_program(kVertexShaderSrc, kFragmentShaderSrc);
 
-    g_loc_position = glGetAttribLocation(g_program, "a_position");
-    g_loc_i_col0 = glGetAttribLocation(g_program, "a_iCol0");
-    g_loc_i_col1 = glGetAttribLocation(g_program, "a_iCol1");
-    g_loc_i_translate = glGetAttribLocation(g_program, "a_iTranslate");
+    g_loc_position = kAttrPosition;
+    g_loc_i_col0 = kAttrICol0;
+    g_loc_i_col1 = kAttrICol1;
+    g_loc_i_translate = kAttrITranslate;
     g_loc_resolution = glGetUniformLocation(g_program, "u_resolution");
     g_loc_color = glGetUniformLocation(g_program, "u_color");
     g_loc_offset = glGetUniformLocation(g_program, "u_offset");
@@ -363,6 +511,38 @@ bool init_gl() {
     if (g_loc_i_col0 >= 0) glVertexAttrib2f(g_loc_i_col0, 1.0f, 0.0f);
     if (g_loc_i_col1 >= 0) glVertexAttrib2f(g_loc_i_col1, 0.0f, 1.0f);
     if (g_loc_i_translate >= 0) glVertexAttrib2f(g_loc_i_translate, 0.0f, 0.0f);
+
+    // Merge mode's two extra programs (see draw_layer_merged). The composite
+    // program's sampler is bound to texture unit 0 once here.
+    g_mask_program = link_program(kVertexShaderSrc, kMaskFragmentShaderSrc);
+    g_mask_loc_resolution = glGetUniformLocation(g_mask_program, "u_resolution");
+    g_mask_loc_offset = glGetUniformLocation(g_mask_program, "u_offset");
+    g_mask_loc_zoom = glGetUniformLocation(g_mask_program, "u_zoom");
+
+    g_comp_program = link_program(kCompositeVertexShaderSrc, kCompositeFragmentShaderSrc);
+    g_comp_loc_fill_color = glGetUniformLocation(g_comp_program, "u_fillColor");
+    g_comp_loc_frame_color = glGetUniformLocation(g_comp_program, "u_frameColor");
+    g_comp_loc_pattern_type = glGetUniformLocation(g_comp_program, "u_patternType");
+    g_comp_loc_hatch_angle = glGetUniformLocation(g_comp_program, "u_hatchAngle");
+    g_comp_loc_hatch_spacing = glGetUniformLocation(g_comp_program, "u_hatchSpacing");
+    g_comp_loc_hatch_width = glGetUniformLocation(g_comp_program, "u_hatchWidth");
+    g_comp_loc_show_fill = glGetUniformLocation(g_comp_program, "u_showFill");
+    glUseProgram(g_comp_program);
+    glUniform1i(glGetUniformLocation(g_comp_program, "u_mask"), 0);
+
+    // The mask texture's storage is (re)allocated at the canvas size in
+    // resize_canvas; only the texture object and its FBO attachment are
+    // created here.
+    glGenTextures(1, &g_mask_tex);
+    glBindTexture(GL_TEXTURE_2D, g_mask_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &g_mask_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_mask_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_mask_tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -495,7 +675,14 @@ void triangulate(const Array<Vec2>& pts, std::vector<uint32_t>& out_indices) {
             bool any_inside = false;
             for (uint64_t j = 0; j < m; j++) {
                 if (j == iprev || j == i || j == inext) continue;
-                if (point_in_tri(pts[remaining[j]], a, b, c)) {
+                const Vec2& p = pts[remaining[j]];
+                // Keyhole/comb polygons (the self-touching slits tools use to
+                // represent holes) duplicate the slit's bridge vertices, and a
+                // duplicate lands exactly on an ear corner -- point_in_tri is
+                // boundary-inclusive, so without this exemption every ear near
+                // the bridge is vetoed and triangulation stalls at zero.
+                if (p == a || p == b || p == c) continue;
+                if (point_in_tri(p, a, b, c)) {
                     any_inside = true;
                     break;
                 }
@@ -723,6 +910,97 @@ void clamp_pan() {
     g_pan_y = std::clamp(g_pan_y, g_bbox_min_y - half_h, g_bbox_max_y + half_h);
 }
 
+// Points the three per-instance affine attributes at an InstancedBatch's
+// instance VBO with a per-instance divisor / reverts them to the disabled
+// (generic identity) state -- shared by draw_frame's normal path and
+// draw_layer_merged's mask pass, which draw the same batches under different
+// programs (the attribute indices are fixed at link time, see link_program).
+void enable_instance_attribs(GLuint instance_vbo) {
+    const GLsizei stride = kInstanceStrideFloats * (GLsizei)sizeof(float);
+    glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
+    glEnableVertexAttribArray(g_loc_i_col0);
+    glVertexAttribPointer(g_loc_i_col0, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glVertexAttribDivisor(g_loc_i_col0, 1);
+    glEnableVertexAttribArray(g_loc_i_col1);
+    glVertexAttribPointer(g_loc_i_col1, 2, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+    glVertexAttribDivisor(g_loc_i_col1, 1);
+    glEnableVertexAttribArray(g_loc_i_translate);
+    glVertexAttribPointer(g_loc_i_translate, 2, GL_FLOAT, GL_FALSE, stride, (void*)(4 * sizeof(float)));
+    glVertexAttribDivisor(g_loc_i_translate, 1);
+}
+
+void disable_instance_attribs() {
+    glDisableVertexAttribArray(g_loc_i_col0);
+    glDisableVertexAttribArray(g_loc_i_col1);
+    glDisableVertexAttribArray(g_loc_i_translate);
+}
+
+// Merge-mode path for one layer, two passes. Pass 1 rasterizes the layer's
+// fill triangles (static + instanced, same VBOs the normal path draws) into
+// the screen-sized R8 mask with blending off, collapsing any overlap into
+// plain coverage -- the union of the layer's polygons, computed by the
+// rasterizer instead of CPU polygon booleans. Pass 2 draws one fullscreen
+// triangle that turns that mask into pixels: frame color along the coverage
+// boundary, hatch fill inside, discard outside (see
+// kCompositeFragmentShaderSrc). Alpha blending on the canvas is per-pass-2-
+// fragment, so merged layers stack against other layers exactly like normal
+// ones. Coverage comes from the triangulated fill data, so polygons that
+// exceeded kMaxTriangulatePoints (rendered outline-only in normal mode)
+// don't contribute here.
+void draw_layer_merged(const LayerBuffer& layer) {
+    bool has_fill = layer.fill_vbo != 0;
+    for (const InstancedBatch& batch : layer.instanced_batches) {
+        if (batch.fill_vbo) has_fill = true;
+    }
+    if (!has_fill) return;
+
+    // Pass 1: coverage mask.
+    glBindFramebuffer(GL_FRAMEBUFFER, g_mask_fbo);
+    glDisable(GL_BLEND);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(g_mask_program);
+    glUniform2f(g_mask_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform2f(g_mask_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_mask_loc_zoom, g_zoom);
+
+    if (layer.fill_vbo) {
+        glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
+    }
+    for (const InstancedBatch& batch : layer.instanced_batches) {
+        if (!batch.fill_vbo) continue;
+        enable_instance_attribs(batch.instance_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
+        disable_instance_attribs();
+    }
+
+    // Pass 2: composite boundary + fill onto the canvas.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glEnable(GL_BLEND);
+    glUseProgram(g_comp_program);
+    glUniform4fv(g_comp_loc_fill_color, 1, layer.fill_color.data());
+    glUniform4fv(g_comp_loc_frame_color, 1, layer.frame_color.data());
+    glUniform1f(g_comp_loc_pattern_type, layer.pattern_type);
+    glUniform1f(g_comp_loc_hatch_angle, layer.hatch_angle);
+    glUniform1f(g_comp_loc_hatch_spacing, kHatchSpacingPx);
+    glUniform1f(g_comp_loc_hatch_width, kHatchHalfWidthPx);
+    glUniform1f(g_comp_loc_show_fill, g_show_infill ? 1.0f : 0.0f);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_mask_tex);
+    // The fullscreen triangle comes from gl_VertexID; a_position must not be
+    // an enabled array here or GL would read (and bounds-check) whatever
+    // buffer the mask pass left bound.
+    glDisableVertexAttribArray(g_loc_position);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glUseProgram(g_program);
+}
+
 bool draw_frame(double /*time*/, void* /*userData*/) {
     g_frame_requested = false;
     if (g_layers.empty()) return false;
@@ -756,6 +1034,11 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
 
         frame_layers_drawn++;
         frame_visible_polygons += layer.polygon_count;
+
+        if (g_merge_mode) {
+            draw_layer_merged(layer);
+            continue;
+        }
 
         if (layer.fill_vbo && g_show_infill) {
             glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
@@ -796,17 +1079,7 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
         // affine reverts to the identity generic value (set in init_gl) for
         // the non-instanced draws above/below.
         for (const InstancedBatch& batch : layer.instanced_batches) {
-            const GLsizei stride = kInstanceStrideFloats * (GLsizei)sizeof(float);
-            glBindBuffer(GL_ARRAY_BUFFER, batch.instance_vbo);
-            glEnableVertexAttribArray(g_loc_i_col0);
-            glVertexAttribPointer(g_loc_i_col0, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
-            glVertexAttribDivisor(g_loc_i_col0, 1);
-            glEnableVertexAttribArray(g_loc_i_col1);
-            glVertexAttribPointer(g_loc_i_col1, 2, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
-            glVertexAttribDivisor(g_loc_i_col1, 1);
-            glEnableVertexAttribArray(g_loc_i_translate);
-            glVertexAttribPointer(g_loc_i_translate, 2, GL_FLOAT, GL_FALSE, stride, (void*)(4 * sizeof(float)));
-            glVertexAttribDivisor(g_loc_i_translate, 1);
+            enable_instance_attribs(batch.instance_vbo);
 
             if (batch.fill_vbo && g_show_infill) {
                 glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
@@ -832,9 +1105,7 @@ bool draw_frame(double /*time*/, void* /*userData*/) {
                                         batch.instance_count);
             }
 
-            glDisableVertexAttribArray(g_loc_i_col0);
-            glDisableVertexAttribArray(g_loc_i_col1);
-            glDisableVertexAttribArray(g_loc_i_translate);
+            disable_instance_attribs();
         }
     }
     draw_measure_line();
@@ -863,6 +1134,13 @@ void resize_canvas() {
     canvas.set("height", height);
 
     glViewport(0, 0, width, height);
+
+    // Keep merge mode's coverage mask the same size as the canvas -- the
+    // composite pass addresses it 1:1 by gl_FragCoord.
+    if (g_mask_tex) {
+        glBindTexture(GL_TEXTURE_2D, g_mask_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+    }
     clamp_pan();
     update_scale_bar();
     request_redraw();
@@ -1300,6 +1578,20 @@ val build_layer_entry(uint64_t tag, std::vector<Polygon*>& polys, uint64_t& out_
     val fill_ranges = val::array();
     std::vector<uint32_t> tri_indices;
 
+    auto append_fill = [&](const Array<Vec2>& pts, const std::vector<uint32_t>& indices) {
+        if (indices.empty()) return;
+        uint32_t fill_first = (uint32_t)(fill_vertices.size() / 2);
+        for (uint32_t idx : indices) {
+            const Vec2& pt = pts[idx];
+            fill_vertices.push_back((float)pt.x);
+            fill_vertices.push_back((float)pt.y);
+        }
+        val fill_range = val::array();
+        fill_range.set(0, fill_first);
+        fill_range.set(1, (uint32_t)indices.size());
+        fill_ranges.call<void>("push", fill_range);
+    };
+
     for (Polygon* poly : polys) {
         uint32_t first = (uint32_t)(outline_vertices.size() / 2);
         for (uint64_t i = 0; i < poly->point_array.count; i++) {
@@ -1318,17 +1610,39 @@ val build_layer_entry(uint64_t tag, std::vector<Polygon*>& polys, uint64_t& out_
 
         tri_indices.clear();
         triangulate(poly->point_array, tri_indices);
-        if (!tri_indices.empty()) {
-            uint32_t fill_first = (uint32_t)(fill_vertices.size() / 2);
-            for (uint32_t idx : tri_indices) {
-                const Vec2& pt = poly->point_array[idx];
-                fill_vertices.push_back((float)pt.x);
-                fill_vertices.push_back((float)pt.y);
+        // A simple polygon with n vertices triangulates into exactly n-2
+        // triangles; fewer means triangulate() declined (over the point cap)
+        // or bailed partway (degenerate input, e.g. the self-touching comb
+        // slits some tools emit to represent holes). Fall back to gdstk's
+        // fracture(), whose horizontal/vertical cuts both bound the piece
+        // size and split away most degeneracies, and triangulate the pieces.
+        // Fill only -- the outline above still traces the original polygon,
+        // and the seams the cuts introduce are invisible: normal mode never
+        // strokes fill internals, and merge mode's coverage mask unions the
+        // pieces back together.
+        uint64_t n = poly->point_array.count;
+        bool complete = n >= 3 && tri_indices.size() == (size_t)(n - 2) * 3;
+        if (complete || n < 3) {
+            append_fill(poly->point_array, tri_indices);
+        } else {
+            Array<Polygon*> pieces = {};
+            // precision = 1e-3: coordinates are in microns (see read_gds's
+            // unit argument), so cuts snap to a 1 nm grid.
+            poly->fracture(kMaxTriangulatePoints, 1e-3, pieces);
+            if (pieces.count == 0) {
+                // fracture had nothing to offer -- keep whatever partial
+                // triangulation the ear clipper managed.
+                append_fill(poly->point_array, tri_indices);
             }
-            val fill_range = val::array();
-            fill_range.set(0, fill_first);
-            fill_range.set(1, (uint32_t)tri_indices.size());
-            fill_ranges.call<void>("push", fill_range);
+            for (uint64_t p = 0; p < pieces.count; p++) {
+                Polygon* piece = pieces[p];
+                tri_indices.clear();
+                triangulate(piece->point_array, tri_indices);
+                append_fill(piece->point_array, tri_indices);
+                piece->clear();
+                free_allocation(piece);
+            }
+            pieces.clear();
         }
     }
 
@@ -1965,6 +2279,12 @@ void setShowInfill(bool show) {
     request_redraw();
 }
 
+// The dat.gui "Merge Overlaps" checkbox -- see g_merge_mode/draw_layer_merged.
+void setMergeMode(bool on) {
+    g_merge_mode = on;
+    request_redraw();
+}
+
 // Discards any in-progress or finalized measurement (the label hides on the
 // next draw_frame via update_measure_label). Bound to Escape in viewer.js;
 // also called on mode exit and when a new file replaces the geometry the
@@ -2016,6 +2336,7 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setLayerVisible", &setLayerVisible);
     function("resetView", &reset_view);
     function("setShowInfill", &setShowInfill);
+    function("setMergeMode", &setMergeMode);
     function("setMeasureMode", &setMeasureMode);
     function("clearMeasurement", &clearMeasurement);
 }

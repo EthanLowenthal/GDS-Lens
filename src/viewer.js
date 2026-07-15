@@ -97,12 +97,17 @@ const actions = {
     loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
     resetView: () => modulePromise.then((Module) => Module.resetView()),
     showInfill: true,
+    mergeOverlaps: false,
     measure: false
 };
 const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 gui.add(actions, "resetView").name("Reset View");
 gui.add(actions, "showInfill").name("Infill")
     .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
+// Draw each layer as the union of its polygons (boundary + fill only, no
+// internal edges) -- a pure render-mode toggle, no re-parse involved.
+gui.add(actions, "mergeOverlaps").name("Merge Overlaps")
+    .onChange((on) => modulePromise.then((Module) => Module.setMergeMode(on)));
 const measureController = gui.add(actions, "measure").name("Measure (M)")
     .onChange((on) => modulePromise.then((Module) => Module.setMeasureMode(on)));
 
