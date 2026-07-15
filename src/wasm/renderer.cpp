@@ -145,13 +145,29 @@ const char* kCompositeVertexShaderSrc =
     "}";
 
 // Merge mode's composite pass: reads the layer's coverage mask and paints the
-// union boundary (any covered texel with an uncovered 8-neighbor) in the
-// layer's frame color, and the interior with the same screen-space hatch
-// patterns the normal fill path uses (duplicated from kFragmentShaderSrc,
-// with fwidth() replaced by exact analytic derivatives -- the pattern coords
-// are linear in gl_FragCoord, and derivatives after a discard are undefined).
-// Uncovered texels discard, so normal alpha blending stacks merged layers the
-// same way unmerged ones stack.
+// union boundary in the layer's frame color and the interior with the same
+// screen-space hatch patterns the normal fill path uses (duplicated from
+// kFragmentShaderSrc, with fwidth() replaced by exact analytic derivatives --
+// the pattern coords are linear in gl_FragCoord, and derivatives after a
+// discard are undefined).
+//
+// Anti-aliasing comes from two things working together. First, supersampling:
+// the mask is u_maskScale (normally 2) times the canvas resolution, so edges
+// land between canvas pixels with sub-pixel precision. (Deliberately not MSAA
+// -- a multisampled R8 renderbuffer + resolve blit rendered blank on at least
+// one real driver; this path only uses the plain texture FBO machinery that
+// single-sample mode already proved.) Second, bilinear reconstruction: the
+// mask texture is LINEAR-filtered and every read is a texture() tap, so
+// coverage varies continuously as the true edge moves -- a texelFetch/min
+// over raw binary texels would snap the border back to hard steps no matter
+// the supersample factor, which is exactly what the first version of this
+// shader got wrong. The border weight ramps with the lowest tap in a 1-canvas-
+// pixel ring, frame color composites over fill by that weight, and the final
+// alpha scales by the pixel's own coverage so the outer silhouette fades
+// smoothly. Uncovered pixels discard, so normal alpha blending stacks merged
+// layers the same way unmerged ones stack. CLAMP_TO_EDGE on the sampler keeps
+// geometry running past the viewport from growing a false outline at the
+// screen border.
 const char* kCompositeFragmentShaderSrc =
     "#version 300 es\n"
     "precision highp float;\n"
@@ -163,14 +179,8 @@ const char* kCompositeFragmentShaderSrc =
     "uniform float u_hatchSpacing;\n"
     "uniform float u_hatchWidth;\n"
     "uniform float u_showFill;\n"
+    "uniform int u_maskScale;\n"
     "out vec4 fragColor;\n"
-    // Clamped mask fetch: off-screen neighbors read as their nearest on-screen
-    // texel, so geometry running past the viewport edge doesn't grow a false
-    // outline along the screen border.
-    "float maskAt(ivec2 p) {\n"
-    "    ivec2 size = textureSize(u_mask, 0);\n"
-    "    return texelFetch(u_mask, clamp(p, ivec2(0), size - 1), 0).r;\n"
-    "}\n"
     "float lineMask(float coord, float spacing, float halfWidth, float deriv) {\n"
     "    float t = mod(coord, spacing);\n"
     "    float d = min(t, spacing - t);\n"
@@ -178,47 +188,64 @@ const char* kCompositeFragmentShaderSrc =
     "    return 1.0 - smoothstep(halfWidth - aa, halfWidth + aa, d);\n"
     "}\n"
     "void main() {\n"
-    "    ivec2 pix = ivec2(gl_FragCoord.xy);\n"
-    "    if (maskAt(pix) < 0.5) discard;\n"
-    "    float outside = 0.0;\n"
+    // uv of this canvas pixel's center in the (canvas * scale)-sized mask;
+    // pixelUv is one canvas pixel expressed in uv units.
+    "    vec2 texSize = vec2(textureSize(u_mask, 0));\n"
+    "    vec2 pixelUv = float(u_maskScale) / texSize;\n"
+    "    vec2 uv = gl_FragCoord.xy * pixelUv;\n"
+    // Bilinear center tap: at scale 2 the pixel center sits exactly between
+    // its 2x2 mask block, so this single tap IS the block average -- the
+    // pixel's fractional coverage.
+    "    float coverage = texture(u_mask, uv).r;\n"
+    "    if (coverage <= 0.0) discard;\n"
+    // Border weight: lowest bilinear tap in a 1-canvas-pixel ring. Every tap
+    // is itself an interpolated (continuous) value, so the ramp moves
+    // smoothly with the true edge instead of snapping at texel boundaries.
+    // 1.4 sharpens it so the outline reads as a line rather than a soft glow.
+    "    float inner = coverage;\n"
     "    for (int dy = -1; dy <= 1; dy++) {\n"
     "        for (int dx = -1; dx <= 1; dx++) {\n"
     "            if (dx == 0 && dy == 0) continue;\n"
-    "            outside = max(outside, 1.0 - maskAt(pix + ivec2(dx, dy)));\n"
+    "            inner = min(inner, texture(u_mask, uv + vec2(dx, dy) * pixelUv).r);\n"
     "        }\n"
     "    }\n"
-    "    if (outside > 0.5) {\n"
-    "        fragColor = u_frameColor;\n"
-    "        return;\n"
+    "    float border = min(1.0, (1.0 - inner) * 1.4);\n"
+    "    float fillAlpha = 0.0;\n"
+    "    if (u_showFill > 0.5) {\n"
+    "        float c = cos(u_hatchAngle);\n"
+    "        float s2 = sin(u_hatchAngle);\n"
+    "        vec2 p = gl_FragCoord.xy;\n"
+    "        float u = p.x * c + p.y * s2;\n"
+    "        float v = -p.x * s2 + p.y * c;\n"
+    // d(u)/d(pixel) is exactly (|c|, |s2|); fwidth would sum those, so pass
+    // |c|+|s2| (same for v by symmetry) and 1.0 for the axis-aligned grid.
+    "        float duv = abs(c) + abs(s2);\n"
+    "        int patternType = int(u_patternType + 0.5);\n"
+    "        float mask;\n"
+    "        if (patternType == 0) {\n"
+    "            mask = lineMask(u, u_hatchSpacing, u_hatchWidth, duv);\n"
+    "        } else if (patternType == 1) {\n"
+    "            mask = max(lineMask(u, u_hatchSpacing, u_hatchWidth, duv), lineMask(v, u_hatchSpacing, u_hatchWidth, duv));\n"
+    "        } else if (patternType == 2) {\n"
+    "            float du = mod(u, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
+    "            float dv = mod(v, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
+    "            float dist = length(vec2(du, dv));\n"
+    "            float aa = 1.0 + 0.001;\n"  // fwidth(dist) <= sqrt(2); 1.0 is close enough
+    "            float dotRadius = u_hatchWidth * 1.7;\n"
+    "            mask = 1.0 - smoothstep(dotRadius - aa, dotRadius + aa, dist);\n"
+    "        } else {\n"
+    "            mask = max(lineMask(p.x, u_hatchSpacing, u_hatchWidth, 1.0), lineMask(p.y, u_hatchSpacing, u_hatchWidth, 1.0));\n"
+    "        }\n"
+    "        fillAlpha = min(u_fillColor.a * 1.4, 0.7) * mask;\n"
     "    }\n"
-    "    if (u_showFill < 0.5) discard;\n"
-    "    float c = cos(u_hatchAngle);\n"
-    "    float s = sin(u_hatchAngle);\n"
-    "    vec2 p = gl_FragCoord.xy;\n"
-    "    float u = p.x * c + p.y * s;\n"
-    "    float v = -p.x * s + p.y * c;\n"
-    // d(u)/d(pixel) is exactly (|c|, |s|); fwidth would sum those, so pass
-    // |c|+|s| (same for v by symmetry) and 1.0 for the axis-aligned grid.
-    "    float duv = abs(c) + abs(s);\n"
-    "    int patternType = int(u_patternType + 0.5);\n"
-    "    float mask;\n"
-    "    if (patternType == 0) {\n"
-    "        mask = lineMask(u, u_hatchSpacing, u_hatchWidth, duv);\n"
-    "    } else if (patternType == 1) {\n"
-    "        mask = max(lineMask(u, u_hatchSpacing, u_hatchWidth, duv), lineMask(v, u_hatchSpacing, u_hatchWidth, duv));\n"
-    "    } else if (patternType == 2) {\n"
-    "        float du = mod(u, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
-    "        float dv = mod(v, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
-    "        float dist = length(vec2(du, dv));\n"
-    "        float aa = 1.0 + 0.001;\n"  // fwidth(dist) <= sqrt(2); 1.0 is close enough
-    "        float dotRadius = u_hatchWidth * 1.7;\n"
-    "        mask = 1.0 - smoothstep(dotRadius - aa, dotRadius + aa, dist);\n"
-    "    } else {\n"
-    "        mask = max(lineMask(p.x, u_hatchSpacing, u_hatchWidth, 1.0), lineMask(p.y, u_hatchSpacing, u_hatchWidth, 1.0));\n"
-    "    }\n"
-    "    float alpha = min(u_fillColor.a * 1.4, 0.7) * mask;\n"
-    "    if (alpha <= 0.0) discard;\n"
-    "    fragColor = vec4(u_fillColor.rgb, alpha);\n"
+    // Frame-over-fill compositing by border weight, then the whole result
+    // fades by the pixel's own coverage at the outer silhouette.
+    "    float frameAlpha = u_frameColor.a * border;\n"
+    "    float outAlpha = frameAlpha + fillAlpha * (1.0 - frameAlpha);\n"
+    "    float finalAlpha = outAlpha * coverage;\n"
+    "    if (finalAlpha < 0.002) discard;\n"
+    "    vec3 rgb = (u_frameColor.rgb * frameAlpha + u_fillColor.rgb * fillAlpha * (1.0 - frameAlpha)) / max(outAlpha, 0.0001);\n"
+    "    fragColor = vec4(rgb, finalAlpha);\n"
     "}";
 
 struct PolygonRange {
@@ -361,8 +388,14 @@ GLint g_comp_loc_hatch_angle = -1;
 GLint g_comp_loc_hatch_spacing = -1;
 GLint g_comp_loc_hatch_width = -1;
 GLint g_comp_loc_show_fill = -1;
+GLint g_comp_loc_mask_scale = -1;
 GLuint g_mask_fbo = 0;
 GLuint g_mask_tex = 0;
+// Supersampling factor for the coverage mask (mask texture = canvas size *
+// this) -- merge mode's anti-aliasing (see kCompositeFragmentShaderSrc).
+// Recomputed per resize: drops to 1 if 2x the canvas would exceed
+// GL_MAX_TEXTURE_SIZE (AA off, but never blank).
+int g_mask_scale = 2;
 
 // Constant pixel pitch for every layer's pattern -- only the angle and
 // pattern kind vary per layer (see pattern_for_layer) so stacked layers
@@ -527,16 +560,20 @@ bool init_gl() {
     g_comp_loc_hatch_spacing = glGetUniformLocation(g_comp_program, "u_hatchSpacing");
     g_comp_loc_hatch_width = glGetUniformLocation(g_comp_program, "u_hatchWidth");
     g_comp_loc_show_fill = glGetUniformLocation(g_comp_program, "u_showFill");
+    g_comp_loc_mask_scale = glGetUniformLocation(g_comp_program, "u_maskScale");
     glUseProgram(g_comp_program);
     glUniform1i(glGetUniformLocation(g_comp_program, "u_mask"), 0);
 
     // The mask texture's storage is (re)allocated at the canvas size in
     // resize_canvas; only the texture object and its FBO attachment are
     // created here.
+    // LINEAR, not NEAREST: the composite pass reads the mask with bilinear
+    // taps so coverage varies continuously as the true edge moves sub-texel
+    // -- the anti-aliasing depends on it (see kCompositeFragmentShaderSrc).
     glGenTextures(1, &g_mask_tex);
     glBindTexture(GL_TEXTURE_2D, g_mask_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenFramebuffers(1, &g_mask_fbo);
@@ -954,8 +991,13 @@ void draw_layer_merged(const LayerBuffer& layer) {
     }
     if (!has_fill) return;
 
-    // Pass 1: coverage mask.
+    // Pass 1: coverage mask, rasterized at g_mask_scale times the canvas
+    // resolution for anti-aliasing (see kCompositeFragmentShaderSrc). Only
+    // the viewport changes -- the camera uniforms produce clip-space
+    // coordinates, which are viewport-independent, so the same values place
+    // every vertex at exactly scale x its canvas pixel position.
     glBindFramebuffer(GL_FRAMEBUFFER, g_mask_fbo);
+    glViewport(0, 0, g_canvas_width * g_mask_scale, g_canvas_height * g_mask_scale);
     glDisable(GL_BLEND);
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -980,10 +1022,12 @@ void draw_layer_merged(const LayerBuffer& layer) {
         disable_instance_attribs();
     }
 
-    // Pass 2: composite boundary + fill onto the canvas.
+    // Pass 2: composite boundary + fill onto the canvas, back at 1:1.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g_canvas_width, g_canvas_height);
     glEnable(GL_BLEND);
     glUseProgram(g_comp_program);
+    glUniform1i(g_comp_loc_mask_scale, g_mask_scale);
     glUniform4fv(g_comp_loc_fill_color, 1, layer.fill_color.data());
     glUniform4fv(g_comp_loc_frame_color, 1, layer.frame_color.data());
     glUniform1f(g_comp_loc_pattern_type, layer.pattern_type);
@@ -1135,11 +1179,30 @@ void resize_canvas() {
 
     glViewport(0, 0, width, height);
 
-    // Keep merge mode's coverage mask the same size as the canvas -- the
-    // composite pass addresses it 1:1 by gl_FragCoord.
+    // Keep merge mode's coverage mask at canvas size * g_mask_scale -- the
+    // composite pass addresses a scale x scale block per canvas pixel (the
+    // supersampling that anti-aliases merge mode).
     if (g_mask_tex) {
+        GLint max_tex = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+        g_mask_scale = (2 * width <= max_tex && 2 * height <= max_tex) ? 2 : 1;
         glBindTexture(GL_TEXTURE_2D, g_mask_tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width * g_mask_scale, height * g_mask_scale, 0, GL_RED,
+                     GL_UNSIGNED_BYTE, nullptr);
+        // Merge mode failing at the FBO level shows as a blank canvas with no
+        // other symptom (the mask reads all-zero and the composite discards
+        // everything) -- check loudly here instead. Never triggered on a
+        // conformant WebGL2 impl; exists because an earlier MSAA-based mask
+        // did exactly that silently.
+        glBindFramebuffer(GL_FRAMEBUFFER, g_mask_fbo);
+        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        GLenum err = glGetError();
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        if (status != GL_FRAMEBUFFER_COMPLETE || err != GL_NO_ERROR) {
+            EM_ASM({ console.warn('[GDS] merge-mode mask FBO incomplete: status 0x' + $0.toString(16) +
+                                  ', glGetError 0x' + $1.toString(16)); },
+                   (int)status, (int)err);
+        }
     }
     clamp_pan();
     update_scale_bar();
