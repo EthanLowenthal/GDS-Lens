@@ -1,10 +1,26 @@
 # Change Log
 
-## [Unreleased]
+## [1.1.0] - 2026-07-15
 
-- Measure tool: toggle from the panel (or press `M`), then click two points
-  to measure the distance between them (total, Δx, Δy). `Escape` clears the
-  current measurement.
+- Measure tool: toggle from the panel, then click two points to measure the
+  distance between them (total, Δx, Δy). Clicking again starts a fresh
+  measurement.
+- Merge Overlaps mode: draws each layer as the antialiased union of its
+  polygons (fill + outer boundary only, no internal edges).
+- Infill is now hidden by default.
+- Layer list: names are no longer cut off after the layer number — labels
+  stay on one line, truncate with an ellipsis, and show in full on hover.
+- KLayout `.lyp` handling:
+  - Entries without usable colors are kept (their names and visibility
+    apply; colors fall back to the defaults) instead of being dropped.
+  - A group's `<visible>` flag now cascades to the layers inside it,
+    matching KLayout.
+  - `<fill-brightness>`/`<frame-brightness>` are applied to the colors.
+  - More robust XML parsing: tag attributes, character entities, comments,
+    and self-closing tags are handled.
+  - Multi-tab files load the first tab; entries bound to other layouts
+    (`@2` and up) are skipped instead of misapplied.
+- Debug overlay shows frame time / fps.
 
 ## [1.0.0]
 
