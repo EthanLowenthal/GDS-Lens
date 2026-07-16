@@ -2,6 +2,10 @@
 
 ## [UNRELEASED]
 
+- Control panel migrated from dat.gui (unmaintained) to lil-gui. Same layout
+  and behavior; the panel now has a "Controls" title bar at the top instead
+  of a "Close Controls" footer.
+
 - Marker database support: load DRC/LVS violation markers on top of the
   layout via the new "Load Marker File" panel button. One button, format
   auto-detected by content:

@@ -3,12 +3,12 @@
 // lives in wasm/renderer.cpp (GL context + shaders + camera + input) and
 // wasm/bindings.cpp (gdstk parsing), which attach directly to #glCanvas and
 // the DOM themselves. The control surface (load .lyp button + per-layer
-// visibility toggles) is built with dat.gui (vendor/dat.gui.min.js).
+// visibility toggles) is built with lil-gui (vendor/lil-gui.umd.min.js).
 //
 // Loading a GDS file is split across a Worker (see wasm-worker.js) and this
 // main-thread module: the Worker instantiates its own copy of the same wasm
 // module and runs parseGdsToLayers() (parse + flatten + triangulate, no
-// GL/DOM) so the canvas/dat.gui panel stay responsive on very large files,
+// GL/DOM) so the canvas/lil-gui panel stay responsive on very large files,
 // reporting progress via 'gdsProgress' messages along the way. Once it posts
 // back the flattened geometry, this thread's Module.uploadLayers() does the
 // (fast, GPU-bound) VBO upload -- the only part that needs the GL context.
@@ -88,9 +88,9 @@ window.addEventListener("unhandledrejection", (event) => {
 });
 
 const vscode = acquireVsCodeApi();
-console.log("[GDS] acquireVsCodeApi() OK, typeof createGdstkModule:", typeof createGdstkModule, "typeof dat:", typeof dat, "typeof Worker:", typeof Worker, "typeof Blob:", typeof Blob);
+console.log("[GDS] acquireVsCodeApi() OK, typeof createGdstkModule:", typeof createGdstkModule, "typeof lil:", typeof lil, "typeof Worker:", typeof Worker, "typeof Blob:", typeof Blob);
 
-const gui = new dat.GUI({ width: 260 });
+const gui = new lil.GUI({ width: 260 });
 const actions = {
     // Clicking the row always opens the file dialog (load, or replace the
     // current file); the injected ✕ (see setFileChip) handles unloading.
@@ -113,35 +113,37 @@ gui.add(actions, "mergeOverlaps").name("Merge Overlaps")
 const measureController = gui.add(actions, "measure").name("Measure")
     .onChange((on) => modulePromise.then((Module) => Module.setMeasureMode(on)));
 
-// Reflects a loaded-file state in a dat.gui button row (used by both the
+// Reflects a loaded-file state in a lil-gui button row (used by both the
 // .lyp and marker-file rows). With no file it's a plain load button. Once a
 // file is loaded it shows the filename with an ✕ on the right that unloads
 // it via onUnload. Clicking the filename itself re-opens the dialog to swap
 // in a different file. (The .lyp-* CSS classes are shared by both rows.)
 function setFileChip(controller, name, { idleLabel, idleTitle, unloadTitle, onUnload }) {
     // Remove any ✕ from a previous loaded state before re-deciding.
-    const existingX = controller.__li.querySelector(".lyp-unload");
+    const existingX = controller.domElement.querySelector(".lyp-unload");
     if (existingX) existingX.remove();
-    controller.__li.classList.toggle("lyp-loaded", !!name);
+    controller.domElement.classList.toggle("lyp-loaded", !!name);
 
     if (!name) {
         controller.name(idleLabel);
-        controller.__li.title = idleTitle;
+        controller.domElement.title = idleTitle;
         return;
     }
 
     controller.name(name);
-    controller.__li.title = `${name} — click to replace, ✕ to unload`;
+    controller.domElement.title = `${name} — click to replace, ✕ to unload`;
     const x = document.createElement("span");
     x.className = "lyp-unload";
     x.textContent = "✕";
     x.title = unloadTitle;
     x.addEventListener("click", (event) => {
-        // Don't let the click also trigger the row's load-dialog handler.
+        // The ✕ overlays the row's full-width <button> but isn't inside it,
+        // so a click here never reaches the load-dialog handler; stopping
+        // propagation just makes that explicit.
         event.stopPropagation();
         onUnload();
     });
-    controller.__li.appendChild(x);
+    controller.domElement.appendChild(x);
 }
 
 function setLypChip(name) {
@@ -180,8 +182,8 @@ setMarkerChip(null);
 
 let layersFolder = null;
 
-// Tints a dat.gui row/folder's 4px left border with a layer's frame color --
-// dat.gui has no built-in color swatch for booleans, so the border is the cue.
+// Tints a lil-gui row/folder's 4px left border with a layer's frame color --
+// lil-gui has no built-in color swatch for booleans, so the border is the cue.
 function tintBorder(el, color) {
     if (el) el.style.borderLeft = `4px solid ${color}`;
 }
@@ -200,8 +202,8 @@ function addLayerRow(parent, item, onSync) {
             modulePromise.then((Module) => Module.setLayerVisible(item.layer, item.datatype, visible));
             if (onSync) onSync();
         });
-    tintBorder(controller.__li, item.frameColor);
-    controller.__li.title = label;
+    tintBorder(controller.domElement, item.frameColor);
+    controller.domElement.title = label;
     return { controller, state };
 }
 
@@ -217,9 +219,12 @@ function addLayerRow(parent, item, onSync) {
 // visibility.
 function renderLayerList(layers) {
     if (layersFolder) {
-        gui.removeFolder(layersFolder);
+        layersFolder.destroy();
     }
+    // lil-gui folders open by default (dat.gui's were closed) -- keep the
+    // panel compact until the user asks for the layer list.
     layersFolder = gui.addFolder("Layers");
+    layersFolder.close();
 
     // Group by category, preserving getLayers()'s ordering (lyp order first).
     // Ungrouped layers collect under a single trailing "Other layers" bucket.
@@ -234,8 +239,9 @@ function renderLayerList(layers) {
     for (const [category, items] of categories) {
         const folder = layersFolder.addFolder(`${category}  (${items.length})`);
         folder.close();
-        // The <li.folder> wrapping this folder's <ul> carries a 4px border too.
-        tintBorder(folder.domElement.parentElement, items[0].frameColor);
+        // The folder's own <div.lil-gui> (title + children) carries a 4px
+        // border too.
+        tintBorder(folder.domElement, items[0].frameColor);
 
         const children = [];
         const syncCategory = () => {
@@ -257,7 +263,7 @@ function renderLayerList(layers) {
                     }
                 });
             });
-        allController.__li.title = `Toggle all ${items.length} layers in ${category}`;
+        allController.domElement.title = `Toggle all ${items.length} layers in ${category}`;
 
         for (const item of items) {
             const row = addLayerRow(folder, item, syncCategory);
@@ -274,8 +280,8 @@ function renderLayerList(layers) {
 let currentMarkers = null;
 let markersFolder = null;
 let selectedMarkerId = -1;
-let selectedMarkerRow = null; // the selected item's dat.gui <li>, if it has a row
-const markerItemRows = new Map(); // item id -> <li> (only the uncapped rows)
+let selectedMarkerRow = null; // the selected item's lil-gui row <div>, if it has one
+const markerItemRows = new Map(); // item id -> row <div> (only the uncapped rows)
 
 // Browser-wide controls, kept outside the model so they survive re-renders
 // and marker-file swaps within a session. opacity scales the whole overlay's
@@ -283,7 +289,7 @@ const markerItemRows = new Map(); // item id -> <li> (only the uncapped rows)
 // the panel (they draw nothing anyway).
 const markerUiState = { opacity: 1.0, hideEmpty: false };
 
-// dat.gui DOM does not survive 100k rows -- cap the rows per category and
+// The GUI's DOM does not survive 100k rows -- cap the rows per category and
 // close with a disabled "… N more" row. Category visibility still covers
 // capped-off items (it lives in wasm per-category), and [ / ] key stepping
 // reaches them too.
@@ -291,7 +297,7 @@ const MAX_MARKER_ROWS_PER_CATEGORY = 200;
 
 function removeMarkerBrowser() {
     if (markersFolder) {
-        gui.removeFolder(markersFolder);
+        markersFolder.destroy();
         markersFolder = null;
     }
     markerItemRows.clear();
@@ -333,24 +339,24 @@ function renderMarkerBrowser(model) {
         console.error("[GDS] marker warnings:", model.warnings.join(" | "));
         const row = markersFolder.add({ w: () => {} }, "w")
             .name(`⚠ ${model.warnings.length} warning${model.warnings.length === 1 ? "" : "s"}`);
-        row.__li.title = model.warnings.join("\n");
+        row.domElement.title = model.warnings.join("\n");
     }
 
     const opacityController = markersFolder.add(markerUiState, "opacity", 0, 1, 0.05).name("Opacity")
         .onChange((value) => modulePromise.then((Module) => Module.setMarkerOpacity(value)));
-    opacityController.__li.title = "Opacity of the whole marker overlay";
+    opacityController.domElement.title = "Opacity of the whole marker overlay";
 
     const emptyCount = model.categories.filter((c) => c.items.length === 0).length;
     const hideEmptyController = markersFolder.add(markerUiState, "hideEmpty").name("Hide empty categories")
         .onChange(() => renderMarkerBrowser(model));
-    hideEmptyController.__li.title =
+    hideEmptyController.domElement.title =
         `Hide categories with 0 violations (currently ${emptyCount} of ${model.categories.length})`;
 
     model.categories.forEach((cat, categoryIndex) => {
         if (markerUiState.hideEmpty && cat.items.length === 0) return;
         const folder = markersFolder.addFolder(`${cat.name}  (${cat.items.length})`);
         folder.close();
-        if (cat.description) folder.domElement.parentElement.title = cat.description;
+        if (cat.description) folder.domElement.title = cat.description;
 
         // uiVisible (consulted by stepMarker so [ / ] skips hidden categories)
         // survives re-renders -- wasm keeps the real per-category visibility,
@@ -364,7 +370,7 @@ function renderMarkerBrowser(model) {
                 cat.uiVisible = visible;
                 modulePromise.then((Module) => Module.setMarkerCategoryVisible(categoryIndex, visible));
             });
-        visController.__li.title = `Show/hide all ${cat.items.length} markers in ${cat.name}`;
+        visController.domElement.title = `Show/hide all ${cat.items.length} markers in ${cat.name}`;
 
         for (const item of cat.items.slice(0, MAX_MARKER_ROWS_PER_CATEGORY)) {
             const label = item.bbox
@@ -372,13 +378,13 @@ function renderMarkerBrowser(model) {
                 : `#${item.label}`;
             const controller = folder.add({ go: () => modulePromise.then((Module) => selectMarker(Module, item)) }, "go")
                 .name(label);
-            controller.__li.title = [item.note, cat.description].filter(Boolean).join("\n") || label;
-            markerItemRows.set(item.id, controller.__li);
+            controller.domElement.title = [item.note, cat.description].filter(Boolean).join("\n") || label;
+            markerItemRows.set(item.id, controller.domElement);
         }
         if (cat.items.length > MAX_MARKER_ROWS_PER_CATEGORY) {
             const more = folder.add({ m: () => {} }, "m")
                 .name(`… ${cat.items.length - MAX_MARKER_ROWS_PER_CATEGORY} more (press [ or ] to step)`);
-            more.__li.classList.add("marker-more-row");
+            more.domElement.classList.add("marker-more-row");
         }
     });
 
@@ -408,13 +414,20 @@ function stepMarker(direction) {
     modulePromise.then((Module) => selectMarker(Module, items[idx]));
 }
 
+// Capture phase, because every lil-gui controller stopPropagation()s keydown
+// in the bubble phase -- a plain window listener would never hear [ / ]
+// while focus sits anywhere inside the panel, which is the normal state
+// after clicking any row (boolean rows are <label>s that focus their
+// checkbox; marker rows are <button>s that keep focus).
 window.addEventListener("keydown", (event) => {
-    // Don't hijack typing in dat.gui's text inputs.
-    const tag = event.target && event.target.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    // Don't hijack typing in lil-gui's text/number inputs -- but focused
+    // checkboxes and buttons must not block marker stepping.
+    const t = event.target;
+    const tag = t && t.tagName;
+    if (tag === "TEXTAREA" || (tag === "INPUT" && t.type !== "checkbox")) return;
     if (event.key === "[") stepMarker(-1);
     else if (event.key === "]") stepMarker(1);
-});
+}, true);
 
 const loadingOverlay = document.getElementById("loadingOverlay");
 const loadingBarFill = document.getElementById("loadingBarFill");
@@ -501,7 +514,7 @@ window.addEventListener("message", (event) => {
                 currentMarkers = null;
                 Module.clearMarkers();
                 setMarkerChip(message.name || null);
-                markerController.__li.title = `Failed to parse ${message.name}: ${err.message || err}`;
+                markerController.domElement.title = `Failed to parse ${message.name}: ${err.message || err}`;
                 return;
             }
             currentMarkers = model;

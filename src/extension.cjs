@@ -114,14 +114,14 @@ class GdsEditorProvider {
             const jsPath = path.join(this.context.extensionPath, 'src', 'viewer.js');
             const markerParsersJsPath = path.join(this.context.extensionPath, 'src', 'marker-parsers.js');
             const wasmJsPath = path.join(this.context.extensionPath, 'src', 'wasm', 'build', 'gdstk_wasm.js');
-            const datGuiJsPath = path.join(this.context.extensionPath, 'src', 'vendor', 'dat.gui.min.js');
+            const lilGuiJsPath = path.join(this.context.extensionPath, 'src', 'vendor', 'lil-gui.umd.min.js');
             const workerJsPath = path.join(this.context.extensionPath, 'src', 'wasm-worker.js');
 
             // 3. Convert the native viewer.js/wasm file paths into authenticated Webview URIs
             const jsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(jsPath));
             const markerParsersJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(markerParsersJsPath));
             const wasmJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(wasmJsPath));
-            const datGuiJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(datGuiJsPath));
+            const lilGuiJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(lilGuiJsPath));
 
             // The Worker (see viewer.js) needs gdstk_wasm.js's and
             // wasm-worker.js's full text to build its own Blob script from --
@@ -148,7 +148,7 @@ class GdsEditorProvider {
             // 4. Load the base HTML text and dynamically swap out the standard script references
             let htmlContent = fs.readFileSync(htmlPath, 'utf8');
             htmlContent = htmlContent.replace('src="wasm/build/gdstk_wasm.js"', 'src="' + wasmJsWebviewUri.toString() + '"');
-            htmlContent = htmlContent.replace('src="vendor/dat.gui.min.js"', 'src="' + datGuiJsWebviewUri.toString() + '"');
+            htmlContent = htmlContent.replace('src="vendor/lil-gui.umd.min.js"', 'src="' + lilGuiJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="marker-parsers.js"', 'src="' + markerParsersJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="viewer.js"', 'src="' + jsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('{{cspSource}}', webviewPanel.webview.cspSource);
