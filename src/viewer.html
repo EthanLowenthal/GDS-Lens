@@ -20,25 +20,28 @@
            it just above the line so it doesn't cover what's being measured. */
         #measureLabel { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: #ffffff; background: rgba(0,0,0,0.75); border: 1px solid #555; border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
         #measureLabel.hidden { display: none; }
-        .dg.ac { z-index: 20 !important; }
-        /* Checkbox rows (layer list + top-level toggles): dat.gui defaults
-           give the label only 40% of the row and let it word-wrap into the
-           hidden overflow, so "250/74 – SIN_WG_S" showed as "250/74 –" with
-           the whole name gone. nowrap makes the cut character-level with an
-           ellipsis, and the checkbox needs nowhere near 60% of the row. */
-        .dg .cr.boolean .property-name { width: 78%; white-space: nowrap; }
-        .dg .cr.boolean .c { width: 22%; }
+        /* lil-gui's autoPlace default (1001) would float the panel above the
+           loading overlay (z 30) and debug panel (z 40) -- keep it below both. */
+        .lil-gui.autoPlace { z-index: 20 !important; }
+        /* Checkbox rows (layer list + top-level toggles): lil-gui gives the
+           label a 45% min-width and no overflow handling, so a long name like
+           "250/74 – SIN_WG_S" would push into the checkbox column. Widen the
+           label (the checkbox needs nowhere near half the row) and cut it
+           character-level with an ellipsis. */
+        .lil-gui .lil-controller.lil-boolean > .lil-name { min-width: 78%; width: 78%; overflow: hidden; text-overflow: ellipsis; }
         /* Loaded-.lyp chip: the row shows the filename with an ✕ on the right
            (injected by setLypChip in viewer.js) to unload it. */
-        .dg li.lyp-loaded { position: relative; }
-        .dg li.lyp-loaded .property-name { padding-right: 22px; }
-        .dg li.lyp-loaded .lyp-unload { position: absolute; right: 8px; top: 0; height: 27px; line-height: 27px; color: #ff9a9a; cursor: pointer; font-size: 12px; z-index: 5; }
-        .dg li.lyp-loaded .lyp-unload:hover { color: #ff4d4d; }
+        .lil-gui .lil-controller.lyp-loaded { position: relative; }
+        .lil-gui .lil-controller.lyp-loaded .lil-name { padding-right: 22px; }
+        .lil-gui .lil-controller.lyp-loaded .lyp-unload { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: #ff9a9a; cursor: pointer; font-size: 12px; z-index: 5; }
+        .lil-gui .lil-controller.lyp-loaded .lyp-unload:hover { color: #ff4d4d; }
         /* Marker browser (see renderMarkerBrowser in viewer.js): the selected
-           violation's row, and the disabled "… N more" overflow row. */
-        .dg li.marker-selected { background: #5a1f1f !important; }
-        .dg li.marker-selected .property-name { color: #ffd9d9; }
-        .dg li.marker-more-row { opacity: 0.55; pointer-events: none; }
+           violation's row, and the disabled "… N more" overflow row. The row
+           is a full-width <button> in lil-gui, so tint the button itself
+           (!important also beats lil-gui's :hover/:active backgrounds). */
+        .lil-gui .lil-controller.marker-selected button { background: #5a1f1f !important; }
+        .lil-gui .lil-controller.marker-selected .lil-name { color: #ffd9d9; }
+        .lil-gui .lil-controller.marker-more-row { opacity: 0.55; pointer-events: none; }
         #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: #d0d0d0; background: #0c0c0d; z-index: 30; }
         #loadingOverlay.hidden { display: none; }
         #loadingBarTrack { width: 320px; height: 8px; background: #2a2a2c; border-radius: 4px; overflow: hidden; }
@@ -91,7 +94,7 @@
 
     <!-- Webview Local Script Injection Pipeline -->
     <script src="wasm/build/gdstk_wasm.js"></script>
-    <script src="vendor/dat.gui.min.js"></script>
+    <script src="vendor/lil-gui.umd.min.js"></script>
     <script src="marker-parsers.js"></script>
     <script src="viewer.js"></script>
 </body>
