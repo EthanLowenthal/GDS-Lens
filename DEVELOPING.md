@@ -6,16 +6,22 @@ see [`README.md`](README.md).
 ## Project layout
 
 - `src/extension.cjs` — the extension host (Node). Opens the `.gds` file,
-  streams its raw bytes into the webview, and relays the `.lyp` file picker.
+  streams its raw bytes into the webview, and relays the `.lyp` and marker
+  file pickers.
 - `src/viewer.html` / `src/viewer.js` — the webview: bootstraps the wasm
   module and wires up `postMessage` from the extension host.
+- `src/marker-parsers.js` — standalone parsers for DRC/LVS marker databases
+  (KLayout `.lyrdb`, Calibre DRC ASCII); loaded in the webview via a
+  `<script>` tag and `require()`d directly by the unit tests.
 - `src/wasm/` — C++ source (`bindings.cpp`, `renderer.cpp`, `gds_common.hpp`)
   compiled with Emscripten into `src/wasm/build/gdstk_wasm.js`, which does
   GDS parsing and WebGL rendering. See `docs/rendering-rewrite.md` for the
   design history of this C++/WASM architecture.
 - `third_party/gdstk`, `third_party/qhull` — git submodules the wasm build
   links against.
-- `test/` — extension test suite.
+- `test/` — plain-Node tests (`npm test`): marker-parser unit tests plus a
+  headless smoke test that evals the built wasm bundle in Node (skipped when
+  `src/wasm/build/gdstk_wasm.js` hasn't been built).
 
 ## Building
 

@@ -10,6 +10,12 @@ const logger = vscode.window.createOutputChannel("GDSII Debugger");
 // edits to the .lyp are picked up on reopen, and so the stored state stays tiny.
 const LAST_LYP_PATH_KEY = 'GDS-Lens.lastLypPath';
 
+// workspaceState key holding a { gdsFsPath: markerFsPath } map. Unlike the
+// global .lyp path above, marker databases are remembered *per GDS file* --
+// DRC results are design-specific, so re-applying design A's markers to
+// design B would be noise.
+const MARKER_PATHS_KEY = 'GDS-Lens.markerPathByGds';
+
 function activate(context) {
     logger.show(true);
     logger.appendLine(">>> GDSII Extension Core Spinning Up (wasm parsing + rendering)...");
@@ -62,6 +68,31 @@ class GdsEditorProvider {
         }
     }
 
+    // Marker-database twin of postLyp: reads a .lyrdb / Calibre results file
+    // and pushes its text to one viewer (format sniffing happens in the
+    // webview -- see marker-parsers.js). Returns false if unreadable so
+    // callers can drop a stale remembered path.
+    postMarkers(webviewPanel, fsPath) {
+        try {
+            const text = fs.readFileSync(fsPath, 'utf8');
+            webviewPanel.webview.postMessage({
+                type: 'markersLoaded',
+                text: text,
+                name: path.basename(fsPath)
+            });
+            return true;
+        } catch (err) {
+            logger.appendLine('>>> Could not read marker file at ' + fsPath + ': ' + err.message);
+            return false;
+        }
+    }
+
+    async updateMarkerMap(mutate) {
+        const map = { ...(this.context.workspaceState.get(MARKER_PATHS_KEY) || {}) };
+        mutate(map);
+        await this.context.workspaceState.update(MARKER_PATHS_KEY, map);
+    }
+
     async openCustomDocument(uri, openContext, token) {
         return {
             uri: uri,
@@ -81,12 +112,14 @@ class GdsEditorProvider {
             // 2. Fetch the absolute disk file path vectors
             const htmlPath = path.join(this.context.extensionPath, 'src', 'viewer.html');
             const jsPath = path.join(this.context.extensionPath, 'src', 'viewer.js');
+            const markerParsersJsPath = path.join(this.context.extensionPath, 'src', 'marker-parsers.js');
             const wasmJsPath = path.join(this.context.extensionPath, 'src', 'wasm', 'build', 'gdstk_wasm.js');
             const datGuiJsPath = path.join(this.context.extensionPath, 'src', 'vendor', 'dat.gui.min.js');
             const workerJsPath = path.join(this.context.extensionPath, 'src', 'wasm-worker.js');
 
             // 3. Convert the native viewer.js/wasm file paths into authenticated Webview URIs
             const jsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(jsPath));
+            const markerParsersJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(markerParsersJsPath));
             const wasmJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(wasmJsPath));
             const datGuiJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(datGuiJsPath));
 
@@ -116,6 +149,7 @@ class GdsEditorProvider {
             let htmlContent = fs.readFileSync(htmlPath, 'utf8');
             htmlContent = htmlContent.replace('src="wasm/build/gdstk_wasm.js"', 'src="' + wasmJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="vendor/dat.gui.min.js"', 'src="' + datGuiJsWebviewUri.toString() + '"');
+            htmlContent = htmlContent.replace('src="marker-parsers.js"', 'src="' + markerParsersJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="viewer.js"', 'src="' + jsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('{{cspSource}}', webviewPanel.webview.cspSource);
             htmlContent = htmlContent.replace('{{workerBundleBase64}}', workerBundleBase64);
@@ -146,6 +180,26 @@ class GdsEditorProvider {
                 } else if (message.command === 'unloadLypFile') {
                     // Forget the remembered .lyp so it isn't re-applied next time.
                     await this.context.globalState.update(LAST_LYP_PATH_KEY, undefined);
+                } else if (message.command === 'loadMarkerFile') {
+                    const options = {
+                        canSelectMany: false,
+                        openLabel: 'Load Marker Database',
+                        // Content-sniffed in the webview, so the filter is loose:
+                        // Calibre ASCII results get named all sorts of things.
+                        filters: {
+                            'Marker databases': ['lyrdb', 'rdb', 'results', 'db', 'ascii', 'txt'],
+                            'All files': ['*']
+                        }
+                    };
+                    const fileUri = await vscode.window.showOpenDialog(options);
+                    if (fileUri && fileUri[0]) {
+                        const markerPath = fileUri[0].fsPath;
+                        // Remember per GDS file (see MARKER_PATHS_KEY).
+                        await this.updateMarkerMap((map) => { map[document.uri.fsPath] = markerPath; });
+                        this.postMarkers(webviewPanel, markerPath);
+                    }
+                } else if (message.command === 'unloadMarkerFile') {
+                    await this.updateMarkerMap((map) => { delete map[document.uri.fsPath]; });
                 }
             });
 
@@ -169,6 +223,15 @@ class GdsEditorProvider {
             const savedLypPath = this.context.globalState.get(LAST_LYP_PATH_KEY);
             if (savedLypPath && !this.postLyp(webviewPanel, savedLypPath)) {
                 await this.context.globalState.update(LAST_LYP_PATH_KEY, undefined);
+            }
+
+            // Re-apply this GDS file's remembered marker database, if any
+            // (per-GDS, unlike the .lyp above). Same ordering guarantee: the
+            // webview parses and holds the markers until geometry arrives.
+            const markerMap = this.context.workspaceState.get(MARKER_PATHS_KEY) || {};
+            const savedMarkerPath = markerMap[document.uri.fsPath];
+            if (savedMarkerPath && !this.postMarkers(webviewPanel, savedMarkerPath)) {
+                await this.updateMarkerMap((map) => { delete map[document.uri.fsPath]; });
             }
         } catch (err) {
             logger.appendLine('[FATAL CRASH ERROR] ' + err.stack);

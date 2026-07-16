@@ -1,5 +1,31 @@
 # Change Log
 
+## [UNRELEASED]
+
+- Marker database support: load DRC/LVS violation markers on top of the
+  layout via the new "Load Marker File" panel button. One button, format
+  auto-detected by content:
+  - KLayout report databases (`.lyrdb`) — boxes, polygons (including hole
+    rings), edges, and edge-pairs; nested categories; text/float-only values
+    shown in the item label.
+  - Calibre DRC ASCII results databases (any extension) — polygon and edge
+    clusters, with coordinates scaled by the header's precision.
+- Markers draw as a red highlight overlay above all layers (translucent fill,
+  outlines, and end ticks on edge markers so they're findable when zoomed
+  out), unaffected by layer visibility, infill, or merge mode.
+- Marker browser panel: one folder per category (rulecheck) with item counts,
+  a per-category visibility toggle, and clickable items that zoom the view to
+  the violation (selected marker is re-highlighted in white). `[` / `]` step
+  the selection through visible markers. Categories start hidden — turn on
+  the rulechecks you want drawn; the selected marker always draws, even from
+  a hidden category.
+- Marker overlay opacity slider, and a "Hide empty categories" toggle that
+  filters rulechecks with 0 violations out of the browser panel.
+- Non-top-cell / hierarchical results are detected and surfaced as a ⚠
+  warnings row (positions may be wrong) instead of failing the load.
+- The loaded marker file is remembered per GDS file and re-applied when that
+  file is reopened (unlike the `.lyp`, which is global).
+
 ## [1.1.0] - 2026-07-15
 
 - Measure tool: toggle from the panel, then click two points to measure the

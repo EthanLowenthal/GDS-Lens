@@ -34,6 +34,11 @@
         .dg li.lyp-loaded .property-name { padding-right: 22px; }
         .dg li.lyp-loaded .lyp-unload { position: absolute; right: 8px; top: 0; height: 27px; line-height: 27px; color: #ff9a9a; cursor: pointer; font-size: 12px; z-index: 5; }
         .dg li.lyp-loaded .lyp-unload:hover { color: #ff4d4d; }
+        /* Marker browser (see renderMarkerBrowser in viewer.js): the selected
+           violation's row, and the disabled "… N more" overflow row. */
+        .dg li.marker-selected { background: #5a1f1f !important; }
+        .dg li.marker-selected .property-name { color: #ffd9d9; }
+        .dg li.marker-more-row { opacity: 0.55; pointer-events: none; }
         #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: #d0d0d0; background: #0c0c0d; z-index: 30; }
         #loadingOverlay.hidden { display: none; }
         #loadingBarTrack { width: 320px; height: 8px; background: #2a2a2c; border-radius: 4px; overflow: hidden; }
@@ -87,6 +92,7 @@
     <!-- Webview Local Script Injection Pipeline -->
     <script src="wasm/build/gdstk_wasm.js"></script>
     <script src="vendor/dat.gui.min.js"></script>
+    <script src="marker-parsers.js"></script>
     <script src="viewer.js"></script>
 </body>
 </html>

@@ -2,7 +2,7 @@
   "name": "GDS-Lens",
   "displayName": "GDS Lens",
   "description": "View GDSII chip layouts directly in VS Code",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "icon": "images/logo.png",
   "engines": {
     "vscode": "^1.125.0"
@@ -10,7 +10,8 @@
   "main": "./src/extension.cjs",
   "publisher": "ethml",
   "scripts": {
-    "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build"
+    "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build",
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -18,6 +19,7 @@
     "@types/vscode": "^1.125.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
+    "@xmldom/xmldom": "^0.9.10",
     "eslint": "^10.5.0"
   },
   "repository": {
