@@ -475,6 +475,58 @@ bool g_show_infill = false;
 // geometry is untouched, so toggling never re-parses or re-uploads anything.
 bool g_merge_mode = false;
 
+// ---- DRC/LVS marker overlay -------------------------------------------------
+// Violation markers from a KLayout .lyrdb / Calibre DRC results database
+// (parsed and flattened in JS -- see src/marker-parsers.js), drawn as a fixed
+// red highlight after every layer, unaffected by layer visibility / infill /
+// merge modes. Geometry is retained CPU-side (unlike layers) because
+// visibility is per-category and selection changes need VBO rebuilds; marker
+// counts are small (10^2-10^5 vertices) so a full rebuild on toggle is cheap.
+// Rebuild is lazy: state changes set g_markers_dirty + request_redraw(), and
+// draw_markers() rebuilds before drawing. The CPU-side state lives outside
+// any g_gl_ready guard so headless Node runs can still exercise
+// setMarkers()/getMarkerStats() without a GL context.
+// Categories start hidden: a fresh marker load draws nothing until the user
+// turns on the rulechecks they care about (a full DRC deck lighting up all at
+// once is noise). viewer.js's checkboxes default to match.
+struct MarkerCategoryGL {
+    bool visible = false;
+};
+struct MarkerGeom {
+    std::vector<float> poly_verts;        // ring vertices, x,y pairs, rings back-to-back
+    std::vector<uint32_t> poly_counts;    // vertex count per ring
+    std::vector<uint32_t> poly_item_ids;  // owning item per ring
+    std::vector<float> edge_verts;        // packed segments, x0,y0,x1,y1 each
+    std::vector<uint32_t> edge_item_ids;  // owning item per segment
+    std::vector<int32_t> item_category;   // category index per item (size == item count)
+    std::vector<float> item_bboxes;       // 4 floats per item (min>max sentinel = no geometry)
+};
+MarkerGeom g_markers;
+std::vector<MarkerCategoryGL> g_marker_categories;
+int g_selected_marker = -1;   // item id, -1 = none
+// Overall overlay opacity (the panel's Opacity slider): scales every marker
+// pass's alpha at draw time, so changing it never rebuilds VBOs.
+float g_marker_opacity = 1.0f;
+bool g_markers_dirty = false; // CPU state changed -> rebuild VBOs on next frame
+GLuint g_marker_outline_vbo = 0;
+GLuint g_marker_outline_ebo = 0; // restart-joined GL_LINE_LOOPs, one per ring
+GLsizei g_marker_outline_index_count = 0;
+GLuint g_marker_fill_vbo = 0; // triangulated translucent fill
+GLsizei g_marker_fill_vertex_count = 0;
+GLuint g_marker_edge_vbo = 0; // GL_LINES
+GLsizei g_marker_edge_vertex_count = 0;
+GLuint g_marker_sel_vbo = 0; // selected item's segments, redrawn on top in white
+GLsizei g_marker_sel_vertex_count = 0;
+// Edge end ticks have a constant on-screen length, so they're regenerated
+// from this CPU copy of the currently-visible edge segments whenever g_zoom
+// changed since the last build (edge counts are small).
+std::vector<float> g_marker_visible_edges;
+GLuint g_marker_tick_vbo = 0;
+GLsizei g_marker_tick_vertex_count = 0;
+float g_marker_tick_zoom = -1.0f;
+
+bool markers_present() { return !g_markers.item_category.empty(); }
+
 GLuint compile_shader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
@@ -906,6 +958,226 @@ void draw_measure_line() {
     glDrawArrays(GL_LINES, 0, count / 2);
 }
 
+bool marker_item_visible(uint32_t item_id) {
+    if (item_id >= g_markers.item_category.size()) return false;
+    int32_t cat = g_markers.item_category[item_id];
+    // Out-of-range category (shouldn't happen; flattenMarkerModel guarantees
+    // valid indices) draws rather than silently vanishing.
+    if (cat < 0 || (size_t)cat >= g_marker_categories.size()) return true;
+    return g_marker_categories[(size_t)cat].visible;
+}
+
+void delete_marker_gl_buffers() {
+    auto del = [](GLuint& buf) {
+        if (buf) {
+            glDeleteBuffers(1, &buf);
+            buf = 0;
+        }
+    };
+    del(g_marker_outline_vbo);
+    del(g_marker_outline_ebo);
+    del(g_marker_fill_vbo);
+    del(g_marker_edge_vbo);
+    del(g_marker_sel_vbo);
+    del(g_marker_tick_vbo);
+    g_marker_outline_index_count = 0;
+    g_marker_fill_vertex_count = 0;
+    g_marker_edge_vertex_count = 0;
+    g_marker_sel_vertex_count = 0;
+    g_marker_tick_vertex_count = 0;
+    g_marker_tick_zoom = -1.0f;
+    g_marker_visible_edges.clear();
+}
+
+// Rebuilds every marker VBO from g_markers, skipping items whose category is
+// hidden. Polygons get a restart-joined LINE_LOOP outline EBO (same trick as
+// LayerBuffer.outline_ebo) plus ear-clipped fill triangles; edges get one
+// GL_LINES buffer; the selected item's segments are additionally copied into
+// g_marker_sel_vbo for the white emphasis pass.
+void rebuild_marker_buffers() {
+    std::vector<float> outline_verts;
+    std::vector<uint32_t> outline_indices;
+    std::vector<float> fill_verts;
+    std::vector<float> sel_verts;
+    g_marker_visible_edges.clear();
+
+    std::vector<Vec2> ring_pts;
+    std::vector<uint32_t> tri_indices;
+
+    size_t cursor = 0; // float index into poly_verts
+    for (size_t r = 0; r < g_markers.poly_counts.size(); r++) {
+        uint32_t count = g_markers.poly_counts[r];
+        const float* pts = g_markers.poly_verts.data() + cursor;
+        cursor += (size_t)count * 2;
+        if (cursor > g_markers.poly_verts.size()) break; // malformed payload
+        uint32_t item = g_markers.poly_item_ids[r];
+        // The selected item's white emphasis draws even when its category is
+        // hidden -- selection is explicit intent, and with categories hidden
+        // by default a browser click must still show *something* to zoom to.
+        bool visible = marker_item_visible(item);
+        bool selected = (int)item == g_selected_marker;
+        if (!visible && !selected) continue;
+
+        if (visible) {
+            uint32_t first = (uint32_t)(outline_verts.size() / 2);
+            for (uint32_t k = 0; k < count; k++) {
+                outline_verts.push_back(pts[k * 2]);
+                outline_verts.push_back(pts[k * 2 + 1]);
+                outline_indices.push_back(first + k);
+            }
+            outline_indices.push_back(kRestartIndex);
+
+            // Fill via the existing ear clipper -- it takes gdstk's
+            // Array<Vec2>, so wrap the ring in a non-owning view (never
+            // clear()ed).
+            ring_pts.clear();
+            for (uint32_t k = 0; k < count; k++) {
+                ring_pts.push_back({(double)pts[k * 2], (double)pts[k * 2 + 1]});
+            }
+            Array<Vec2> view = {};
+            view.items = ring_pts.data();
+            view.count = ring_pts.size();
+            view.capacity = ring_pts.size();
+            tri_indices.clear();
+            triangulate(view, tri_indices);
+            for (uint32_t idx : tri_indices) {
+                fill_verts.push_back((float)ring_pts[idx].x);
+                fill_verts.push_back((float)ring_pts[idx].y);
+            }
+        }
+
+        if (selected) {
+            for (uint32_t k = 0; k < count; k++) {
+                uint32_t kn = (k + 1) % count;
+                sel_verts.push_back(pts[k * 2]);
+                sel_verts.push_back(pts[k * 2 + 1]);
+                sel_verts.push_back(pts[kn * 2]);
+                sel_verts.push_back(pts[kn * 2 + 1]);
+            }
+        }
+    }
+
+    for (size_t s = 0; s < g_markers.edge_item_ids.size(); s++) {
+        if ((s + 1) * 4 > g_markers.edge_verts.size()) break; // malformed payload
+        uint32_t item = g_markers.edge_item_ids[s];
+        const float* e = g_markers.edge_verts.data() + s * 4;
+        if (marker_item_visible(item)) {
+            g_marker_visible_edges.insert(g_marker_visible_edges.end(), e, e + 4);
+        }
+        if ((int)item == g_selected_marker) sel_verts.insert(sel_verts.end(), e, e + 4);
+    }
+
+    auto upload = [](GLuint& vbo, const std::vector<float>& data) {
+        if (data.empty()) {
+            if (vbo) {
+                glDeleteBuffers(1, &vbo);
+                vbo = 0;
+            }
+            return;
+        }
+        if (!vbo) glGenBuffers(1, &vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(data.size() * sizeof(float)), data.data(), GL_STATIC_DRAW);
+    };
+
+    upload(g_marker_outline_vbo, outline_verts);
+    if (outline_verts.empty()) {
+        if (g_marker_outline_ebo) {
+            glDeleteBuffers(1, &g_marker_outline_ebo);
+            g_marker_outline_ebo = 0;
+        }
+        g_marker_outline_index_count = 0;
+    } else {
+        if (!g_marker_outline_ebo) glGenBuffers(1, &g_marker_outline_ebo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_marker_outline_ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)),
+                     outline_indices.data(), GL_STATIC_DRAW);
+        g_marker_outline_index_count = (GLsizei)outline_indices.size();
+    }
+    upload(g_marker_fill_vbo, fill_verts);
+    g_marker_fill_vertex_count = (GLsizei)(fill_verts.size() / 2);
+    upload(g_marker_edge_vbo, g_marker_visible_edges);
+    g_marker_edge_vertex_count = (GLsizei)(g_marker_visible_edges.size() / 2);
+    upload(g_marker_sel_vbo, sel_verts);
+    g_marker_sel_vertex_count = (GLsizei)(sel_verts.size() / 2);
+    g_marker_tick_zoom = -1.0f; // visible edge set changed -> regenerate ticks
+}
+
+// Short perpendicular ticks at each visible edge's endpoints (same 6px
+// half-length math as the measure-line ticks) so 1px edge markers stay
+// findable when zoomed out. Zoom-dependent, so rebuilt into a small dynamic
+// VBO whenever g_zoom changed since the last build.
+void build_marker_ticks() {
+    std::vector<float> ticks;
+    ticks.reserve(g_marker_visible_edges.size() * 2);
+    float tick = 6.0f / g_zoom;
+    for (size_t i = 0; i + 3 < g_marker_visible_edges.size(); i += 4) {
+        float x0 = g_marker_visible_edges[i];
+        float y0 = g_marker_visible_edges[i + 1];
+        float x1 = g_marker_visible_edges[i + 2];
+        float y1 = g_marker_visible_edges[i + 3];
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        float len = std::sqrt(dx * dx + dy * dy);
+        // Degenerate (point-like) edge: arbitrary horizontal tick.
+        float nx = tick, ny = 0.0f;
+        if (len > 0.0f) {
+            nx = -dy / len * tick;
+            ny = dx / len * tick;
+        }
+        const float quad[8] = {x0 - nx, y0 - ny, x0 + nx, y0 + ny, x1 - nx, y1 - ny, x1 + nx, y1 + ny};
+        ticks.insert(ticks.end(), quad, quad + 8);
+    }
+    if (!g_marker_tick_vbo) glGenBuffers(1, &g_marker_tick_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_marker_tick_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ticks.size() * sizeof(float)), ticks.data(), GL_DYNAMIC_DRAW);
+    g_marker_tick_vertex_count = (GLsizei)(ticks.size() / 2);
+    g_marker_tick_zoom = g_zoom;
+}
+
+// Draws the marker overlay. Called from draw_frame after the layer loop
+// (above all layers, below the ruler) with g_program active and the camera
+// uniforms already set; like draw_measure_line, the instance attributes'
+// generic identity values pass positions through and u_useHatch=0 gives
+// solid color.
+void draw_markers() {
+    if (!markers_present()) return;
+    if (g_marker_opacity <= 0.0f) return;
+    if (g_markers_dirty) {
+        rebuild_marker_buffers();
+        g_markers_dirty = false;
+    }
+
+    glUniform1f(g_loc_use_hatch, 0.0f);
+    auto draw = [](GLuint vbo, GLenum mode, GLsizei count, float r, float g, float b, float a) {
+        if (!vbo || count == 0) return;
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glUniform4f(g_loc_color, r, g, b, a * g_marker_opacity);
+        glDrawArrays(mode, 0, count);
+    };
+
+    // Translucent fill (always on -- deliberately ignores g_show_infill).
+    draw(g_marker_fill_vbo, GL_TRIANGLES, g_marker_fill_vertex_count, 1.0f, 0.1f, 0.1f, 0.18f);
+
+    if (g_marker_outline_vbo && g_marker_outline_ebo && g_marker_outline_index_count > 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, g_marker_outline_vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glUniform4f(g_loc_color, 1.0f, 0.15f, 0.15f, 0.95f * g_marker_opacity);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_marker_outline_ebo);
+        glDrawElements(GL_LINE_LOOP, g_marker_outline_index_count, GL_UNSIGNED_INT, 0);
+    }
+
+    draw(g_marker_edge_vbo, GL_LINES, g_marker_edge_vertex_count, 1.0f, 0.15f, 0.15f, 0.95f);
+    if (!g_marker_visible_edges.empty() && g_zoom != g_marker_tick_zoom) build_marker_ticks();
+    draw(g_marker_tick_vbo, GL_LINES, g_marker_tick_vertex_count, 1.0f, 0.15f, 0.15f, 0.95f);
+
+    // Selected marker re-drawn on top in white.
+    draw(g_marker_sel_vbo, GL_LINES, g_marker_sel_vertex_count, 1.0f, 1.0f, 1.0f, 0.9f);
+}
+
 struct ViewRect {
     float min_x, max_x, min_y, max_y;
 };
@@ -1071,7 +1343,9 @@ bool draw_frame(double time, void* /*userData*/) {
         }
     }
     g_last_frame_timestamp = time;
-    if (g_layers.empty()) return false;
+    // Markers may load before the GDS finishes parsing -- keep drawing them
+    // (and everything else) even with no layers yet.
+    if (g_layers.empty() && !markers_present()) return false;
 
     glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -1176,6 +1450,7 @@ bool draw_frame(double time, void* /*userData*/) {
             disable_instance_attribs();
         }
     }
+    draw_markers();
     draw_measure_line();
     update_measure_label();
     update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size());
@@ -2568,6 +2843,103 @@ void setMeasureMode(bool on) {
     }
 }
 
+// Replaces all marker state with the flattened payload built by
+// flattenMarkerModel() (marker-parsers.js): plain typed arrays, one bulk
+// convertJSArrayToNumberVector copy each -- no chatty per-item objects across
+// the boundary (same convention as uploadLayers). CPU-side state is populated
+// unconditionally so headless Node runs work; GL work is deferred to the
+// lazy rebuild in draw_markers() (request_redraw() is a no-op headlessly).
+void setMarkers(val data) {
+    g_markers.poly_verts = convertJSArrayToNumberVector<float>(data["polyVerts"]);
+    g_markers.poly_counts = convertJSArrayToNumberVector<uint32_t>(data["polyVertCounts"]);
+    g_markers.poly_item_ids = convertJSArrayToNumberVector<uint32_t>(data["polyItemIds"]);
+    g_markers.edge_verts = convertJSArrayToNumberVector<float>(data["edgeVerts"]);
+    g_markers.edge_item_ids = convertJSArrayToNumberVector<uint32_t>(data["edgeItemIds"]);
+    g_markers.item_category = convertJSArrayToNumberVector<int32_t>(data["itemCategory"]);
+    g_markers.item_bboxes = convertJSArrayToNumberVector<float>(data["itemBBoxes"]);
+    g_marker_categories.assign((size_t)data["categories"]["length"].as<unsigned>(), MarkerCategoryGL{});
+    g_selected_marker = -1;
+    g_markers_dirty = true;
+    request_redraw();
+}
+
+void clearMarkers() {
+    g_markers = MarkerGeom{};
+    g_marker_categories.clear();
+    g_selected_marker = -1;
+    g_markers_dirty = false;
+    // Safe headlessly: every buffer name is still 0 there, so no GL call runs.
+    delete_marker_gl_buffers();
+    request_redraw();
+}
+
+void setMarkerCategoryVisible(int category_index, bool visible) {
+    if (category_index < 0 || (size_t)category_index >= g_marker_categories.size()) return;
+    if (g_marker_categories[(size_t)category_index].visible == visible) return;
+    g_marker_categories[(size_t)category_index].visible = visible;
+    g_markers_dirty = true;
+    request_redraw();
+}
+
+void setSelectedMarker(int item_id) {
+    if (g_selected_marker == item_id) return;
+    g_selected_marker = item_id;
+    g_markers_dirty = true;
+    request_redraw();
+}
+
+// Overall marker-overlay opacity, 0..1 (the panel's Opacity slider). A pure
+// draw-time alpha scale -- no VBO rebuild.
+void setMarkerOpacity(double opacity) {
+    float value = (float)std::clamp(opacity, 0.0, 1.0);
+    if (value == g_marker_opacity) return;
+    g_marker_opacity = value;
+    request_redraw();
+}
+
+// Frames the camera on a world-space box with 4x padding -- used by the
+// marker browser's item rows (and reusable for a future "zoom to all
+// markers"). Degenerate axes (points, axis-aligned edges) only need an
+// epsilon to keep the division finite: a zero-width axis then contributes an
+// astronomical zoom candidate that either loses the min() to the real axis
+// (an edge) or -- for a pure point -- gets capped by clamp_zoom_value's
+// kMaxZoomRatio ceiling, which is exactly the "as close as the camera goes"
+// framing a point marker wants. Anything larger here (an earlier version
+// floored the box at 20px-at-fit-zoom worth of world space) swamps typical
+// sub-µm DRC markers and leaves the view zoomed way out.
+void zoomToBox(double min_x, double min_y, double max_x, double max_y) {
+    if (!g_gl_ready) return;
+    if (!std::isfinite(min_x) || !std::isfinite(min_y) || !std::isfinite(max_x) || !std::isfinite(max_y)) return;
+    if (min_x > max_x || min_y > max_y) return;
+    double w = std::max(max_x - min_x, 1e-9);
+    double h = std::max(max_y - min_y, 1e-9);
+    double zoom = std::min((double)g_canvas_width / w, (double)g_canvas_height / h) / 4.0;
+    g_zoom = clamp_zoom_value((float)zoom);
+    g_pan_x = (float)((min_x + max_x) * 0.5);
+    g_pan_y = (float)((min_y + max_y) * 0.5);
+    clamp_pan();
+    update_scale_bar();
+    request_redraw();
+}
+
+// CPU-side marker state summary for headless smoke tests (no GL context
+// needed) -- see test/marker-wasm.test.js.
+val getMarkerStats() {
+    val stats = val::object();
+    stats.set("items", (int)g_markers.item_category.size());
+    stats.set("polygons", (int)g_markers.poly_counts.size());
+    stats.set("edges", (int)g_markers.edge_item_ids.size());
+    stats.set("categories", (int)g_marker_categories.size());
+    int visible = 0;
+    for (const MarkerCategoryGL& c : g_marker_categories) {
+        if (c.visible) visible++;
+    }
+    stats.set("categoriesVisible", visible);
+    stats.set("selected", g_selected_marker);
+    stats.set("opacity", (double)g_marker_opacity);
+    return stats;
+}
+
 int main() {
     g_gl_ready = init_gl();
     if (!g_gl_ready) return 0;
@@ -2593,4 +2965,11 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setMergeMode", &setMergeMode);
     function("setMeasureMode", &setMeasureMode);
     function("clearMeasurement", &clearMeasurement);
+    function("setMarkers", &setMarkers);
+    function("clearMarkers", &clearMarkers);
+    function("setMarkerCategoryVisible", &setMarkerCategoryVisible);
+    function("setSelectedMarker", &setSelectedMarker);
+    function("setMarkerOpacity", &setMarkerOpacity);
+    function("zoomToBox", &zoomToBox);
+    function("getMarkerStats", &getMarkerStats);
 }

@@ -93,14 +93,16 @@ console.log("[GDS] acquireVsCodeApi() OK, typeof createGdstkModule:", typeof cre
 const gui = new dat.GUI({ width: 260 });
 const actions = {
     // Clicking the row always opens the file dialog (load, or replace the
-    // current .lyp); the injected ✕ (see setLypChip) handles unloading.
+    // current file); the injected ✕ (see setFileChip) handles unloading.
     loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
+    loadMarkerFile: () => vscode.postMessage({ command: "loadMarkerFile" }),
     resetView: () => modulePromise.then((Module) => Module.resetView()),
     showInfill: false,
     mergeOverlaps: false,
     measure: false
 };
 const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
+const markerController = gui.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
 gui.add(actions, "resetView").name("Reset View");
 gui.add(actions, "showInfill").name("Infill")
     .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
@@ -111,42 +113,70 @@ gui.add(actions, "mergeOverlaps").name("Merge Overlaps")
 const measureController = gui.add(actions, "measure").name("Measure")
     .onChange((on) => modulePromise.then((Module) => Module.setMeasureMode(on)));
 
-// Reflects the loaded-.lyp state in the top control. With no .lyp it's a plain
-// "Load KLayout .lyp File" button. Once a .lyp is loaded it shows the filename
-// with an ✕ on the right that unloads it (clears styling in wasm, forgets the
-// remembered path in the extension host, and reverts the button). Clicking the
-// filename itself re-opens the dialog to swap in a different .lyp.
-function setLypChip(name) {
+// Reflects a loaded-file state in a dat.gui button row (used by both the
+// .lyp and marker-file rows). With no file it's a plain load button. Once a
+// file is loaded it shows the filename with an ✕ on the right that unloads
+// it via onUnload. Clicking the filename itself re-opens the dialog to swap
+// in a different file. (The .lyp-* CSS classes are shared by both rows.)
+function setFileChip(controller, name, { idleLabel, idleTitle, unloadTitle, onUnload }) {
     // Remove any ✕ from a previous loaded state before re-deciding.
-    const existingX = lypController.__li.querySelector(".lyp-unload");
+    const existingX = controller.__li.querySelector(".lyp-unload");
     if (existingX) existingX.remove();
-    lypController.__li.classList.toggle("lyp-loaded", !!name);
+    controller.__li.classList.toggle("lyp-loaded", !!name);
 
     if (!name) {
-        lypController.name("Load KLayout .lyp File");
-        lypController.__li.title = "Load a KLayout .lyp layer-properties file";
+        controller.name(idleLabel);
+        controller.__li.title = idleTitle;
         return;
     }
 
-    lypController.name(name);
-    lypController.__li.title = `${name} — click to replace, ✕ to unload`;
+    controller.name(name);
+    controller.__li.title = `${name} — click to replace, ✕ to unload`;
     const x = document.createElement("span");
     x.className = "lyp-unload";
     x.textContent = "✕";
-    x.title = "Unload .lyp";
+    x.title = unloadTitle;
     x.addEventListener("click", (event) => {
         // Don't let the click also trigger the row's load-dialog handler.
         event.stopPropagation();
-        modulePromise.then((Module) => {
-            // Empty text clears g_lyp_info and reverts layers to hash colors.
-            Module.loadLypText("");
-            renderLayerList(Module.getLayers());
-        });
-        vscode.postMessage({ command: "unloadLypFile" });
-        setLypChip(null);
+        onUnload();
     });
-    lypController.__li.appendChild(x);
+    controller.__li.appendChild(x);
 }
+
+function setLypChip(name) {
+    setFileChip(lypController, name, {
+        idleLabel: "Load KLayout .lyp File",
+        idleTitle: "Load a KLayout .lyp layer-properties file",
+        unloadTitle: "Unload .lyp",
+        onUnload: () => {
+            modulePromise.then((Module) => {
+                // Empty text clears g_lyp_info and reverts layers to hash colors.
+                Module.loadLypText("");
+                renderLayerList(Module.getLayers());
+            });
+            vscode.postMessage({ command: "unloadLypFile" });
+            setLypChip(null);
+        }
+    });
+}
+
+function setMarkerChip(name) {
+    setFileChip(markerController, name, {
+        idleLabel: "Load Marker File (.lyrdb / DRC)",
+        idleTitle: "Load a KLayout report database (.lyrdb) or Calibre DRC ASCII results database",
+        unloadTitle: "Unload marker file",
+        onUnload: () => {
+            modulePromise.then((Module) => Module.clearMarkers());
+            vscode.postMessage({ command: "unloadMarkerFile" });
+            removeMarkerBrowser();
+            currentMarkers = null;
+            setMarkerChip(null);
+        }
+    });
+}
+setLypChip(null);
+setMarkerChip(null);
 
 let layersFolder = null;
 
@@ -237,6 +267,155 @@ function renderLayerList(layers) {
     }
 }
 
+// ---- Marker browser (DRC/LVS violation databases) ----
+// The parsed normalized model (see marker-parsers.js) is the JS-side source
+// of truth for the browser UI; wasm only holds the flattened geometry it
+// draws. Rebuilt from scratch on every marker load.
+let currentMarkers = null;
+let markersFolder = null;
+let selectedMarkerId = -1;
+let selectedMarkerRow = null; // the selected item's dat.gui <li>, if it has a row
+const markerItemRows = new Map(); // item id -> <li> (only the uncapped rows)
+
+// Browser-wide controls, kept outside the model so they survive re-renders
+// and marker-file swaps within a session. opacity scales the whole overlay's
+// alpha in wasm; hideEmpty filters clean categories (0 violations) out of
+// the panel (they draw nothing anyway).
+const markerUiState = { opacity: 1.0, hideEmpty: false };
+
+// dat.gui DOM does not survive 100k rows -- cap the rows per category and
+// close with a disabled "… N more" row. Category visibility still covers
+// capped-off items (it lives in wasm per-category), and [ / ] key stepping
+// reaches them too.
+const MAX_MARKER_ROWS_PER_CATEGORY = 200;
+
+function removeMarkerBrowser() {
+    if (markersFolder) {
+        gui.removeFolder(markersFolder);
+        markersFolder = null;
+    }
+    markerItemRows.clear();
+    selectedMarkerRow = null;
+    selectedMarkerId = -1;
+}
+
+// Marks `item` selected (white emphasis in wasm + row highlight) and zooms
+// the view to its bbox. Geometry-less items (bbox null) just select.
+function selectMarker(Module, item) {
+    if (selectedMarkerRow) selectedMarkerRow.classList.remove("marker-selected");
+    selectedMarkerRow = markerItemRows.get(item.id) || null;
+    if (selectedMarkerRow) selectedMarkerRow.classList.add("marker-selected");
+    selectedMarkerId = item.id;
+    Module.setSelectedMarker(item.id);
+    if (item.bbox) {
+        Module.zoomToBox(item.bbox.minX, item.bbox.minY, item.bbox.maxX, item.bbox.maxY);
+    }
+}
+
+// %.4g-ish coordinate for the item rows -- full precision belongs in the
+// tooltip, not a 260px panel.
+function fmtCoord(v) {
+    return Number(v.toPrecision(4)).toString();
+}
+
+function renderMarkerBrowser(model) {
+    // Re-renders (e.g. the hide-empty toggle) keep the current selection;
+    // fresh loads reset selectedMarkerId first (see the markersLoaded handler).
+    const keepSelectedId = selectedMarkerId;
+    removeMarkerBrowser();
+    selectedMarkerId = keepSelectedId;
+
+    const totalItems = model.categories.reduce((n, c) => n + c.items.length, 0);
+    markersFolder = gui.addFolder(`Markers (${totalItems})`);
+    markersFolder.open();
+
+    if (model.warnings.length > 0) {
+        console.error("[GDS] marker warnings:", model.warnings.join(" | "));
+        const row = markersFolder.add({ w: () => {} }, "w")
+            .name(`⚠ ${model.warnings.length} warning${model.warnings.length === 1 ? "" : "s"}`);
+        row.__li.title = model.warnings.join("\n");
+    }
+
+    const opacityController = markersFolder.add(markerUiState, "opacity", 0, 1, 0.05).name("Opacity")
+        .onChange((value) => modulePromise.then((Module) => Module.setMarkerOpacity(value)));
+    opacityController.__li.title = "Opacity of the whole marker overlay";
+
+    const emptyCount = model.categories.filter((c) => c.items.length === 0).length;
+    const hideEmptyController = markersFolder.add(markerUiState, "hideEmpty").name("Hide empty categories")
+        .onChange(() => renderMarkerBrowser(model));
+    hideEmptyController.__li.title =
+        `Hide categories with 0 violations (currently ${emptyCount} of ${model.categories.length})`;
+
+    model.categories.forEach((cat, categoryIndex) => {
+        if (markerUiState.hideEmpty && cat.items.length === 0) return;
+        const folder = markersFolder.addFolder(`${cat.name}  (${cat.items.length})`);
+        folder.close();
+        if (cat.description) folder.domElement.parentElement.title = cat.description;
+
+        // uiVisible (consulted by stepMarker so [ / ] skips hidden categories)
+        // survives re-renders -- wasm keeps the real per-category visibility,
+        // so the checkbox must not silently reset out of sync with it.
+        // Categories start hidden (matching wasm's MarkerCategoryGL default):
+        // the user opts in to the rulechecks they want drawn.
+        if (cat.uiVisible === undefined) cat.uiVisible = false;
+        const visState = { visible: cat.uiVisible };
+        const visController = folder.add(visState, "visible").name("◼ visible")
+            .onChange((visible) => {
+                cat.uiVisible = visible;
+                modulePromise.then((Module) => Module.setMarkerCategoryVisible(categoryIndex, visible));
+            });
+        visController.__li.title = `Show/hide all ${cat.items.length} markers in ${cat.name}`;
+
+        for (const item of cat.items.slice(0, MAX_MARKER_ROWS_PER_CATEGORY)) {
+            const label = item.bbox
+                ? `#${item.label} (${fmtCoord((item.bbox.minX + item.bbox.maxX) / 2)}, ${fmtCoord((item.bbox.minY + item.bbox.maxY) / 2)})`
+                : `#${item.label}`;
+            const controller = folder.add({ go: () => modulePromise.then((Module) => selectMarker(Module, item)) }, "go")
+                .name(label);
+            controller.__li.title = [item.note, cat.description].filter(Boolean).join("\n") || label;
+            markerItemRows.set(item.id, controller.__li);
+        }
+        if (cat.items.length > MAX_MARKER_ROWS_PER_CATEGORY) {
+            const more = folder.add({ m: () => {} }, "m")
+                .name(`… ${cat.items.length - MAX_MARKER_ROWS_PER_CATEGORY} more (press [ or ] to step)`);
+            more.__li.classList.add("marker-more-row");
+        }
+    });
+
+    // Restore the selected item's row highlight after a re-render.
+    selectedMarkerRow = markerItemRows.get(selectedMarkerId) || null;
+    if (selectedMarkerRow) selectedMarkerRow.classList.add("marker-selected");
+}
+
+// The [ and ] keys step the selection backward/forward through every item
+// in checked categories (wrapping), including items past the per-category
+// row cap. With no category checked (the default state right after a load),
+// step through everything instead -- the selected marker draws regardless of
+// category visibility, so stepping is never a dead key.
+function stepMarker(direction) {
+    if (!currentMarkers) return;
+    let items = [];
+    for (const cat of currentMarkers.categories) {
+        if (cat.uiVisible === false) continue;
+        items.push(...cat.items);
+    }
+    if (items.length === 0) {
+        items = currentMarkers.categories.flatMap((cat) => cat.items);
+    }
+    if (items.length === 0) return;
+    let idx = items.findIndex((it) => it.id === selectedMarkerId);
+    idx = idx < 0 ? (direction > 0 ? 0 : items.length - 1) : (idx + direction + items.length) % items.length;
+    modulePromise.then((Module) => selectMarker(Module, items[idx]));
+}
+
+window.addEventListener("keydown", (event) => {
+    // Don't hijack typing in dat.gui's text inputs.
+    const tag = event.target && event.target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    if (event.key === "[") stepMarker(-1);
+    else if (event.key === "]") stepMarker(1);
+});
+
 const loadingOverlay = document.getElementById("loadingOverlay");
 const loadingBarFill = document.getElementById("loadingBarFill");
 const loadingPhase = document.getElementById("loadingPhase");
@@ -309,6 +488,31 @@ window.addEventListener("message", (event) => {
             renderLayerList(Module.getLayers());
         });
         setLypChip(message.name || null);
+    } else if (message.type === "markersLoaded") {
+        modulePromise.then((Module) => {
+            let model;
+            try {
+                // Format sniffed by content (lyrdb XML vs Calibre ASCII) --
+                // see marker-parsers.js, loaded via its own <script> tag.
+                model = parseMarkerFile(message.text, DOMParser);
+            } catch (err) {
+                console.error("[GDS] marker parse failed:", err);
+                removeMarkerBrowser();
+                currentMarkers = null;
+                Module.clearMarkers();
+                setMarkerChip(message.name || null);
+                markerController.__li.title = `Failed to parse ${message.name}: ${err.message || err}`;
+                return;
+            }
+            currentMarkers = model;
+            Module.setMarkers(flattenMarkerModel(model));
+            // The slider state outlives marker swaps; wasm resets selection
+            // on setMarkers but keeps opacity, so re-assert both explicitly.
+            Module.setMarkerOpacity(markerUiState.opacity);
+            selectedMarkerId = -1;
+            renderMarkerBrowser(model);
+            setMarkerChip(message.name || null);
+        });
     } else if (message.type === "toggleDebugTools") {
         // "GDSLens: Toggle Debug Tools" command -- show/hide the upper-left
         // #ui readout and the debug-log toggle button (both hidden by

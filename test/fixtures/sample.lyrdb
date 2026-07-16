@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<report-database>
+  <description>DRC test fixture</description>
+  <original-file>design.gds</original-file>
+  <generator>drc: rules.drc</generator>
+  <top-cell>TOP</top-cell>
+  <tags>
+  </tags>
+  <categories>
+    <category>
+      <name>width_check</name>
+      <description>M1 width &lt; 0.14</description>
+    </category>
+    <category>
+      <name>space</name>
+      <description>spacing checks</description>
+      <categories>
+        <category>
+          <name>m2</name>
+          <description>M2 space &lt; 0.2</description>
+        </category>
+      </categories>
+    </category>
+    <category>
+      <name>empty_cat</name>
+      <description>no violations here</description>
+    </category>
+  </categories>
+  <cells>
+    <cell><name>TOP</name></cell>
+    <cell><name>SUB</name></cell>
+  </cells>
+  <items>
+    <item>
+      <cell>TOP</cell>
+      <category>'width_check'</category>
+      <visited>false</visited>
+      <multiplicity>1</multiplicity>
+      <values>
+        <value>polygon: (0,0;1.5,0;1.5,0.2;0,0.2)</value>
+      </values>
+    </item>
+    <item>
+      <cell>TOP</cell>
+      <category>'width_check'</category>
+      <visited>false</visited>
+      <multiplicity>3</multiplicity>
+      <values>
+        <value>box: (2,1;3,2)</value>
+      </values>
+    </item>
+    <item>
+      <cell>TOP</cell>
+      <category>'space.m2'</category>
+      <values>
+        <value>edge: (0,5;2,5)</value>
+      </values>
+    </item>
+    <item>
+      <cell>TOP</cell>
+      <category>'space.m2'</category>
+      <values>
+        <value>edge-pair: (0,6;2,6)/(0,6.5;2,6.5)</value>
+      </values>
+    </item>
+    <item>
+      <cell>SUB</cell>
+      <category>'space.m2'</category>
+      <values>
+        <value>float: 0.125</value>
+      </values>
+    </item>
+    <item>
+      <cell>TOP</cell>
+      <category>'derived_cat'</category>
+      <values>
+        <value>box: (10,10;
+                     11,11)</value>
+      </values>
+    </item>
+  </items>
+</report-database>
