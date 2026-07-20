@@ -1,6 +1,6 @@
 # Change Log
 
-## [UNRELEASED]
+## [1.2.0] - 2026-07-20
 
 - Control panel migrated from dat.gui (unmaintained) to lil-gui. Same layout
   and behavior; the panel now has a "Controls" title bar at the top instead
