@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- Text labels: GDSII/OASIS `TEXT` elements now render, behind a "Text" toggle
+  in the panel (off by default). Labels draw at a constant on-screen size in
+  their own layer's color, follow that layer's visibility checkbox, and honor
+  the label's justification (anchor). Text found on a layer/texttype with no
+  geometry on it gets a layer entry of its own, so pin text on a text-only
+  texttype is visible and toggleable like any other layer.
+
+## [1.3.0] - 2026-07-31
+
 - OASIS support: `.oas` and `.oasis` files open in the viewer alongside
   `.gds`, going through the same flatten/triangulate/render path (gdstk's
   `read_oas`, normalized to microns exactly like GDSII). Cell references,

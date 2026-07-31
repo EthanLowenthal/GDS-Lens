@@ -248,6 +248,33 @@ const char* kCompositeFragmentShaderSrc =
     "    fragColor = vec4(rgb, finalAlpha);\n"
     "}";
 
+// Label ("text") rendering: GDSII TEXT / OASIS TEXT elements draw as stroked
+// glyphs at a constant on-screen size (see kGlyphStrokes / rebuild_text_buffer),
+// so a_position is the label's world-space origin and a_offset is the glyph
+// vertex's offset from it in *pixels* -- the offset is added after the camera
+// zoom, which is what keeps the text the same size at every zoom level. That
+// also means the vertex data itself never depends on the camera, so panning
+// only re-picks which labels are in view, never re-shapes a glyph.
+const char* kTextVertexShaderSrc =
+    "#version 300 es\n"
+    "in vec2 a_position;\n"
+    "in vec2 a_offset;\n"
+    "uniform vec2 u_resolution;\n"
+    "uniform vec2 u_offset;\n"
+    "uniform float u_zoom;\n"
+    "void main() {\n"
+    "    vec2 screenPos = (a_position - u_offset) * u_zoom + a_offset;\n"
+    "    vec2 clipSpace = (screenPos / u_resolution) * 2.0;\n"
+    "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
+    "}";
+
+const char* kTextFragmentShaderSrc =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "uniform vec4 u_color;\n"
+    "out vec4 fragColor;\n"
+    "void main() { fragColor = u_color; }";
+
 struct PolygonRange {
     GLint first;
     GLsizei count;
@@ -292,6 +319,22 @@ constexpr GLsizei kInstanceStrideFloats = 6;  // col0.xy, col1.xy, translate.xy
 // edge would connect unrelated polygons), and triangle fans from ear-clipping
 // are similarly per-polygon. Repeated references on this layer are drawn
 // separately via instanced_batches instead of being flattened in here.
+// One flattened GDSII/OASIS label: its world-space origin (the reference tree
+// is already applied -- see collect_instanced), the text itself, and the
+// anchor telling which corner/edge of the text box that origin is. Kept
+// CPU-side rather than baked into a VBO at load time because the glyphs are
+// drawn at a fixed pixel size for only the labels currently on screen, which
+// is a per-view decision (see rebuild_text_buffer) -- and because a full chip's
+// worth of labels turned into geometry up front is hundreds of MB of vertices
+// for text that is unreadable mush at anything but a close zoom.
+struct TextLabel {
+    float x = 0.0f, y = 0.0f;
+    // gdstk's Anchor enum value (NW=0, N=1, NE=2, W=4, O=5, E=6, SW=8, S=9,
+    // SE=10): bits 2-3 select the vertical edge, bits 0-1 the horizontal one.
+    uint8_t anchor = 5;  // Anchor::O (centered), gdstk's default
+    std::string text;
+};
+
 struct LayerBuffer {
     uint32_t layer;
     // GDS datatype: layers are keyed on the (layer, datatype) pair, not the
@@ -314,6 +357,11 @@ struct LayerBuffer {
     GLsizei fill_vertex_count = 0;
     // Repeated references on this layer -- see InstancedBatch.
     std::vector<InstancedBatch> instanced_batches;
+    // This layer's labels, in world space (see TextLabel). Drawn only while
+    // the Text toggle is on, and folded into the cull box below so a
+    // text-only layer (labels but no polygons at all, which real decks do
+    // have) still passes draw_frame's bbox test.
+    std::vector<TextLabel> labels;
     // Logical polygon count on this layer, including instanced copies
     // (unit-shape polygon count * instance_count for each batch) -- every
     // layer draws unconditionally in one call each for fill/outline (see
@@ -475,6 +523,48 @@ bool g_show_infill = false;
 // geometry is untouched, so toggling never re-parses or re-uploads anything.
 bool g_merge_mode = false;
 
+// Label rendering on/off (the panel's "Text" checkbox -- see setShowText).
+// Off by default, like the other render-mode toggles: on a full chip the
+// labels are dense enough to bury the geometry, so drawing them is opt-in.
+bool g_show_text = false;
+
+// Text GL state. One VBO holds every on-screen label's glyph segments as
+// GL_LINES, grouped into one range per layer so each range can be drawn in the
+// layer's own frame color. It is rebuilt whenever the view moves (the buffer
+// only holds the labels currently in view) or the label/visibility state
+// changes -- see rebuild_text_buffer / draw_text.
+GLuint g_text_program = 0;
+GLint g_text_loc_resolution = -1;
+GLint g_text_loc_offset = -1;
+GLint g_text_loc_zoom = -1;
+GLint g_text_loc_color = -1;
+GLuint g_text_vbo = 0;
+struct TextRange {
+    size_t layer_index;
+    GLint first;
+    GLsizei count;
+};
+std::vector<TextRange> g_text_ranges;
+bool g_text_dirty = true;
+// The world-space region the current buffer was built for, and the zoom it was
+// built at. The glyph vertices themselves don't depend on the camera at all
+// (the pixel offset is applied after it), so the only reason to rebuild is
+// that the view moved somewhere the buffer has no labels for -- which is why
+// the build region is deliberately larger than the viewport: ordinary panning
+// then reuses the buffer instead of re-uploading it every frame.
+// min > max is the never-built sentinel.
+float g_text_built_min_x = HUGE_VALF;
+float g_text_built_max_x = -HUGE_VALF;
+float g_text_built_min_y = HUGE_VALF;
+float g_text_built_max_y = -HUGE_VALF;
+float g_text_built_zoom = -1.0f;
+// Whether that build stopped at kMaxLabelsPerFrame -- see draw_text.
+bool g_text_built_capped = false;
+// Labels held across all layers (for the stats readout), and how many of them
+// the last rebuild actually drew.
+uint64_t g_total_labels = 0;
+uint64_t g_labels_drawn = 0;
+
 // ---- DRC/LVS marker overlay -------------------------------------------------
 // Violation markers from a KLayout .lyrdb / Calibre DRC results database
 // (parsed and flattened in JS -- see src/marker-parsers.js), drawn as a fixed
@@ -527,6 +617,236 @@ float g_marker_tick_zoom = -1.0f;
 
 bool markers_present() { return !g_markers.item_category.empty(); }
 
+// ---- Stroke font ------------------------------------------------------------
+// A vector (line-segment) font rather than a texture atlas: the glyphs are
+// drawn with the same GL_LINES machinery every other overlay in this file
+// uses, so there is no font texture to build, no atlas to pack, and nothing
+// to re-rasterize when the pixel size changes. It is also what CAD viewers
+// traditionally use for layout labels, so the result looks the part.
+//
+// One entry per printable ASCII code point, 0x20 (space) through 0x7E (~), in
+// order, followed by one fallback glyph (a hollow box) used for every other
+// byte -- GDSII/OASIS label text is a byte string with no declared encoding,
+// so anything outside printable ASCII (including the individual bytes of a
+// UTF-8 sequence) draws as that box instead of being guessed at.
+//
+// Each glyph is a set of polylines on an integer grid, written as two-digit
+// "xy" points separated by spaces, with '/' between polylines. x runs 0..4
+// left to right. y runs 0..9 bottom to top with the baseline at 2, the
+// x-height at 7 and the cap height at 9 -- so descenders reach y=0 and
+// ascenders y=9.
+const char* const kGlyphStrokes[] = {
+    "",                                                     // (space)
+    "29 24/22 23",                                          // !
+    "19 17/39 37",                                          // "
+    "17 47/15 45/19 12/39 32",                              // #
+    "48 39 19 08 07 16 35 44 43 32 12 03/21 29",            // $
+    "09 19 18 08 09/32 42 43 33 32/02 49",                  // %
+    "42 17 18 29 38 37 04 03 12 22 44",                     // &
+    "29 27",                                                // '
+    "39 17 14 32",                                          // (
+    "19 37 34 12",                                          // )
+    "28 24/07 45/47 05",                                    // *
+    "05 45/27 23",                                          // +
+    "22 21 10",                                             // ,
+    "05 45",                                                // -
+    "22 23",                                                // .
+    "02 49",                                                // /
+    "12 32 43 48 39 19 08 03 12",                           // 0
+    "08 29 22/02 42",                                       // 1
+    "08 19 39 48 47 02 42",                                 // 2
+    "08 19 39 48 47 36 45 43 32 12 03",                     // 3
+    "39 04 44/32 39",                                       // 4
+    "49 09 06 36 45 43 32 12 03",                           // 5
+    "48 39 19 08 03 12 32 43 44 35 15 04",                  // 6
+    "09 49 12",                                             // 7
+    "12 32 43 44 35 15 04 03 12/15 35 46 48 39 19 08 06 15",// 8
+    "03 12 32 43 48 39 19 08 07 16 36 47",                  // 9
+    "26 27/22 23",                                          // :
+    "26 27/22 21 10",                                       // ;
+    "48 05 42",                                             // <
+    "06 46/04 44",                                          // =
+    "08 45 02",                                             // >
+    "08 19 39 48 47 25 24/22 23",                           // ?
+    "43 12 03 08 19 39 48 45 34 24 26 36",                  // @
+    "02 29 42/15 35",                                       // A
+    "09 02/09 39 48 47 36 06/36 45 43 32 02",               // B
+    "48 39 19 08 03 12 32 43",                              // C
+    "09 02/09 39 48 43 32 02",                              // D
+    "49 09 02 42/06 36",                                    // E
+    "49 09 02/06 36",                                       // F
+    "48 39 19 08 03 12 32 43 45 25",                        // G
+    "09 02/49 42/06 46",                                    // H
+    "09 49/29 22/02 42",                                    // I
+    "39 33 22 12 03",                                       // J
+    "09 02/49 05 42",                                       // K
+    "09 02 42",                                             // L
+    "02 09 25 49 42",                                       // M
+    "02 09 42 49",                                          // N
+    "12 32 43 48 39 19 08 03 12",                           // O
+    "02 09 39 48 46 35 05",                                 // P
+    "12 32 43 48 39 19 08 03 12/23 42",                     // Q
+    "02 09 39 48 46 35 05/25 42",                           // R
+    "48 39 19 08 07 16 35 44 43 32 12 03",                  // S
+    "09 49/29 22",                                          // T
+    "09 03 12 32 43 49",                                    // U
+    "09 22 49",                                             // V
+    "09 02 26 42 49",                                       // W
+    "09 42/02 49",                                          // X
+    "09 26 49/26 22",                                       // Y
+    "09 49 02 42",                                          // Z
+    "39 29 22 32",                                          // [
+    "09 42",                                                // (backslash)
+    "19 29 22 12",                                          // ]
+    "07 29 47",                                             // ^
+    "01 41",                                                // _
+    "19 27",                                                // `
+    "06 17 37 46 42/43 32 12 03 14 44",                     // a
+    "09 02/06 17 37 46 43 32 12 03",                        // b
+    "46 37 17 06 03 12 32 43",                              // c
+    "49 42/46 37 17 06 03 12 32 43",                        // d
+    "04 44 46 37 17 06 03 12 32 43",                        // e
+    "22 28 39 49/16 36",                                    // f
+    "46 37 17 06 03 12 32 43/47 41 30 10 01",               // g
+    "09 02/05 17 37 46 42",                                 // h
+    "27 22/28 29",                                          // i
+    "37 31 20 10 01/38 39",                                 // j
+    "09 02/37 04 32",                                       // k
+    "19 29 22 32",                                          // l
+    "07 02/06 17 26 22/26 37 46 42",                        // m
+    "07 02/06 17 37 46 42",                                 // n
+    "12 32 43 46 37 17 06 03 12",                           // o
+    "07 00/06 17 37 46 43 32 12 03",                        // p
+    "47 40/46 37 17 06 03 12 32 43",                        // q
+    "07 02/06 17 37",                                       // r
+    "46 37 17 06 15 34 43 32 12 03",                        // s
+    "19 13 22 32/07 27",                                    // t
+    "07 03 12 32 43 47/47 42",                              // u
+    "07 22 47",                                             // v
+    "07 02 25 42 47",                                       // w
+    "07 42/02 47",                                          // x
+    "07 03 12 32 43 47/47 41 30 10",                        // y
+    "07 47 02 42",                                          // z
+    "39 28 26 15 24 22 32",                                 // {
+    "29 21",                                                // |
+    "19 28 26 35 24 22 12",                                 // }
+    "05 16 36 45",                                          // ~
+    "02 42 47 07 02",                                       // fallback (any other byte)
+};
+constexpr int kGlyphCount = (int)(sizeof(kGlyphStrokes) / sizeof(kGlyphStrokes[0]));
+
+// Grid metrics (see kGlyphStrokes): the cap height spans y=2..9, and each
+// glyph advances 6 units -- 4 units of drawn width plus 2 of side bearing.
+constexpr float kGlyphBaselineUnits = 2.0f;
+constexpr float kGlyphCapUnits = 7.0f;
+constexpr float kGlyphWidthUnits = 4.0f;
+constexpr float kGlyphAdvanceUnits = 6.0f;
+
+// On-screen cap height of a label, in CSS pixels. Everything else about the
+// text scales off this.
+constexpr float kTextCapHeightPx = 11.0f;
+constexpr float kTextUnitPx = kTextCapHeightPx / kGlyphCapUnits;
+
+// kGlyphStrokes decoded once into flat line segments (x0,y0,x1,y1 per
+// segment, in grid units) so building a label is a scale-and-offset copy
+// rather than a string parse -- the buffer is rebuilt on every pan, so this
+// runs a lot.
+const std::vector<std::vector<float>>& glyph_segments() {
+    static const std::vector<std::vector<float>> table = [] {
+        std::vector<std::vector<float>> glyphs;
+        glyphs.reserve(kGlyphCount);
+        for (int g = 0; g < kGlyphCount; g++) {
+            std::vector<float> segments;
+            float prev_x = 0.0f, prev_y = 0.0f;
+            bool have_prev = false;
+            for (const char* p = kGlyphStrokes[g]; *p; p++) {
+                if (*p == '/' || *p == ' ') {
+                    // '/' starts a new polyline; ' ' just separates points.
+                    if (*p == '/') have_prev = false;
+                    continue;
+                }
+                // Two digits, "xy". Anything else in the table is a typo, so
+                // stop rather than read past the end of the string.
+                if (p[1] < '0' || p[1] > '9') break;
+                float x = (float)(p[0] - '0');
+                float y = (float)(p[1] - '0');
+                p++;
+                if (have_prev) {
+                    segments.push_back(prev_x);
+                    segments.push_back(prev_y);
+                    segments.push_back(x);
+                    segments.push_back(y);
+                }
+                prev_x = x;
+                prev_y = y;
+                have_prev = true;
+            }
+            glyphs.push_back(std::move(segments));
+        }
+        return glyphs;
+    }();
+    return table;
+}
+
+// Width of `text` as drawn, in pixels: full advances between characters plus
+// one glyph's drawn width for the last one (the trailing side bearing isn't
+// part of the visible box, and including it would bias every centered label
+// half a space to the left).
+float text_width_px(const std::string& text) {
+    if (text.empty()) return 0.0f;
+    return ((float)(text.size() - 1) * kGlyphAdvanceUnits + kGlyphWidthUnits) * kTextUnitPx;
+}
+
+// Appends `text` to `out` as GL_LINES vertices -- 4 floats each: the label's
+// world origin (identical for every vertex of the label, so the camera places
+// the whole label as a unit) followed by that vertex's pixel offset from the
+// origin. `anchor` is gdstk's Anchor enum: bits 2-3 pick the vertical edge the
+// origin sits on (0 = top, 1 = middle, 2 = baseline) and bits 0-1 the
+// horizontal one (0 = left, 1 = center, 2 = right).
+//
+// The label is always drawn horizontally, ignoring any rotation/magnification
+// on the label itself or in the references above it: at a fixed pixel size,
+// inheriting the placement's transform would give upside-down and mirrored
+// (unreadable) text for the many cells that are placed that way, which is not
+// what a label is for.
+void append_text_vertices(const std::string& text, float world_x, float world_y, uint8_t anchor,
+                          std::vector<float>& out) {
+    const std::vector<std::vector<float>>& glyphs = glyph_segments();
+
+    float origin_x = 0.0f;
+    switch (anchor & 3) {
+        case 0: origin_x = 0.0f; break;                          // W (left)
+        case 1: origin_x = -text_width_px(text) * 0.5f; break;    // center
+        default: origin_x = -text_width_px(text); break;          // E (right)
+    }
+    float origin_y = 0.0f;
+    switch ((anchor >> 2) & 3) {
+        case 0: origin_y = -kTextCapHeightPx; break;         // N (top edge at origin)
+        case 1: origin_y = -kTextCapHeightPx * 0.5f; break;  // middle
+        default: origin_y = 0.0f; break;                     // S (baseline at origin)
+    }
+    // Grid y is measured from y=0, not the baseline -- shift so that the
+    // baseline lands on origin_y.
+    origin_y -= kGlyphBaselineUnits * kTextUnitPx;
+
+    for (size_t i = 0; i < text.size(); i++) {
+        unsigned char c = (unsigned char)text[i];
+        int index = (c >= 0x20 && c <= 0x7E) ? (int)c - 0x20 : kGlyphCount - 1;
+        const std::vector<float>& segments = glyphs[(size_t)index];
+        float pen_x = origin_x + (float)i * kGlyphAdvanceUnits * kTextUnitPx;
+        for (size_t s = 0; s + 3 < segments.size(); s += 4) {
+            out.push_back(world_x);
+            out.push_back(world_y);
+            out.push_back(pen_x + segments[s] * kTextUnitPx);
+            out.push_back(origin_y + segments[s + 1] * kTextUnitPx);
+            out.push_back(world_x);
+            out.push_back(world_y);
+            out.push_back(pen_x + segments[s + 2] * kTextUnitPx);
+            out.push_back(origin_y + segments[s + 3] * kTextUnitPx);
+        }
+    }
+}
+
 GLuint compile_shader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
@@ -546,6 +866,10 @@ constexpr GLuint kAttrPosition = 0;
 constexpr GLuint kAttrICol0 = 1;
 constexpr GLuint kAttrICol1 = 2;
 constexpr GLuint kAttrITranslate = 3;
+// The label program's per-vertex pixel offset (see kTextVertexShaderSrc). Its
+// own index rather than a reused one, so enabling it can't disturb the
+// instancing attributes' divisors or generic values.
+constexpr GLuint kAttrTextOffset = 4;
 
 GLuint link_program(const char* vs_src, const char* fs_src) {
     GLuint program = glCreateProgram();
@@ -555,6 +879,7 @@ GLuint link_program(const char* vs_src, const char* fs_src) {
     glBindAttribLocation(program, kAttrICol0, "a_iCol0");
     glBindAttribLocation(program, kAttrICol1, "a_iCol1");
     glBindAttribLocation(program, kAttrITranslate, "a_iTranslate");
+    glBindAttribLocation(program, kAttrTextOffset, "a_offset");
     glLinkProgram(program);
     return program;
 }
@@ -603,6 +928,15 @@ bool init_gl() {
     if (g_loc_i_col0 >= 0) glVertexAttrib2f(g_loc_i_col0, 1.0f, 0.0f);
     if (g_loc_i_col1 >= 0) glVertexAttrib2f(g_loc_i_col1, 0.0f, 1.0f);
     if (g_loc_i_translate >= 0) glVertexAttrib2f(g_loc_i_translate, 0.0f, 0.0f);
+
+    // Label overlay program (see draw_text). Same camera uniforms as the layer
+    // program plus the per-vertex pixel offset that keeps glyphs a constant
+    // on-screen size.
+    g_text_program = link_program(kTextVertexShaderSrc, kTextFragmentShaderSrc);
+    g_text_loc_resolution = glGetUniformLocation(g_text_program, "u_resolution");
+    g_text_loc_offset = glGetUniformLocation(g_text_program, "u_offset");
+    g_text_loc_zoom = glGetUniformLocation(g_text_program, "u_zoom");
+    g_text_loc_color = glGetUniformLocation(g_text_program, "u_color");
 
     // Merge mode's two extra programs (see draw_layer_merged). The composite
     // program's sampler is bound to texture unit 0 once here.
@@ -708,6 +1042,8 @@ void apply_layer_colors(LayerBuffer& layer) {
 
 void apply_lyp_to_layers() {
     for (LayerBuffer& layer : g_layers) apply_layer_colors(layer);
+    // A .lyp can hide layers, and the label buffer only holds visible ones.
+    g_text_dirty = true;
 }
 
 std::string rgba_to_css(const std::array<float, 4>& c) {
@@ -1202,9 +1538,14 @@ bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, co
 // layer-level visibility/bbox skip in draw_frame -- there's no per-polygon
 // culling anymore, so every drawn layer's polygons are all visible.
 void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers_total) {
-    char buf[224];
+    char buf[320];
     int len = snprintf(buf, sizeof(buf), "Visible: %llu / %llu polygons<br>Render: no culling (%d / %d layers on screen)",
              (unsigned long long)visible_polygons, (unsigned long long)g_total_polygons, layers_drawn, layers_total);
+    if (g_total_labels > 0 && len > 0 && (size_t)len < sizeof(buf)) {
+        len += snprintf(buf + len, sizeof(buf) - (size_t)len, "<br>Labels: %llu / %llu drawn",
+                        (unsigned long long)(g_show_text ? g_labels_drawn : 0),
+                        (unsigned long long)g_total_labels);
+    }
     // Frame time is only measured across back-to-back frames (see
     // draw_frame); before any interaction there's nothing meaningful to show.
     if (g_frame_ms_ema > 0.0f && len > 0 && (size_t)len < sizeof(buf)) {
@@ -1212,6 +1553,122 @@ void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers
                  1000.0f / g_frame_ms_ema);
     }
     set_inner_html("renderStats", buf);
+}
+
+// Upper bound on labels drawn in one frame. Text is only legible a few
+// hundred labels to a screen; past this the extra glyphs are unreadable
+// overlap that costs both the rebuild below and the draw. Hit only when
+// zoomed out over a label-dense design, where the text is mush either way.
+constexpr uint64_t kMaxLabelsPerFrame = 4000;
+
+// Extra world-space margin on the label cull test: a label's glyphs run right
+// and up from its origin (or are centered on it) in *screen* space, so an
+// origin just off-screen can still have visible text. 400px covers a ~40
+// character label at kTextCapHeightPx.
+constexpr float kTextCullPadPx = 400.0f;
+
+// How much larger than the viewport the buffer is built, per side, as a
+// fraction of the viewport. Half a screen in every direction is enough that
+// a normal drag doesn't leave the built region mid-gesture.
+constexpr float kTextBuildMargin = 0.5f;
+
+// Refills g_text_vbo with the glyph segments of every label in (a margin
+// around) the current view, grouped into one contiguous range per layer so
+// each range can be drawn in that layer's frame color. Labels outside the
+// region are skipped entirely, so the buffer stays small no matter how many
+// labels the design holds.
+void rebuild_text_buffer() {
+    g_text_ranges.clear();
+    g_labels_drawn = 0;
+    std::vector<float> vertices;
+
+    const ViewRect view = current_view_rect();
+    const float margin_x = (view.max_x - view.min_x) * kTextBuildMargin;
+    const float margin_y = (view.max_y - view.min_y) * kTextBuildMargin;
+    const ViewRect region = {view.min_x - margin_x, view.max_x + margin_x, view.min_y - margin_y,
+                             view.max_y + margin_y};
+    // On top of the margin, the glyphs of a label whose origin sits just
+    // outside the region can still reach into it -- they extend from the
+    // origin in screen space, so that reach is a pixel distance.
+    const float pad = kTextCullPadPx / g_zoom;
+
+    for (size_t i = 0; i < g_layers.size(); i++) {
+        const LayerBuffer& layer = g_layers[i];
+        if (!layer.visible || layer.labels.empty()) continue;
+        if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, region)) continue;
+
+        GLint first = (GLint)(vertices.size() / 4);
+        for (const TextLabel& label : layer.labels) {
+            if (g_labels_drawn >= kMaxLabelsPerFrame) break;
+            if (label.x < region.min_x - pad || label.x > region.max_x + pad) continue;
+            if (label.y < region.min_y - pad || label.y > region.max_y + pad) continue;
+            append_text_vertices(label.text, label.x, label.y, label.anchor, vertices);
+            g_labels_drawn++;
+        }
+        GLsizei count = (GLsizei)(vertices.size() / 4) - first;
+        if (count > 0) g_text_ranges.push_back({i, first, count});
+        if (g_labels_drawn >= kMaxLabelsPerFrame) break;
+    }
+
+    if (!vertices.empty()) {
+        if (!g_text_vbo) glGenBuffers(1, &g_text_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, g_text_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertices.size() * sizeof(float)), vertices.data(),
+                     GL_DYNAMIC_DRAW);
+    }
+    g_text_dirty = false;
+    g_text_built_min_x = region.min_x;
+    g_text_built_max_x = region.max_x;
+    g_text_built_min_y = region.min_y;
+    g_text_built_max_y = region.max_y;
+    g_text_built_zoom = g_zoom;
+    g_text_built_capped = g_labels_drawn >= kMaxLabelsPerFrame;
+}
+
+// Draws the label overlay above the layer geometry (and below the markers and
+// the ruler). Runs its own program -- the glyph vertices carry a pixel offset
+// the layer shader knows nothing about -- and restores g_program afterwards,
+// which is what the passes after it expect to still be bound.
+void draw_text() {
+    if (!g_show_text) return;
+    const ViewRect view = current_view_rect();
+    bool inside_built_region = view.min_x >= g_text_built_min_x && view.max_x <= g_text_built_max_x &&
+                               view.min_y >= g_text_built_min_y && view.max_y <= g_text_built_max_y;
+    // A capped build holds an arbitrary subset of a label-dense region, so the
+    // labels it dropped have to be reconsidered whenever the zoom changes --
+    // otherwise zooming in on an area whose labels lost the cap would show
+    // nothing, since zooming in never leaves the built region.
+    bool stale_cap = g_text_built_capped && g_zoom != g_text_built_zoom;
+    if (g_text_dirty || !inside_built_region || stale_cap) {
+        rebuild_text_buffer();
+    }
+    if (g_text_ranges.empty() || !g_text_vbo) return;
+
+    glUseProgram(g_text_program);
+    glUniform2f(g_text_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform2f(g_text_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_text_loc_zoom, g_zoom);
+
+    const GLsizei stride = 4 * (GLsizei)sizeof(float);
+    glBindBuffer(GL_ARRAY_BUFFER, g_text_vbo);
+    glEnableVertexAttribArray(g_loc_position);
+    glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+    glEnableVertexAttribArray(kAttrTextOffset);
+    glVertexAttribPointer(kAttrTextOffset, 2, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+
+    for (const TextRange& range : g_text_ranges) {
+        const LayerBuffer& layer = g_layers[range.layer_index];
+        // The layer's frame color, floored at a legible alpha -- a .lyp can
+        // set a frame alpha low enough that 1px strokes all but disappear.
+        glUniform4f(g_text_loc_color, layer.frame_color[0], layer.frame_color[1], layer.frame_color[2],
+                    std::max(layer.frame_color[3], 0.9f));
+        glDrawArrays(GL_LINES, range.first, range.count);
+    }
+
+    // a_offset is only ever fed by this pass; leaving the array enabled would
+    // point the other programs' attribute 4 at a buffer they never bound.
+    glDisableVertexAttribArray(kAttrTextOffset);
+    glUseProgram(g_program);
 }
 
 float clamp_zoom_value(float zoom) {
@@ -1450,6 +1907,7 @@ bool draw_frame(double time, void* /*userData*/) {
             disable_instance_attribs();
         }
     }
+    draw_text();
     draw_markers();
     draw_measure_line();
     update_measure_label();
@@ -1521,6 +1979,11 @@ void clear_layers() {
         }
     }
     g_layers.clear();
+    // The label ranges index into g_layers -- they can't outlive it.
+    g_text_ranges.clear();
+    g_total_labels = 0;
+    g_labels_drawn = 0;
+    g_text_dirty = true;
 }
 
 // A 2D affine map x' = a*x + b*y + tx, y' = c*x + d*y + ty. Used to track the
@@ -1592,6 +2055,42 @@ Affine2D reference_placement(const Reference* ref, const Vec2& offset) {
 // of how many instances there are, which is the whole point: a cell placed
 // 800k times (as one AREF or 800k separate SREFs) costs one shape plus 800k
 // cheap affines instead of 800k full copies.
+// One label picked up during the flatten, with its origin already in world
+// space. Collected into per-tag buckets alongside the polygons (a label lives
+// on a (layer, texttype) pair, which shares the Tag encoding with
+// (layer, datatype)) so labels inherit the color and visibility of the layer
+// they belong to.
+struct CollectedLabel {
+    double x, y;
+    uint8_t anchor;
+    std::string text;
+};
+
+// Ceiling on how many labels one layout contributes. A label costs its text
+// plus ~40 bytes and is kept for the life of the view (see TextLabel), and a
+// cell holding a few pins placed 100k times can produce millions of them --
+// well past the point where any of them is readable. Collection stops here
+// rather than growing without bound; the viewer logs that it happened.
+constexpr uint64_t kMaxLabels = 200000;
+
+struct LabelSink {
+    std::unordered_map<uint64_t, std::vector<CollectedLabel>> by_tag;
+    uint64_t count = 0;
+    bool capped = false;
+
+    void add(uint64_t tag, double x, double y, uint8_t anchor, const char* text) {
+        // Empty text draws nothing -- dropping it here keeps it from creating
+        // a layer entry (and a sidebar row) of its own.
+        if (text == nullptr || text[0] == '\0') return;
+        if (count >= kMaxLabels) {
+            capped = true;
+            return;
+        }
+        by_tag[tag].push_back({x, y, anchor, std::string(text)});
+        count++;
+    }
+};
+
 struct InstanceGroupPolys {
     // Keyed by gdstk Tag (layer + datatype), not layer number -- see LayerBuffer.
     std::unordered_map<uint64_t, std::vector<Polygon*>> by_layer_unit;
@@ -1717,11 +2216,14 @@ std::unordered_map<Cell*, bool> choose_instanced_cells(Library& lib,
 // Descent stops at the first instanced cell on any path (its whole subtree is
 // captured by its template, built separately), so no polygon is emitted
 // twice. templates_needed collects which cells actually got instanced so the
-// caller only builds templates for those.
+// caller only builds templates for those. Labels are collected into `labels`
+// the same way the static geometry is -- but only for cells this walk actually
+// descends into; an instanced cell's labels are expanded per instance by the
+// caller, since the walk stops there.
 void collect_instanced(Cell* cell, const Affine2D& current,
                        const std::unordered_map<Cell*, bool>& instanced,
                        std::unordered_map<uint64_t, std::vector<Polygon*>>& by_layer_static,
-                       std::unordered_map<Cell*, InstanceGroupPolys>& groups) {
+                       std::unordered_map<Cell*, InstanceGroupPolys>& groups, LabelSink& labels) {
     // This cell's own polygons/paths only (depth=0); apply_repetitions still
     // expands any repetition attached directly to a polygon/path (a rarer
     // feature distinct from a Reference's repetition), left as static
@@ -1734,6 +2236,20 @@ void collect_instanced(Cell* cell, const Affine2D& current,
         by_layer_static[poly->tag].push_back(poly);
     }
     own_polygons.clear();
+
+    // This cell's own labels (depth=0, repetitions expanded exactly like the
+    // polygons above), moved into world space. get_labels hands back copies,
+    // so each one is freed here after its origin/text have been taken.
+    Array<Label*> own_labels = {};
+    cell->get_labels(true, 0, false, 0, own_labels);
+    for (uint64_t i = 0; i < own_labels.count; i++) {
+        Label* label = own_labels[i];
+        Vec2 p = current.apply_point(label->origin);
+        labels.add(label->tag, p.x, p.y, (uint8_t)label->anchor, label->text);
+        label->clear();
+        free_allocation(label);
+    }
+    own_labels.clear();
 
     for (uint64_t i = 0; i < cell->reference_array.count; i++) {
         Reference* ref = cell->reference_array[i];
@@ -1757,7 +2273,7 @@ void collect_instanced(Cell* cell, const Affine2D& current,
             if (is_instanced) {
                 groups[ref->cell].instances.push_back(placement);
             } else {
-                collect_instanced(ref->cell, placement, instanced, by_layer_static, groups);
+                collect_instanced(ref->cell, placement, instanced, by_layer_static, groups, labels);
             }
         }
 
@@ -1771,6 +2287,18 @@ void collect_instanced(Cell* cell, const Affine2D& current,
 // postMessage-transfer after this call returns.
 val to_float32_array(const std::vector<float>& data) {
     val array = val::global("Float32Array").new_(data.size());
+    array.call<void>("set", typed_memory_view(data.size(), data.data()));
+    return array;
+}
+
+val to_uint8_array(const std::vector<uint8_t>& data) {
+    val array = val::global("Uint8Array").new_(data.size());
+    array.call<void>("set", typed_memory_view(data.size(), data.data()));
+    return array;
+}
+
+val to_uint32_array(const std::vector<uint32_t>& data) {
+    val array = val::global("Uint32Array").new_(data.size());
     array.call<void>("set", typed_memory_view(data.size(), data.data()));
     return array;
 }
@@ -2140,6 +2668,43 @@ val build_layer_entry(uint64_t tag, std::vector<Polygon*>& polys, uint64_t& out_
     return layer_entry;
 }
 
+// Adds one layer's labels to the entry build_layer_entry produced, and grows
+// the design bbox by their origins (a label is part of the design, and a
+// text-only layout has no polygons to frame the view on otherwise).
+//
+// The text crosses to JS as one flat byte blob plus a length per label rather
+// than an array of JS strings: same bulk-typed-array convention as the vertex
+// data, and the main thread rebuilds the std::strings from the bytes without
+// marshalling a JS string per label (see uploadLayers). GDSII/OASIS text is
+// bytes with no declared encoding, so nothing here interprets them.
+void attach_labels(val& layer_entry, const std::vector<CollectedLabel>& labels, double& min_x, double& max_x,
+                   double& min_y, double& max_y) {
+    std::vector<uint8_t> chars;
+    std::vector<uint32_t> lengths;
+    std::vector<float> origins;
+    std::vector<uint8_t> anchors;
+    lengths.reserve(labels.size());
+    origins.reserve(labels.size() * 2);
+    anchors.reserve(labels.size());
+
+    for (const CollectedLabel& label : labels) {
+        chars.insert(chars.end(), label.text.begin(), label.text.end());
+        lengths.push_back((uint32_t)label.text.size());
+        origins.push_back((float)label.x);
+        origins.push_back((float)label.y);
+        anchors.push_back(label.anchor);
+        min_x = std::min(min_x, label.x);
+        max_x = std::max(max_x, label.x);
+        min_y = std::min(min_y, label.y);
+        max_y = std::max(max_y, label.y);
+    }
+
+    layer_entry.set("textChars", to_uint8_array(chars));
+    layer_entry.set("textLengths", to_uint32_array(lengths));
+    layer_entry.set("textOrigins", to_float32_array(origins));
+    layer_entry.set("textAnchors", to_uint8_array(anchors));
+}
+
 // Result of uploading one {outlineVertices,outlineRanges,fillVertices,
 // fillRanges} JS entry (as produced by build_layer_entry) to fresh GL
 // buffers -- shared by both uploadLayers' static per-layer path and its
@@ -2154,6 +2719,40 @@ struct UploadedGeometry {
     uint32_t polygon_count = 0;
     float min_x = HUGE_VAL, max_x = -HUGE_VAL, min_y = HUGE_VAL, max_y = -HUGE_VAL;
 };
+
+// Inverse of attach_labels: unpacks a layer entry's flat text arrays into the
+// layer's TextLabel list and grows its cull box by the label origins, so a
+// layer whose only content is text still passes draw_frame's bbox test.
+void upload_labels(LayerBuffer& layer, val entry) {
+    val lengths_value = entry["textLengths"];
+    if (lengths_value.isUndefined() || lengths_value.isNull()) return;
+
+    std::vector<uint32_t> lengths = convertJSArrayToNumberVector<uint32_t>(lengths_value);
+    if (lengths.empty()) return;
+    std::vector<uint8_t> chars = convertJSArrayToNumberVector<uint8_t>(entry["textChars"]);
+    std::vector<float> origins = convertJSArrayToNumberVector<float>(entry["textOrigins"]);
+    std::vector<uint8_t> anchors = convertJSArrayToNumberVector<uint8_t>(entry["textAnchors"]);
+
+    layer.labels.reserve(layer.labels.size() + lengths.size());
+    size_t cursor = 0;
+    for (size_t i = 0; i < lengths.size(); i++) {
+        // Defensive: a truncated payload stops the loop rather than reading
+        // past the end of any of the four parallel arrays.
+        if (cursor + lengths[i] > chars.size()) break;
+        if (i * 2 + 1 >= origins.size() || i >= anchors.size()) break;
+        TextLabel label;
+        label.x = origins[i * 2];
+        label.y = origins[i * 2 + 1];
+        label.anchor = anchors[i];
+        label.text.assign(reinterpret_cast<const char*>(chars.data()) + cursor, lengths[i]);
+        cursor += lengths[i];
+        layer.min_x = std::min(layer.min_x, label.x);
+        layer.max_x = std::max(layer.max_x, label.x);
+        layer.min_y = std::min(layer.min_y, label.y);
+        layer.max_y = std::max(layer.max_y, label.y);
+        layer.labels.push_back(std::move(label));
+    }
+}
 
 UploadedGeometry upload_geometry(val entry) {
     UploadedGeometry g;
@@ -2261,9 +2860,10 @@ val parseGdsToLayers(const std::string& path) {
 
     std::unordered_map<uint64_t, std::vector<Polygon*>> by_layer_static;
     std::unordered_map<Cell*, InstanceGroupPolys> groups;
+    LabelSink labels;
     uint64_t root_index = 0;
     for (Cell* root : roots) {
-        collect_instanced(root, Affine2D{}, instanced, by_layer_static, groups);
+        collect_instanced(root, Affine2D{}, instanced, by_layer_static, groups, labels);
         root_index++;
         report_progress("flattening", root_index, roots.size());
     }
@@ -2271,6 +2871,29 @@ val parseGdsToLayers(const std::string& path) {
     // Build the unit shape (once) for every cell that actually got instances.
     for (auto& kv : groups) {
         build_cell_template(kv.first, kv.second.by_layer_unit);
+    }
+
+    // Labels inside instanced cells. Unlike the geometry, these aren't drawn
+    // through GPU instancing (glyphs are built per label at a fixed pixel
+    // size, so there's no shared unit shape to instance), so each placement
+    // gets its own world-space copy -- which is what kMaxLabels bounds.
+    for (auto& kv : groups) {
+        Array<Label*> cell_labels = {};
+        kv.first->get_labels(true, -1, false, 0, cell_labels);
+        for (uint64_t i = 0; i < cell_labels.count; i++) {
+            Label* label = cell_labels[i];
+            for (const Affine2D& placement : kv.second.instances) {
+                Vec2 p = placement.apply_point(label->origin);
+                labels.add(label->tag, p.x, p.y, (uint8_t)label->anchor, label->text);
+            }
+            label->clear();
+            free_allocation(label);
+        }
+        cell_labels.clear();
+    }
+    if (labels.capped) {
+        EM_ASM({ console.log('[GDS] label limit reached (' + $0 + ') -- some labels will not be drawn'); },
+               (double)kMaxLabels);
     }
 
     double min_x = HUGE_VAL, max_x = -HUGE_VAL;
@@ -2281,7 +2904,13 @@ val parseGdsToLayers(const std::string& path) {
     uint64_t layer_index = 0;
     uint64_t layer_total = by_layer_static.size();
     for (const auto& kv : groups) layer_total += kv.second.by_layer_unit.size();
+    // Tags that only ever appear as labels still become layers of their own
+    // (real decks do put pin text on a texttype with no geometry on it).
+    for (const auto& kv : labels.by_tag) {
+        if (by_layer_static.count(kv.first) == 0) layer_total++;
+    }
 
+    const std::vector<CollectedLabel> kNoLabels;
     for (auto& entry : by_layer_static) {
         uint64_t layer_polygon_count = 0;
         double lmin_x, lmax_x, lmin_y, lmax_y;
@@ -2292,7 +2921,25 @@ val parseGdsToLayers(const std::string& path) {
             min_y = std::min(min_y, lmin_y);
             max_y = std::max(max_y, lmax_y);
         }
+        auto label_it = labels.by_tag.find(entry.first);
+        attach_labels(layer_entry, label_it != labels.by_tag.end() ? label_it->second : kNoLabels, min_x, max_x,
+                      min_y, max_y);
         total_polygons += layer_polygon_count;
+        layers.call<void>("push", layer_entry);
+
+        layer_index++;
+        report_progress("triangulating", layer_index, layer_total);
+    }
+
+    // Label-only layers: no polygons to build, just the text.
+    for (auto& kv : labels.by_tag) {
+        if (by_layer_static.count(kv.first) > 0) continue;
+        uint64_t layer_polygon_count = 0;
+        double lmin_x, lmax_x, lmin_y, lmax_y;
+        std::vector<Polygon*> no_polygons;
+        val layer_entry =
+            build_layer_entry(kv.first, no_polygons, layer_polygon_count, lmin_x, lmax_x, lmin_y, lmax_y);
+        attach_labels(layer_entry, kv.second, min_x, max_x, min_y, max_y);
         layers.call<void>("push", layer_entry);
 
         layer_index++;
@@ -2383,11 +3030,15 @@ val parseGdsToLayers(const std::string& path) {
 
     lib.free_all();
 
+    // min > max is the "nothing at all in this layout" sentinel: neither a
+    // polygon nor a label ever widened it (label origins count -- a layout
+    // that is only text still has to be framed on something).
+    bool have_bbox = min_x <= max_x;
     val bbox = val::object();
-    bbox.set("minX", total_polygons > 0 && min_x <= max_x ? min_x : 0.0);
-    bbox.set("maxX", total_polygons > 0 && min_x <= max_x ? max_x : 0.0);
-    bbox.set("minY", total_polygons > 0 && min_x <= max_x ? min_y : 0.0);
-    bbox.set("maxY", total_polygons > 0 && min_x <= max_x ? max_y : 0.0);
+    bbox.set("minX", have_bbox ? min_x : 0.0);
+    bbox.set("maxX", have_bbox ? max_x : 0.0);
+    bbox.set("minY", have_bbox ? min_y : 0.0);
+    bbox.set("maxY", have_bbox ? max_y : 0.0);
 
     result.set("ok", true);
     result.set("error", std::string(gds_common::error_string(error_code, format)));
@@ -2396,6 +3047,8 @@ val parseGdsToLayers(const std::string& path) {
     result.set("instanceGroups", instance_groups_js);
     result.set("bbox", bbox);
     result.set("totalPolygons", total_polygons);
+    result.set("totalLabels", labels.count);
+    result.set("labelsCapped", labels.capped);
     return result;
 }
 
@@ -2426,6 +3079,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
 
     std::unordered_map<uint64_t, size_t> layer_index_by_tag;
     uint64_t total_polygons = 0;
+    uint64_t total_labels = 0;
 
     for (unsigned i = 0; i < layer_count; i++) {
         val entry = layers_data[i];
@@ -2445,6 +3099,9 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
         layer_buffer.min_y = g.min_y;
         layer_buffer.max_y = g.max_y;
         total_polygons += g.polygon_count;
+        // After the geometry bbox, since it widens the same fields.
+        upload_labels(layer_buffer, entry);
+        total_labels += layer_buffer.labels.size();
 
         apply_layer_colors(layer_buffer);
         layer_index_by_tag[layer_buffer.tag()] = g_layers.size();
@@ -2528,7 +3185,9 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     double min_y = bbox_data["minY"].as<double>();
     double max_y = bbox_data["maxY"].as<double>();
 
-    if (total_polygons > 0 && min_x <= max_x) {
+    // Labels count as content: a layout with nothing but text still has to be
+    // framed on its bbox rather than falling back to the origin-at-zoom-1 case.
+    if ((total_polygons > 0 || total_labels > 0) && min_x <= max_x) {
         double total_width = max_x - min_x;
         double total_height = max_y - min_y;
         g_pan_x = (float)(min_x + total_width / 2.0);
@@ -2553,12 +3212,15 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     g_fit_pan_x = g_pan_x;
     g_fit_pan_y = g_pan_y;
     g_total_polygons = total_polygons;
+    g_total_labels = total_labels;
+    g_text_dirty = true;
 
     // #renderStats is a placeholder draw_frame overwrites every redraw (see
     // update_render_stats) with the live visible-polygon-count / rendering-
     // mode readout -- kept as a separate span so draw_frame's per-frame
     // update doesn't have to re-set the static title/count text above it.
     set_inner_html("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons) +
+                              "<br>Labels: " + std::to_string(total_labels) +
                               "<br><span id=\"renderStats\"></span>");
     update_scale_bar();
     request_redraw();
@@ -2811,11 +3473,22 @@ void setLayerVisible(uint32_t layer_number, uint32_t datatype, bool visible) {
     }
     auto it = g_lyp_info.find(tag);
     if (it != g_lyp_info.end()) it->second.visible = visible;
+    g_text_dirty = true;  // the label buffer only holds visible layers' labels
     request_redraw();
 }
 
 void setShowInfill(bool show) {
     g_show_infill = show;
+    request_redraw();
+}
+
+// The panel's "Text" checkbox: draw GDSII/OASIS labels over the geometry (see
+// draw_text). Pure render state -- the labels themselves are held from the
+// moment the layout loads, so toggling never re-parses anything.
+void setShowText(bool show) {
+    if (g_show_text == show) return;
+    g_show_text = show;
+    g_text_dirty = true;
     request_redraw();
 }
 
@@ -2973,6 +3646,7 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setLayerVisible", &setLayerVisible);
     function("resetView", &reset_view);
     function("setShowInfill", &setShowInfill);
+    function("setShowText", &setShowText);
     function("setMergeMode", &setMergeMode);
     function("setMeasureMode", &setMeasureMode);
     function("clearMeasurement", &clearMeasurement);

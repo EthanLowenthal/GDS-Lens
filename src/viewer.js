@@ -99,6 +99,7 @@ const actions = {
     loadMarkerFile: () => vscode.postMessage({ command: "loadMarkerFile" }),
     resetView: () => modulePromise.then((Module) => Module.resetView()),
     showInfill: false,
+    showText: false,
     mergeOverlaps: false,
     measure: false
 };
@@ -107,6 +108,12 @@ const markerController = gui.add(actions, "loadMarkerFile").name("Load Marker Fi
 gui.add(actions, "resetView").name("Reset View");
 gui.add(actions, "showInfill").name("Infill")
     .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
+// Draw the layout's own labels (GDSII/OASIS TEXT elements) at a fixed
+// on-screen size, in each label's layer color -- off by default because a
+// full chip's worth of text buries the geometry it sits on.
+const textController = gui.add(actions, "showText").name("Text")
+    .onChange((show) => modulePromise.then((Module) => Module.setShowText(show)));
+textController.domElement.title = "Show layout text labels, drawn in their layer's color";
 // Draw each layer as the union of its polygons (boundary + fill only, no
 // internal edges) -- a pure render-mode toggle, no re-parse involved.
 gui.add(actions, "mergeOverlaps").name("Merge Overlaps")

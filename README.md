@@ -15,7 +15,8 @@ colors.
 - Optional KLayout `.lyp` file loading for custom layer colors.
 - Handles SREF/AREF (including array references), rotation, mirroring, and
   magnification via gdstk's flattening.
-- Per-layer visibility toggles and an infill (fill pattern) toggle.
+- Per-layer visibility toggles, an infill (fill pattern) toggle, and a text
+  toggle for the layout's own labels.
 - Measure tool: click two points to read out the distance between them.
 - Marker databases: load DRC/LVS violation markers (KLayout `.lyrdb` or
   Calibre DRC ASCII results) as a highlight overlay with a browsable
@@ -30,6 +31,10 @@ with an unexpected extension still loads correctly):
 - **Pan / zoom** — drag to pan, scroll to zoom.
 - **Layers** — toggle individual layer visibility from the panel.
 - **Infill** — toggle the hatched layer fill on or off from the panel.
+- **Text** — toggle the layout's text labels (GDSII/OASIS `TEXT` elements) on
+  or off. Labels draw at a constant on-screen size in their layer's color and
+  respect that layer's visibility checkbox. Off by default, since a dense
+  design's labels can bury the geometry underneath them.
 - **Reset View** — refit the layout to the window from the panel.
 - **Measure** — enable from the panel (or press `M`), then click two points
   to measure the distance between them (total, Δx, and Δy). Press `Escape`
