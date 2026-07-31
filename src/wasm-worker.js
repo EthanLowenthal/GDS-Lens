@@ -97,10 +97,16 @@ self.onmessage = (event) => {
             return;
         }
 
-        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "-- posting gdsResult back to main thread");
+        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "labels:", result.totalLabels, "-- posting gdsResult back to main thread");
         const transferList = [];
         for (const layer of result.layers) {
             transferList.push(layer.outlineVertices.buffer, layer.fillVertices.buffer);
+            // Label text (see attach_labels in renderer.cpp). Only the
+            // top-level layer entries carry it -- an instanced cell's labels
+            // are expanded into world space during the flatten, so the
+            // per-group entries below have no text of their own.
+            transferList.push(layer.textChars.buffer, layer.textLengths.buffer,
+                              layer.textOrigins.buffer, layer.textAnchors.buffer);
         }
         for (const group of result.instanceGroups) {
             transferList.push(group.instances.buffer);
