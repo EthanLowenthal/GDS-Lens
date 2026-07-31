@@ -2565,6 +2565,13 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
 }
 
 void showLoadError(const std::string& message) {
+    // Write the visible panel FIRST and unconditionally: #ui below is a
+    // debug-only readout (display:none without the debug command), and a
+    // failure early enough to leave GL uninitialized is exactly when the user
+    // most needs to see why. set_inner_text, not html -- the message can
+    // carry a filename or a gdstk string we don't control.
+    set_inner_text("loadError", std::string("Could not open this layout\n\n") + message);
+
     if (!g_gl_ready) return;
     clear_layers();
     // With no layers draw_frame early-returns and can't hide the label, so

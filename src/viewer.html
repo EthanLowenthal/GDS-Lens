@@ -48,6 +48,13 @@
         #loadingBarFill { width: 0%; height: 100%; background: #4a9eff; transition: width 0.15s ease-out; }
         #loadingPhase { font-size: 12px; }
         #loadingPercent { font-size: 11px; color: #808080; }
+        /* Load failures. This is deliberately NOT part of the debug tools:
+           #ui above is display:none unless the debug command is run, so an
+           error written only there is invisible to a normal user. Empty means
+           no error, so setting/clearing the text is all it takes to show or
+           hide the panel. */
+        #loadError { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-width: 520px; z-index: 35; padding: 16px 20px; background: #2a1416; border: 1px solid #7a2b2b; border-radius: 5px; font-family: monospace; font-size: 12px; line-height: 1.55; color: #ffd9d9; white-space: pre-line; user-select: text; }
+        #loadError:empty { display: none; }
         #debugPanel { position: absolute; bottom: 0; left: 0; width: 100%; max-height: 240px; z-index: 40; background: rgba(0,0,0,0.88); border-top: 1px solid #333; display: flex; flex-direction: column; }
         #debugPanel.hidden { display: none; }
         #debugPanelHeader { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; font-family: monospace; font-size: 11px; color: #999; border-bottom: 1px solid #333; }
@@ -65,6 +72,7 @@
         <div id="loadingPhase">Loading layout...</div>
         <div id="loadingPercent"></div>
     </div>
+    <div id="loadError"></div>
     <canvas id="glCanvas"></canvas>
 
     <div id="debugPanel" class="hidden">
@@ -96,6 +104,7 @@
     <script src="wasm/build/gdstk_wasm.js"></script>
     <script src="vendor/lil-gui.umd.min.js"></script>
     <script src="marker-parsers.js"></script>
+    <script src="load-errors.js"></script>
     <script src="viewer.js"></script>
 </body>
 </html>

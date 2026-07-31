@@ -434,6 +434,31 @@ const loadingOverlay = document.getElementById("loadingOverlay");
 const loadingBarFill = document.getElementById("loadingBarFill");
 const loadingPhase = document.getElementById("loadingPhase");
 const loadingPercent = document.getElementById("loadingPercent");
+const loadError = document.getElementById("loadError");
+
+// Every load-failure path ends here. Writing the DOM directly rather than
+// going through Module.showLoadError matters: the module itself may be the
+// thing that failed (instantiation rejected, or aborted on OOM mid-parse), in
+// which case `modulePromise.then(...)` never runs and the user would be left
+// staring at a stalled progress bar with no explanation. The wasm side is
+// then told separately, best-effort, so it can clear any half-loaded layers.
+function showFatalError(message) {
+    console.error("[GDS] load failed:", message);
+    loadError.textContent = "Could not open this layout\n\n" + message;
+    loadingOverlay.classList.add("hidden");
+    modulePromise.then((Module) => {
+        Module.showLoadError(message);
+        renderLayerList(Module.getLayers());
+    }).catch(() => {
+        // Module is gone -- the DOM message above is all we can offer.
+    });
+}
+
+function clearFatalError() {
+    loadError.textContent = "";
+}
+
+// describeLoadFailure comes from load-errors.js (its own <script> tag).
 
 const phaseLabels = {
     parsing: "Parsing layout file...",
@@ -456,7 +481,13 @@ console.log("[GDS] calling createGdstkModule() on main thread...");
 const modulePromise = createGdstkModule();
 modulePromise.then(
     () => console.log("[GDS] main-thread createGdstkModule() resolved OK"),
-    (err) => console.error("[GDS] main-thread createGdstkModule() REJECTED:", err)
+    (err) => {
+        console.error("[GDS] main-thread createGdstkModule() REJECTED:", err);
+        // Nothing else will ever run if this fails, so this is the one place
+        // the message has to come from -- showFatalError's own best-effort
+        // call into the module simply no-ops on the same rejection.
+        showFatalError(`WebAssembly module failed to load: ${describeLoadFailure(err)}`);
+    }
 );
 
 window.addEventListener("message", (event) => {
@@ -488,14 +519,15 @@ window.addEventListener("message", (event) => {
             console.log("[GDS] new Worker() constructor returned OK");
         } catch (err) {
             console.error("[GDS] failed to build/start worker:", err);
-            modulePromise.then((Module) => {
-                Module.showLoadError(`Failed to create worker: ${err.message || err}`);
-                renderLayerList(Module.getLayers());
-                loadingOverlay.classList.add("hidden");
-            });
+            showFatalError(`Failed to create worker: ${err.message || err}`);
             return;
         }
         startWorker(worker, message.fileData);
+    } else if (message.type === "loadError") {
+        // The extension host gave up before it could send any bytes (file too
+        // large, unreadable, ...) -- without this the overlay would spin
+        // forever waiting for an 'init' that never comes.
+        showFatalError(message.message);
     } else if (message.type === "lypLoaded") {
         modulePromise.then((Module) => {
             Module.loadLypText(message.text);
@@ -543,19 +575,11 @@ function startWorker(worker, fileData) {
     // handler.
     worker.onerror = (err) => {
         console.error("[GDS] worker.onerror fired:", err.message, "at", err.filename + ":" + err.lineno + ":" + err.colno, err.error);
-        modulePromise.then((Module) => {
-            Module.showLoadError(`Worker failed to start: ${err.message || err}`);
-            renderLayerList(Module.getLayers());
-            loadingOverlay.classList.add("hidden");
-        });
+        showFatalError(`Worker failed to start: ${err.message || err}`);
     };
     worker.onmessageerror = (err) => {
         console.error("[GDS] worker.onmessageerror fired (structured-clone failure):", err);
-        modulePromise.then((Module) => {
-            Module.showLoadError("Worker message failed to deserialize -- see devtools console");
-            renderLayerList(Module.getLayers());
-            loadingOverlay.classList.add("hidden");
-        });
+        showFatalError("Worker message failed to deserialize -- see devtools console");
     };
     worker.onmessage = (workerEvent) => {
         const workerMessage = workerEvent.data;
@@ -576,19 +600,34 @@ function startWorker(worker, fileData) {
         if (workerMessage.type === "gdsProgress") {
             updateProgress(workerMessage.phase, workerMessage.current, workerMessage.total);
         } else if (workerMessage.type === "gdsResult") {
-            if (!workerMessage.ok) console.error("[GDS] load failed:", workerMessage.error);
-            else console.log("[GDS] load succeeded, layer count:", workerMessage.layers.length);
+            // Free the worker's copy of the geometry before uploading ours:
+            // on a big design both threads holding it at once is what tips a
+            // borderline load over the edge.
+            worker.terminate();
+            if (!workerMessage.ok) {
+                showFatalError(workerMessage.error);
+                return;
+            }
+            console.log("[GDS] load succeeded, layer count:", workerMessage.layers.length);
             modulePromise.then((Module) => {
-                if (workerMessage.ok) {
+                // uploadLayers is the other place a big layout can run out of
+                // memory -- the parse fit in the worker, but this thread's
+                // module now has to hold the same geometry plus its VBOs. An
+                // unhandled throw here would leave the progress bar spinning
+                // forever, so surface it like any other load failure.
+                try {
                     Module.uploadLayers(workerMessage.layers, workerMessage.instanceGroups, workerMessage.bbox);
-                } else {
-                    Module.showLoadError(workerMessage.error);
+                } catch (err) {
+                    showFatalError(describeLoadFailure(err));
+                    return;
                 }
+                clearFatalError();
                 renderLayerList(Module.getLayers());
                 loadingOverlay.classList.add("hidden");
                 console.log("[GDS] done, overlay hidden");
+            }, (err) => {
+                showFatalError(`WebAssembly module failed to load: ${err && err.message ? err.message : err}`);
             });
-            worker.terminate();
         }
     };
     console.log("[GDS] posting 'parse' message to worker...");
