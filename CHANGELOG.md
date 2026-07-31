@@ -1,6 +1,6 @@
 # Change Log
 
-## [Unreleased]
+## [1.4.0] - 2026-07-31
 
 - Text labels: GDSII/OASIS `TEXT` elements now render, behind a "Text" toggle
   in the panel (off by default). Labels draw at a constant on-screen size in
