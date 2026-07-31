@@ -1,7 +1,7 @@
-// Runs the parse/flatten/triangulate half of loading a GDS file off the
-// main thread. viewer.js instantiates this via a Blob URL built from THIS
-// file's text with the full gdstk_wasm.js source prepended -- not
-// `importScripts(wasmUrl)`. VS Code's webview resource protocol
+// Runs the parse/flatten/triangulate half of loading a layout file (GDSII or
+// OASIS) off the main thread. viewer.js instantiates this via a Blob URL
+// built from THIS file's text with the full gdstk_wasm.js source prepended --
+// not `importScripts(wasmUrl)`. VS Code's webview resource protocol
 // (vscode-cdn.net) serves `<script src>` tags in the main document fine, but
 // a Worker (even a Blob one) can't reach it at all: importScripts against
 // that URL fails with a NetworkError before it even gets to CSP, and
@@ -82,12 +82,15 @@ self.onmessage = (event) => {
     console.log("[GDS worker] calling createGdstkModule()...");
     createGdstkModule().then((Module) => {
         console.log("[GDS worker] createGdstkModule() resolved, Module keys:", Object.keys(Module).filter(k => typeof Module[k] === "function"));
-        console.log("[GDS worker] writing /input.gds to MEMFS...");
-        Module.FS.writeFile("/input.gds", new Uint8Array(message.fileData));
-        console.log("[GDS worker] calling Module.parseGdsToLayers('/input.gds')...");
-        const result = Module.parseGdsToLayers("/input.gds");
-        console.log("[GDS worker] parseGdsToLayers returned, ok:", result.ok, "error:", result.error);
-        Module.FS.unlink("/input.gds");
+        // Extension-less name on purpose: GDSII vs OASIS is decided by the
+        // file's own header inside the wasm (gds_common::detect_format), so
+        // nothing here has to know or plumb through which one this is.
+        console.log("[GDS worker] writing /input.layout to MEMFS...");
+        Module.FS.writeFile("/input.layout", new Uint8Array(message.fileData));
+        console.log("[GDS worker] calling Module.parseGdsToLayers('/input.layout')...");
+        const result = Module.parseGdsToLayers("/input.layout");
+        console.log("[GDS worker] parseGdsToLayers returned, ok:", result.ok, "format:", result.format, "error:", result.error);
+        Module.FS.unlink("/input.layout");
 
         if (!result.ok) {
             postMessage({type: "gdsResult", ok: false, error: result.error});

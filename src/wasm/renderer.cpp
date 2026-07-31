@@ -829,10 +829,10 @@ void set_inner_text(const char* id, const std::string& text) {
     if (!el.isNull() && !el.isUndefined()) el.set("innerText", text);
 }
 
-// dbuPerMicron is always 1.0 now -- gdstk's read_gds() is called with
-// unit=1e-6, which normalizes every file's coordinates to microns at parse
-// time (see bindings.cpp), so the old per-file scale factor the JS scale
-// bar used to divide by no longer varies.
+// dbuPerMicron is always 1.0 now -- gdstk's read_gds()/read_oas() are called
+// with unit=1e-6, which normalizes every file's coordinates to microns at
+// parse time (see bindings.cpp), so the old per-file scale factor the JS
+// scale bar used to divide by no longer varies.
 void update_scale_bar() {
     const double target_pixel_width = 120.0;
     double microns_value = target_pixel_width / g_zoom;
@@ -2104,7 +2104,7 @@ val build_layer_entry(uint64_t tag, std::vector<Polygon*>& polys, uint64_t& out_
             append_fill(poly->point_array, tri_indices);
         } else {
             Array<Polygon*> pieces = {};
-            // precision = 1e-3: coordinates are in microns (see read_gds's
+            // precision = 1e-3: coordinates are in microns (see read_layout's
             // unit argument), so cuts snap to a 1 nm grid.
             poly->fracture(kMaxTriangulatePoints, 1e-3, pieces);
             if (pieces.count == 0) {
@@ -2211,22 +2211,25 @@ UploadedGeometry upload_geometry(val entry) {
 
 }  // namespace
 
-// Parses, flattens, and triangulates a GDS file into plain per-layer vertex
-// data -- no GL/DOM touched, so this is safe to run inside a Worker (see
-// wasm-worker.js) as well as on the main thread. Reports progress via
-// report_progress() as it goes; the caller (JS) is expected to relay
-// 'gdsProgress' postMessages to whatever's driving a progress bar.
+// Parses, flattens, and triangulates a layout file (GDSII or OASIS -- the
+// format is sniffed from the file's header, see gds_common::detect_format)
+// into plain per-layer vertex data -- no GL/DOM touched, so this is safe to
+// run inside a Worker (see wasm-worker.js) as well as on the main thread.
+// Reports progress via report_progress() as it goes; the caller (JS) is
+// expected to relay 'gdsProgress' postMessages to whatever's driving a
+// progress bar.
 val parseGdsToLayers(const std::string& path) {
     val result = val::object();
 
     report_progress("parsing", 0, 1);
     ErrorCode error_code = ErrorCode::NoError;
-    Library lib = read_gds(path.c_str(), 1e-6, 1e-2, NULL, &error_code);
+    gds_common::FileFormat format = gds_common::FileFormat::Gds;
+    Library lib = gds_common::read_layout(path.c_str(), 1e-6, 1e-2, &format, &error_code);
     report_progress("parsing", 1, 1);
 
     if (gds_common::is_fatal(error_code)) {
         result.set("ok", false);
-        result.set("error", std::string(gds_common::error_string(error_code)));
+        result.set("error", std::string(gds_common::error_string(error_code, format)));
         lib.free_all();
         return result;
     }
@@ -2387,7 +2390,8 @@ val parseGdsToLayers(const std::string& path) {
     bbox.set("maxY", total_polygons > 0 && min_x <= max_x ? max_y : 0.0);
 
     result.set("ok", true);
-    result.set("error", std::string(gds_common::error_string(error_code)));
+    result.set("error", std::string(gds_common::error_string(error_code, format)));
+    result.set("format", std::string(gds_common::format_name(format)));
     result.set("layers", layers);
     result.set("instanceGroups", instance_groups_js);
     result.set("bbox", bbox);

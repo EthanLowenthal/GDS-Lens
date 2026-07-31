@@ -1,11 +1,12 @@
 // Thin bootstrap: instantiate the wasm module and relay postMessage payloads
 // from the extension host into it. JS never touches GDS/GL data -- that all
 // lives in wasm/renderer.cpp (GL context + shaders + camera + input) and
-// wasm/bindings.cpp (gdstk parsing), which attach directly to #glCanvas and
-// the DOM themselves. The control surface (load .lyp button + per-layer
-// visibility toggles) is built with lil-gui (vendor/lil-gui.umd.min.js).
+// wasm/bindings.cpp (gdstk GDSII/OASIS parsing), which attach directly to
+// #glCanvas and the DOM themselves. The control surface (load .lyp button +
+// per-layer visibility toggles) is built with lil-gui
+// (vendor/lil-gui.umd.min.js).
 //
-// Loading a GDS file is split across a Worker (see wasm-worker.js) and this
+// Loading a layout file is split across a Worker (see wasm-worker.js) and this
 // main-thread module: the Worker instantiates its own copy of the same wasm
 // module and runs parseGdsToLayers() (parse + flatten + triangulate, no
 // GL/DOM) so the canvas/lil-gui panel stay responsive on very large files,
@@ -435,7 +436,7 @@ const loadingPhase = document.getElementById("loadingPhase");
 const loadingPercent = document.getElementById("loadingPercent");
 
 const phaseLabels = {
-    parsing: "Parsing GDS binary...",
+    parsing: "Parsing layout file...",
     flattening: "Flattening hierarchy...",
     triangulating: "Triangulating geometry..."
 };
