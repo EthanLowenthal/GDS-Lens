@@ -203,7 +203,7 @@ class GdsEditorProvider {
                 }
             });
 
-            logger.appendLine('>>> Streaming raw GDS bytes down into the wasm webview context...');
+            logger.appendLine('>>> Streaming raw layout bytes down into the wasm webview context...');
             logger.appendLine('    fileData bytes: ' + fileData.byteLength);
             logger.appendLine('    cspSource: ' + webviewPanel.webview.cspSource);
             // fileData crosses as a raw ArrayBuffer (as it always has) --

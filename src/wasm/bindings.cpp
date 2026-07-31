@@ -1,9 +1,9 @@
-// Embind glue exposing gdstk's GDSII reader/flattener to the webview.
+// Embind glue exposing gdstk's GDSII/OASIS readers + flattener to the webview.
 //
-// The webview stages the raw .gds bytes into Emscripten's in-memory FS
-// (MEMFS) and calls parseGds() with the path. gdstk::read_gds() only takes a
-// filename (it does FILE* I/O internally), so MEMFS is the simplest way to
-// hand it bytes that originated from a postMessage payload.
+// The webview stages the raw layout bytes into Emscripten's in-memory FS
+// (MEMFS) and calls parseGds() with the path. gdstk's read_gds()/read_oas()
+// only take a filename (they do FILE* I/O internally), so MEMFS is the
+// simplest way to hand them bytes that originated from a postMessage payload.
 
 #include <cstring>
 
@@ -61,12 +61,14 @@ val parseGds(const std::string& path) {
     ErrorCode error_code = ErrorCode::NoError;
     // unit = 1e-6 normalizes every file to micron-scale coordinates
     // regardless of its native database unit, so the renderer never needs to
-    // know about per-file scale factors.
-    Library lib = read_gds(path.c_str(), 1e-6, 1e-2, NULL, &error_code);
+    // know about per-file scale factors. GDSII vs OASIS is sniffed from the
+    // file's own header (see gds_common::detect_format).
+    gds_common::FileFormat format = gds_common::FileFormat::Gds;
+    Library lib = gds_common::read_layout(path.c_str(), 1e-6, 1e-2, &format, &error_code);
 
     if (gds_common::is_fatal(error_code)) {
         result.set("ok", false);
-        result.set("error", std::string(gds_common::error_string(error_code)));
+        result.set("error", std::string(gds_common::error_string(error_code, format)));
         lib.free_all();
         return result;
     }
@@ -95,7 +97,8 @@ val parseGds(const std::string& path) {
     top_rawcells.clear();
 
     result.set("ok", true);
-    result.set("error", std::string(gds_common::error_string(error_code)));
+    result.set("error", std::string(gds_common::error_string(error_code, format)));
+    result.set("format", std::string(gds_common::format_name(format)));
     result.set("dbuPerMicron", 1.0);
     result.set("geometry", geometry);
 

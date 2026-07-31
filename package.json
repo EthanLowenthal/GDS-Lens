@@ -1,7 +1,7 @@
 {
   "name": "GDS-Lens",
   "displayName": "GDS Lens",
-  "description": "View GDSII chip layouts directly in VS Code",
+  "description": "View GDSII and OASIS chip layouts directly in VS Code",
   "version": "1.2.0",
   "icon": "images/logo.png",
   "engines": {
@@ -40,6 +40,12 @@
         "selector": [
           {
             "filenamePattern": "*.gds"
+          },
+          {
+            "filenamePattern": "*.oas"
+          },
+          {
+            "filenamePattern": "*.oasis"
           }
         ],
         "priority": "default"

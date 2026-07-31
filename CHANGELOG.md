@@ -1,5 +1,15 @@
 # Change Log
 
+## [Unreleased]
+
+- OASIS support: `.oas` and `.oasis` files open in the viewer alongside
+  `.gds`, going through the same flatten/triangulate/render path (gdstk's
+  `read_oas`, normalized to microns exactly like GDSII). Cell references,
+  repetitions, and the `.lyp` / marker-database features all work the same
+  way.
+- The format is detected from the file's header rather than its extension, so
+  a layout saved under an unexpected name still loads as the right format.
+
 ## [1.2.0] - 2026-07-20
 
 - Control panel migrated from dat.gui (unmaintained) to lil-gui. Same layout

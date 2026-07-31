@@ -5,9 +5,9 @@ see [`README.md`](README.md).
 
 ## Project layout
 
-- `src/extension.cjs` — the extension host (Node). Opens the `.gds` file,
-  streams its raw bytes into the webview, and relays the `.lyp` and marker
-  file pickers.
+- `src/extension.cjs` — the extension host (Node). Opens the layout file
+  (`.gds` / `.oas` / `.oasis`), streams its raw bytes into the webview, and
+  relays the `.lyp` and marker file pickers.
 - `src/viewer.html` / `src/viewer.js` — the webview: bootstraps the wasm
   module and wires up `postMessage` from the extension host.
 - `src/marker-parsers.js` — standalone parsers for DRC/LVS marker databases
@@ -15,13 +15,17 @@ see [`README.md`](README.md).
   `<script>` tag and `require()`d directly by the unit tests.
 - `src/wasm/` — C++ source (`bindings.cpp`, `renderer.cpp`, `gds_common.hpp`)
   compiled with Emscripten into `src/wasm/build/gdstk_wasm.js`, which does
-  GDS parsing and WebGL rendering. See `docs/rendering-rewrite.md` for the
-  design history of this C++/WASM architecture.
+  GDSII/OASIS parsing and WebGL rendering. Which of gdstk's two readers runs
+  is decided by sniffing the file header in `gds_common.hpp`, so no caller
+  has to know the format. See `docs/rendering-rewrite.md` for the design
+  history of this C++/WASM architecture.
 - `third_party/gdstk`, `third_party/qhull` — git submodules the wasm build
   links against.
-- `test/` — plain-Node tests (`npm test`): marker-parser unit tests plus a
-  headless smoke test that evals the built wasm bundle in Node (skipped when
-  `src/wasm/build/gdstk_wasm.js` hasn't been built).
+- `test/` — plain-Node tests (`npm test`): marker-parser unit tests plus
+  headless tests that eval the built wasm bundle in Node (skipped when
+  `src/wasm/build/gdstk_wasm.js` hasn't been built) covering marker state and
+  the GDSII/OASIS readers. `test/fixtures/sample_layout.{gds,oas}` are the
+  same KLayout-built design written in both formats.
 
 ## Building
 
@@ -43,7 +47,7 @@ submodules.
 ## Running
 
 Press `F5` in VS Code to launch an Extension Development Host with the
-extension loaded, then open a `.gds` file.
+extension loaded, then open a `.gds` or `.oas` file.
 
 ## Known issues
 
