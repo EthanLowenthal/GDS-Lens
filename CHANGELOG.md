@@ -10,6 +10,23 @@
 - The format is detected from the file's header rather than its extension, so
   a layout saved under an unexpected name still loads as the right format.
 
+- Load failures are now visible. They were being written to the upper-left
+  readout, which is hidden unless the debug-tools command has been run — so a
+  layout that failed to open left an empty canvas and no explanation. Errors
+  now show in a panel of their own, including when the failure happens before
+  the renderer starts.
+- Layouts too large to fit in memory report that, instead of a bare
+  "memory access out of bounds". The 32-bit WebAssembly module's memory
+  ceiling was also raised from Emscripten's default 2 GB to the 4 GB maximum
+  a wasm32 module can address, which roughly doubles the size of design that
+  opens successfully.
+- Files above 2 GB are declined up front with an explanation rather than
+  after a long stall, and a layout that can't be read at all (disk error,
+  unmounted share) now reports that instead of leaving the progress bar
+  spinning forever.
+- A design that parsed but was too big to upload to the GPU used to leave the
+  progress bar stuck at 100%; it now reports the failure.
+
 ## [1.2.0] - 2026-07-20
 
 - Control panel migrated from dat.gui (unmaintained) to lil-gui. Same layout

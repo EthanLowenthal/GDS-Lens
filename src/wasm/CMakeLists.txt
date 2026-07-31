@@ -94,6 +94,11 @@ target_link_options(gdstk_wasm PRIVATE
     -sEXPORT_NAME=createGdstkModule
     -sSINGLE_FILE=1
     -sALLOW_MEMORY_GROWTH=1
+    # Emscripten caps growth at 2GB by default; a big flattened layout hits
+    # that and dies with a bare "memory access out of bounds". 4GB is the most
+    # a wasm32 module can address, so this is the ceiling -- past it, loads
+    # fail with the explicit message wasm-worker.js produces.
+    -sMAXIMUM_MEMORY=4294967296
     -sENVIRONMENT=web,node
     -sEXPORTED_RUNTIME_METHODS=FS,ccall
     -sNO_EXIT_RUNTIME=1

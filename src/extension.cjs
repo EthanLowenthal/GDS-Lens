@@ -16,6 +16,20 @@ const LAST_LYP_PATH_KEY = 'GDS-Lens.lastLypPath';
 // design B would be noise.
 const MARKER_PATHS_KEY = 'GDS-Lens.markerPathByGds';
 
+// Hard ceiling on the raw file. The bytes have to be copied into the wasm
+// module's 32-bit heap (4 GB, see src/wasm/CMakeLists.txt) and the flattened
+// geometry built from them is always larger again, so a file this size cannot
+// load however patient you are -- better to say so up front than to spend
+// minutes copying it around first. Anything under this is attempted, and the
+// viewer reports an out-of-memory error if it doesn't fit after all.
+const MAX_LAYOUT_BYTES = 2 * 1024 * 1024 * 1024;
+
+function formatBytes(bytes) {
+    if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + ' GB';
+    if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(0) + ' MB';
+    return (bytes / 1024).toFixed(0) + ' KB';
+}
+
 function activate(context) {
     logger.show(true);
     logger.appendLine(">>> GDSII Extension Core Spinning Up (wasm parsing + rendering)...");
@@ -113,6 +127,7 @@ class GdsEditorProvider {
             const htmlPath = path.join(this.context.extensionPath, 'src', 'viewer.html');
             const jsPath = path.join(this.context.extensionPath, 'src', 'viewer.js');
             const markerParsersJsPath = path.join(this.context.extensionPath, 'src', 'marker-parsers.js');
+            const loadErrorsJsPath = path.join(this.context.extensionPath, 'src', 'load-errors.js');
             const wasmJsPath = path.join(this.context.extensionPath, 'src', 'wasm', 'build', 'gdstk_wasm.js');
             const lilGuiJsPath = path.join(this.context.extensionPath, 'src', 'vendor', 'lil-gui.umd.min.js');
             const workerJsPath = path.join(this.context.extensionPath, 'src', 'wasm-worker.js');
@@ -120,6 +135,7 @@ class GdsEditorProvider {
             // 3. Convert the native viewer.js/wasm file paths into authenticated Webview URIs
             const jsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(jsPath));
             const markerParsersJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(markerParsersJsPath));
+            const loadErrorsJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(loadErrorsJsPath));
             const wasmJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(wasmJsPath));
             const lilGuiJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(lilGuiJsPath));
 
@@ -140,8 +156,12 @@ class GdsEditorProvider {
             // from postMessage's RPC channel that routinely handles content
             // this size without issue (webviews load real HTML documents
             // with inline images/fonts far larger than this all the time).
+            // load-errors.js goes in too: the Worker calls describeLoadFailure
+            // when a parse dies, and it can't import from the main thread.
             const workerBundleBase64 = Buffer.from(
-                fs.readFileSync(wasmJsPath, 'utf8') + '\n' + fs.readFileSync(workerJsPath, 'utf8'),
+                fs.readFileSync(wasmJsPath, 'utf8') + '\n' +
+                fs.readFileSync(loadErrorsJsPath, 'utf8') + '\n' +
+                fs.readFileSync(workerJsPath, 'utf8'),
                 'utf8'
             ).toString('base64');
 
@@ -150,6 +170,7 @@ class GdsEditorProvider {
             htmlContent = htmlContent.replace('src="wasm/build/gdstk_wasm.js"', 'src="' + wasmJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="vendor/lil-gui.umd.min.js"', 'src="' + lilGuiJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="marker-parsers.js"', 'src="' + markerParsersJsWebviewUri.toString() + '"');
+            htmlContent = htmlContent.replace('src="load-errors.js"', 'src="' + loadErrorsJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="viewer.js"', 'src="' + jsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('{{cspSource}}', webviewPanel.webview.cspSource);
             htmlContent = htmlContent.replace('{{workerBundleBase64}}', workerBundleBase64);
@@ -161,7 +182,40 @@ class GdsEditorProvider {
             webviewPanel.onDidDispose(() => this.panels.delete(webviewPanel));
 
             logger.appendLine('\n>>> Intercepted layout open call for file: ' + document.uri.fsPath);
-            const fileData = await vscode.workspace.fs.readFile(document.uri);
+
+            // Size-check before reading: the read itself allocates the whole
+            // file, so on an oversized one this is the difference between an
+            // instant explanation and a long stall ending in a failure the
+            // webview never hears about (it would sit on the loading overlay
+            // forever, since 'init' is what starts its progress reporting).
+            const stat = await vscode.workspace.fs.stat(document.uri);
+            logger.appendLine('    file size: ' + formatBytes(stat.size));
+            if (stat.size > MAX_LAYOUT_BYTES) {
+                const message =
+                    `This layout is ${formatBytes(stat.size)}, past the ${formatBytes(MAX_LAYOUT_BYTES)} ` +
+                    `limit GDS Lens can load.\n\nThe viewer parses layouts in a 32-bit WebAssembly module, ` +
+                    `which has to hold the file and the geometry built from it in 4 GB of memory.`;
+                logger.appendLine('>>> Refusing oversized layout: ' + formatBytes(stat.size));
+                webviewPanel.webview.postMessage({ type: 'loadError', message: message });
+                vscode.window.showErrorMessage(`GDS Lens: layout is too large to open (${formatBytes(stat.size)}).`);
+                return;
+            }
+
+            let fileData;
+            try {
+                fileData = await vscode.workspace.fs.readFile(document.uri);
+            } catch (err) {
+                // Out of memory on a large-but-allowed file, a disk error, a
+                // vanished network mount -- the viewer is already showing its
+                // progress bar, so it needs telling either way.
+                logger.appendLine('>>> Failed to read layout: ' + err.stack);
+                webviewPanel.webview.postMessage({
+                    type: 'loadError',
+                    message: `Could not read ${path.basename(document.uri.fsPath)}: ${err.message}`
+                });
+                vscode.window.showErrorMessage('GDS Lens: could not read layout file: ' + err.message);
+                return;
+            }
 
             webviewPanel.webview.onDidReceiveMessage(async (message) => {
                 if (message.command === 'loadLypFile') {
@@ -235,6 +289,14 @@ class GdsEditorProvider {
             }
         } catch (err) {
             logger.appendLine('[FATAL CRASH ERROR] ' + err.stack);
+            // Best-effort: if the webview got far enough to render, it's
+            // sitting on the loading overlay waiting for bytes that are never
+            // coming, so give it something to show.
+            try {
+                webviewPanel.webview.postMessage({ type: 'loadError', message: err.message });
+            } catch {
+                // Panel already disposed -- the message box below is enough.
+            }
             vscode.window.showErrorMessage("GDSII Viewer Error: " + err.message);
         }
     }

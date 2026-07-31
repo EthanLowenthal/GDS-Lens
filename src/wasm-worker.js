@@ -115,7 +115,7 @@ self.onmessage = (event) => {
         console.log("[GDS worker] postMessage(gdsResult) call returned");
     }).catch((err) => {
         console.error("[GDS worker] createGdstkModule() chain rejected:", err, err && err.stack);
-        postMessage({type: "gdsResult", ok: false, error: `GDS worker failed: ${err && err.message ? err.message : err}`});
+        postMessage({type: "gdsResult", ok: false, error: describeLoadFailure(err, "Layout worker failed")});
     });
 };
 console.log("[GDS worker] onmessage handler registered, script finished top-level execution");

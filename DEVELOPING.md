@@ -49,6 +49,32 @@ submodules.
 Press `F5` in VS Code to launch an Extension Development Host with the
 extension loaded, then open a `.gds` or `.oas` file.
 
+## Layout size limits
+
+Parsing, flattening and triangulating all happen inside a 32-bit WebAssembly
+module, so everything has to fit in one 4 GB address space
+(`-sMAXIMUM_MEMORY` in `src/wasm/CMakeLists.txt` — Emscripten's default is
+only 2 GB). What that buys, measured against generated stress layouts:
+
+- **Flat geometry is the expensive case.** ~1 KB per polygon end to end
+  (gdstk polygon + triangulated vertices + the typed arrays handed to JS), so
+  a couple of million top-level polygons is the practical ceiling.
+- **Hierarchy is nearly free.** A cell placed at least `kInstanceThreshold`
+  (8) times anywhere in the design becomes a GPU instance batch — 24 bytes per
+  placement instead of a full geometry copy. A hierarchy that flattens to
+  115M polygons loads in ~2 GB; the same 4 GB budget is exhausted somewhere
+  under 1G.
+
+Past that the module aborts. The abort is a JS throw, so it's caught in
+`wasm-worker.js`, run through `describeLoadFailure` (`src/load-errors.js`) to
+turn engine strings like `memory access out of bounds` / `Aborted()` into an
+explanation, and shown in the viewer's `#loadError` panel. Files larger than
+`MAX_LAYOUT_BYTES` (2 GB) are refused by the extension host before they're
+even read, since the raw bytes alone have to be copied into that same heap.
+
+Note that `#ui` — the upper-left readout — is `display:none` outside debug
+mode, so it must never be the only place an error is written.
+
 ## Known issues
 
 - `eslint.config.mjs` imports `globals`, which isn't a declared dependency —
