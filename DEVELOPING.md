@@ -113,8 +113,8 @@ shell history.
 ### Releasing
 
 Bump `version` in `package.json`, update `CHANGELOG.md`, rebuild the wasm
-(`npm run build:wasm` — the built bundle is committed, and stale output ships
-silently), then:
+(`npm run build:wasm` — `src/wasm/build/` is gitignored, so the `.vsix` is
+packaged from whatever is on your disk and a stale build ships silently), then:
 
 ```sh
 npm run package       # -> GDS-Lens-<version>.vsix
@@ -160,9 +160,10 @@ steps:
 
 It deliberately does *not* fall back to a PAT if the exchange fails. The
 tradeoff is that releases must run in CI — `--oidc` cannot work from a laptop,
-since there is no Actions token to exchange. Note the wasm bundle is committed
-rather than built in CI, so a CI release publishes whatever
-`src/wasm/build/gdstk_wasm.js` was last committed.
+since there is no Actions token to exchange. Note that moving releases into CI
+is not just a matter of swapping the auth flag: `src/wasm/build/` is gitignored,
+so a CI runner has no bundle to package and would need the Emscripten SDK
+installed to build one.
 
 **`vsce publish --azure-credential`.** Available today, and the only documented
 replacement. Entra ID via workload identity federation: an Azure DevOps service

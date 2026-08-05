@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-05
+
+- GDS Lens is now published on [Open VSX](https://open-vsx.org/extension/ethml/GDS-Lens)
+  as well as the VS Code Marketplace, so it can be installed in Cursor,
+  Windsurf, VSCodium, code-server, Gitpod and Theia.
 - Layer outlines render substantially faster, most noticeably on large designs
   and when zoomed out. Each polygon's boundary was drawn as a `GL_LINE_LOOP`,
   with primitive-restart markers separating one polygon from the next. No
