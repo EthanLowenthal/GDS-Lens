@@ -1,5 +1,27 @@
 # Change Log
 
+## [Unreleased]
+
+- Layer outlines render substantially faster, most noticeably on large designs
+  and when zoomed out. Each polygon's boundary was drawn as a `GL_LINE_LOOP`,
+  with primitive-restart markers separating one polygon from the next. No
+  current GPU API has a line-loop primitive — not D3D11/12, not Vulkan, not
+  Metal — so every backend was emulating the topology and scanning the index
+  stream for restart boundaries. Outlines are now plain `GL_LINES` edge pairs,
+  which pass through unconverted everywhere. Output is visually identical; the
+  outline index buffers are roughly twice the size in exchange.
+- The debug readout now reports GPU memory usage, split into geometry (vertex,
+  index, and instance buffers, which grow with the design) and merge mode's
+  coverage mask (which grows with the window).
+- The load progress bar advances at a more even rate. Per-layer triangulation
+  cost spans orders of magnitude, and layers of similar cost tended to sit
+  next to each other, so the bar would sprint through a cheap run and then
+  appear to hang on an expensive one. All layers — static, label-only, and
+  each instance group's unit shape — now run as a single pass against one
+  denominator, in an interleaved order. The interleaving is seeded fixed, so a
+  given layout still triangulates in the same order every time, and the order
+  layers are emitted in is unchanged.
+
 ## [1.4.0] - 2026-07-31
 
 - Text labels: GDSII/OASIS `TEXT` elements now render, behind a "Text" toggle

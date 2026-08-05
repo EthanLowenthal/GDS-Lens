@@ -314,11 +314,12 @@ constexpr GLsizei kInstanceStrideFloats = 6;  // col0.xy, col1.xy, translate.xy
 
 // One pair of VBOs per layer (fill triangles + outline points) holding all
 // of that layer's non-instanced polygons back-to-back, plus per-polygon
-// (first, count) ranges so each polygon still draws as its own primitive
-// group -- LINE_LOOP loops can't be naively concatenated (the loop-closing
-// edge would connect unrelated polygons), and triangle fans from ear-clipping
-// are similarly per-polygon. Repeated references on this layer are drawn
-// separately via instanced_batches instead of being flattened in here.
+// (first, count) ranges so each polygon's boundary can be expanded into its
+// own closed ring of GL_LINES edges (a shared vertex buffer alone doesn't say
+// where one polygon's boundary ends and the next begins), and triangle fans
+// from ear-clipping are similarly per-polygon. Repeated references on this
+// layer are drawn separately via instanced_batches instead of being flattened
+// in here.
 // One flattened GDSII/OASIS label: its world-space origin (the reference tree
 // is already applied -- see collect_instanced), the text itself, and the
 // anchor telling which corner/edge of the text box that origin is. Kept
@@ -345,10 +346,11 @@ struct LayerBuffer {
     uint64_t tag() const { return make_tag(layer, datatype); }
     GLuint outline_vbo = 0;
     GLuint fill_vbo = 0;
-    // Index buffer over outline_vbo, one GL_LINE_LOOP per polygon joined by
-    // restart markers (see kRestartIndex) -- lets draw_frame draw every
-    // outline polygon on the layer in a single glDrawElements call when the
-    // whole layer is on screen, instead of one glDrawArrays per polygon.
+    // Index buffer over outline_vbo, holding every polygon's boundary as
+    // explicit GL_LINES edge pairs (see upload_geometry) -- lets draw_frame
+    // draw every outline polygon on the layer in a single glDrawElements call
+    // when the whole layer is on screen, instead of one glDrawArrays per
+    // polygon.
     GLuint outline_ebo = 0;
     GLsizei outline_index_count = 0;
     // Total vertex count in fill_vbo -- triangle lists have no loop-closing
@@ -385,6 +387,40 @@ struct LayerBuffer {
 // GL_PRIMITIVE_RESTART capability to glEnable and no way to disable it, so
 // no setup call is needed beyond using this value.
 constexpr uint32_t kRestartIndex = 0xFFFFFFFFu;
+
+// GPU memory accounting behind the #renderStats readout (see
+// update_render_stats). WebGL exposes no way to query driver-side allocation,
+// so this tracks what we asked for: every glBufferData in this file goes
+// through buffer_data_tracked and every glDeleteBuffers through
+// delete_buffer_tracked, keyed on the buffer name so the running total stays
+// right in the two cases a naive "add on upload" counter gets wrong --
+// re-uploading into an existing name (glBufferData replaces the old
+// allocation rather than adding to it), and clear_layers deleting the same
+// InstancedBatch buffer once per layer that shares it (only the first erase
+// finds anything). It counts requested byte sizes, so it excludes driver
+// padding, the shader/program objects, and the default framebuffer.
+std::unordered_map<GLuint, size_t> g_buffer_bytes;
+uint64_t g_gpu_buffer_bytes = 0;
+// Merge mode's coverage mask (see resize_canvas) -- the one texture big
+// enough to matter, and it resizes with the window rather than the design.
+uint64_t g_mask_tex_bytes = 0;
+
+void buffer_data_tracked(GLenum target, GLuint name, GLsizeiptr size, const void* data, GLenum usage) {
+    glBufferData(target, size, data, usage);
+    size_t& slot = g_buffer_bytes[name];
+    g_gpu_buffer_bytes -= slot;
+    slot = (size_t)size;
+    g_gpu_buffer_bytes += slot;
+}
+
+void delete_buffer_tracked(GLuint* name) {
+    auto it = g_buffer_bytes.find(*name);
+    if (it != g_buffer_bytes.end()) {
+        g_gpu_buffer_bytes -= it->second;
+        g_buffer_bytes.erase(it);
+    }
+    glDeleteBuffers(1, name);
+}
 
 // Parsed out of a single <properties>/<group-members> block in a .lyp file.
 // Keyed in g_lyp_info by the (layer, datatype) Tag it applies to. Persists
@@ -1286,7 +1322,8 @@ void draw_measure_line() {
     }
     if (!g_measure_vbo) glGenBuffers(1, &g_measure_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_measure_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(count * sizeof(float)), verts, GL_DYNAMIC_DRAW);
+    buffer_data_tracked(GL_ARRAY_BUFFER, g_measure_vbo, (GLsizeiptr)(count * sizeof(float)), verts,
+                        GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(g_loc_position);
     glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
     glUniform4f(g_loc_color, 1.0f, 1.0f, 1.0f, 0.95f);
@@ -1306,7 +1343,7 @@ bool marker_item_visible(uint32_t item_id) {
 void delete_marker_gl_buffers() {
     auto del = [](GLuint& buf) {
         if (buf) {
-            glDeleteBuffers(1, &buf);
+            delete_buffer_tracked(&buf);
             buf = 0;
         }
     };
@@ -1406,28 +1443,30 @@ void rebuild_marker_buffers() {
     auto upload = [](GLuint& vbo, const std::vector<float>& data) {
         if (data.empty()) {
             if (vbo) {
-                glDeleteBuffers(1, &vbo);
+                delete_buffer_tracked(&vbo);
                 vbo = 0;
             }
             return;
         }
         if (!vbo) glGenBuffers(1, &vbo);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(data.size() * sizeof(float)), data.data(), GL_STATIC_DRAW);
+        buffer_data_tracked(GL_ARRAY_BUFFER, vbo, (GLsizeiptr)(data.size() * sizeof(float)), data.data(),
+                            GL_STATIC_DRAW);
     };
 
     upload(g_marker_outline_vbo, outline_verts);
     if (outline_verts.empty()) {
         if (g_marker_outline_ebo) {
-            glDeleteBuffers(1, &g_marker_outline_ebo);
+            delete_buffer_tracked(&g_marker_outline_ebo);
             g_marker_outline_ebo = 0;
         }
         g_marker_outline_index_count = 0;
     } else {
         if (!g_marker_outline_ebo) glGenBuffers(1, &g_marker_outline_ebo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_marker_outline_ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)),
-                     outline_indices.data(), GL_STATIC_DRAW);
+        buffer_data_tracked(GL_ELEMENT_ARRAY_BUFFER, g_marker_outline_ebo,
+                            (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)), outline_indices.data(),
+                            GL_STATIC_DRAW);
         g_marker_outline_index_count = (GLsizei)outline_indices.size();
     }
     upload(g_marker_fill_vbo, fill_verts);
@@ -1466,7 +1505,8 @@ void build_marker_ticks() {
     }
     if (!g_marker_tick_vbo) glGenBuffers(1, &g_marker_tick_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_marker_tick_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ticks.size() * sizeof(float)), ticks.data(), GL_DYNAMIC_DRAW);
+    buffer_data_tracked(GL_ARRAY_BUFFER, g_marker_tick_vbo, (GLsizeiptr)(ticks.size() * sizeof(float)),
+                        ticks.data(), GL_DYNAMIC_DRAW);
     g_marker_tick_vertex_count = (GLsizei)(ticks.size() / 2);
     g_marker_tick_zoom = g_zoom;
 }
@@ -1538,13 +1578,25 @@ bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, co
 // layer-level visibility/bbox skip in draw_frame -- there's no per-polygon
 // culling anymore, so every drawn layer's polygons are all visible.
 void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers_total) {
-    char buf[320];
+    char buf[448];
     int len = snprintf(buf, sizeof(buf), "Visible: %llu / %llu polygons<br>Render: no culling (%d / %d layers on screen)",
              (unsigned long long)visible_polygons, (unsigned long long)g_total_polygons, layers_drawn, layers_total);
     if (g_total_labels > 0 && len > 0 && (size_t)len < sizeof(buf)) {
         len += snprintf(buf + len, sizeof(buf) - (size_t)len, "<br>Labels: %llu / %llu drawn",
                         (unsigned long long)(g_show_text ? g_labels_drawn : 0),
                         (unsigned long long)g_total_labels);
+    }
+    // GPU memory we asked the driver for, split into the part that scales with
+    // the design (vertex/index/instance buffers) and the part that scales with
+    // the window (merge mode's coverage mask) -- they grow for unrelated
+    // reasons, so a single total hides which one is moving. Actual driver
+    // usage is higher and unqueryable from WebGL; see g_gpu_buffer_bytes.
+    if (len > 0 && (size_t)len < sizeof(buf)) {
+        const double mb = 1024.0 * 1024.0;
+        len += snprintf(buf + len, sizeof(buf) - (size_t)len,
+                        "<br>GPU: %.1f MB (geom %.1f + mask %.1f)",
+                        (double)(g_gpu_buffer_bytes + g_mask_tex_bytes) / mb, (double)g_gpu_buffer_bytes / mb,
+                        (double)g_mask_tex_bytes / mb);
     }
     // Frame time is only measured across back-to-back frames (see
     // draw_frame); before any interaction there's nothing meaningful to show.
@@ -1613,8 +1665,8 @@ void rebuild_text_buffer() {
     if (!vertices.empty()) {
         if (!g_text_vbo) glGenBuffers(1, &g_text_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, g_text_vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertices.size() * sizeof(float)), vertices.data(),
-                     GL_DYNAMIC_DRAW);
+        buffer_data_tracked(GL_ARRAY_BUFFER, g_text_vbo, (GLsizeiptr)(vertices.size() * sizeof(float)),
+                            vertices.data(), GL_DYNAMIC_DRAW);
     }
     g_text_dirty = false;
     g_text_built_min_x = region.min_x;
@@ -1861,13 +1913,13 @@ bool draw_frame(double time, void* /*userData*/) {
             glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
             glUniform4fv(g_loc_color, 1, layer.frame_color.data());
             glUniform1f(g_loc_use_hatch, 0.0f);
-            // outline_ebo strings every polygon's LINE_LOOP together with
-            // primitive-restart markers (kRestartIndex) -- WebGL2 always
-            // honors these for indexed draws, so this one glDrawElements
-            // call draws every outline polygon on the layer without
-            // connecting unrelated polygons' loop-closing edges.
+            // outline_ebo holds every polygon's boundary as explicit edge
+            // pairs (see upload_geometry), so this one glDrawElements call
+            // draws every outline polygon on the layer. Each edge is its own
+            // independent primitive, so unrelated polygons can't get
+            // connected and no restart markers are needed.
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
-            glDrawElements(GL_LINE_LOOP, layer.outline_index_count, GL_UNSIGNED_INT, 0);
+            glDrawElements(GL_LINES, layer.outline_index_count, GL_UNSIGNED_INT, 0);
         }
 
         // Reused cells: one unique unit shape drawn instance_count times,
@@ -1900,7 +1952,7 @@ bool draw_frame(double time, void* /*userData*/) {
                 glUniform4fv(g_loc_color, 1, layer.frame_color.data());
                 glUniform1f(g_loc_use_hatch, 0.0f);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
-                glDrawElementsInstanced(GL_LINE_LOOP, batch.outline_index_count, GL_UNSIGNED_INT, 0,
+                glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
                                         batch.instance_count);
             }
 
@@ -1946,6 +1998,9 @@ void resize_canvas() {
         glBindTexture(GL_TEXTURE_2D, g_mask_tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width * g_mask_scale, height * g_mask_scale, 0, GL_RED,
                      GL_UNSIGNED_BYTE, nullptr);
+        // R8 is one byte per texel; the mask is allocated whether or not merge
+        // mode is on, so this counts unconditionally (see g_mask_tex_bytes).
+        g_mask_tex_bytes = (uint64_t)(width * g_mask_scale) * (uint64_t)(height * g_mask_scale);
         // Merge mode failing at the FBO level shows as a blank canvas with no
         // other symptom (the mask reads all-zero and the composite discards
         // everything) -- check loudly here instead. Never triggered on a
@@ -1968,14 +2023,14 @@ void resize_canvas() {
 
 void clear_layers() {
     for (LayerBuffer& layer : g_layers) {
-        if (layer.outline_vbo) glDeleteBuffers(1, &layer.outline_vbo);
-        if (layer.outline_ebo) glDeleteBuffers(1, &layer.outline_ebo);
-        if (layer.fill_vbo) glDeleteBuffers(1, &layer.fill_vbo);
+        if (layer.outline_vbo) delete_buffer_tracked(&layer.outline_vbo);
+        if (layer.outline_ebo) delete_buffer_tracked(&layer.outline_ebo);
+        if (layer.fill_vbo) delete_buffer_tracked(&layer.fill_vbo);
         for (InstancedBatch& batch : layer.instanced_batches) {
-            if (batch.fill_vbo) glDeleteBuffers(1, &batch.fill_vbo);
-            if (batch.outline_vbo) glDeleteBuffers(1, &batch.outline_vbo);
-            if (batch.outline_ebo) glDeleteBuffers(1, &batch.outline_ebo);
-            if (batch.instance_vbo) glDeleteBuffers(1, &batch.instance_vbo);
+            if (batch.fill_vbo) delete_buffer_tracked(&batch.fill_vbo);
+            if (batch.outline_vbo) delete_buffer_tracked(&batch.outline_vbo);
+            if (batch.outline_ebo) delete_buffer_tracked(&batch.outline_ebo);
+            if (batch.instance_vbo) delete_buffer_tracked(&batch.instance_vbo);
         }
     }
     g_layers.clear();
@@ -2705,6 +2760,41 @@ void attach_labels(val& layer_entry, const std::vector<CollectedLabel>& labels, 
     layer_entry.set("textAnchors", to_uint8_array(anchors));
 }
 
+// One layer's worth of build_layer_entry work, queued so that all of it --
+// static layers, label-only layers, and every instance group's unit shape --
+// can be run as a single pass with one honest progress denominator (see
+// parseGdsToLayers). polys stays owned by the map the job was queued from;
+// build_layer_entry frees the polygons out of it.
+struct LayerJob {
+    uint64_t tag = 0;
+    std::vector<Polygon*>* polys = nullptr;
+    val entry = val::undefined();
+    uint64_t polygon_count = 0;
+    double min_x = HUGE_VAL, max_x = -HUGE_VAL, min_y = HUGE_VAL, max_y = -HUGE_VAL;
+};
+
+// Shuffles the *order jobs are run in* (not the order their results are
+// emitted in) so the progress bar advances at a roughly even rate. Per-layer
+// triangulation cost spans orders of magnitude -- a routing layer with a
+// million small polygons against a handful of big filled shapes -- and both
+// the queue order and the hash order behind it keep related, similarly
+// expensive layers adjacent, so a straight walk sprints through the cheap
+// run and then stalls on the expensive one. Interleaving them makes elapsed
+// time track the fraction reported. The seed is fixed, so a given layout
+// always triangulates in the same order.
+void shuffle_run_order(std::vector<size_t>& order) {
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+    auto next = [&state]() {  // splitmix64
+        uint64_t z = (state += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    };
+    for (size_t i = order.size(); i > 1; i--) {
+        std::swap(order[i - 1], order[(size_t)(next() % i)]);
+    }
+}
+
 // Result of uploading one {outlineVertices,outlineRanges,fillVertices,
 // fillRanges} JS entry (as produced by build_layer_entry) to fresh GL
 // buffers -- shared by both uploadLayers' static per-layer path and its
@@ -2765,11 +2855,22 @@ UploadedGeometry upload_geometry(val entry) {
 
     val outline_ranges = entry["outlineRanges"];
     unsigned outline_range_count = outline_ranges["length"].as<unsigned>();
-    // Indices for outline_ebo: each polygon's vertex range followed by a
-    // restart marker, so the whole layer/batch can be drawn as one
-    // GL_LINE_LOOP glDraw(Elements|ElementsInstanced) call (see draw_frame).
+    // Indices for outline_ebo: each polygon's boundary expanded into explicit
+    // GL_LINES edge pairs -- (v0,v1), (v1,v2) ... (vN-1,v0), with the closing
+    // edge written out rather than implied. Costs ~2 indices per vertex
+    // instead of ~1, and in exchange the whole layer/batch still draws in one
+    // glDraw(Elements|ElementsInstanced) call (see draw_frame), with no
+    // restart markers and no line-loop topology.
+    //
+    // This used to be restart-joined GL_LINE_LOOPs, which is a worse deal than
+    // the index count suggests: no modern GPU API has a line-loop primitive
+    // (not D3D11/12, not Vulkan, not Metal -- it is an OpenGL legacy topology
+    // that survived into GLES 3.0 and hence WebGL2), so ANGLE has to
+    // synthesize the closing edge on every backend, and the restart markers
+    // additionally force it to scan the index stream for topology breaks. A
+    // plain line list passes through unconverted everywhere.
     std::vector<uint32_t> outline_indices;
-    outline_indices.reserve(outline_vertices.size() / 2 + outline_range_count);
+    outline_indices.reserve(outline_vertices.size());
     for (unsigned r = 0; r < outline_range_count; r++) {
         val range = outline_ranges[r];
         uint32_t first = range[0].as<uint32_t>();
@@ -2779,30 +2880,36 @@ UploadedGeometry upload_geometry(val entry) {
         g.max_x = std::max(g.max_x, pr.max_x);
         g.min_y = std::min(g.min_y, pr.min_y);
         g.max_y = std::max(g.max_y, pr.max_y);
-        for (uint32_t k = 0; k < count; k++) outline_indices.push_back(first + k);
-        outline_indices.push_back(kRestartIndex);
+        // A degenerate single-point range has no edge to draw; the loop below
+        // would emit the zero-length pair (v0,v0) for it.
+        if (count < 2) continue;
+        for (uint32_t k = 0; k < count; k++) {
+            outline_indices.push_back(first + k);
+            outline_indices.push_back(first + (k + 1 == count ? 0 : k + 1));
+        }
     }
     g.polygon_count = outline_range_count;
     g.fill_vertex_count = (GLsizei)(fill_vertices.size() / 2);
 
     glGenBuffers(1, &g.outline_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g.outline_vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(outline_vertices.size() * sizeof(float)), outline_vertices.data(),
-                GL_STATIC_DRAW);
+    buffer_data_tracked(GL_ARRAY_BUFFER, g.outline_vbo, (GLsizeiptr)(outline_vertices.size() * sizeof(float)),
+                        outline_vertices.data(), GL_STATIC_DRAW);
 
     if (!outline_indices.empty()) {
         glGenBuffers(1, &g.outline_ebo);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.outline_ebo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)),
-                    outline_indices.data(), GL_STATIC_DRAW);
+        buffer_data_tracked(GL_ELEMENT_ARRAY_BUFFER, g.outline_ebo,
+                            (GLsizeiptr)(outline_indices.size() * sizeof(uint32_t)), outline_indices.data(),
+                            GL_STATIC_DRAW);
         g.outline_index_count = (GLsizei)outline_indices.size();
     }
 
     if (!fill_vertices.empty()) {
         glGenBuffers(1, &g.fill_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, g.fill_vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(fill_vertices.size() * sizeof(float)), fill_vertices.data(),
-                    GL_STATIC_DRAW);
+        buffer_data_tracked(GL_ARRAY_BUFFER, g.fill_vbo, (GLsizeiptr)(fill_vertices.size() * sizeof(float)),
+                            fill_vertices.data(), GL_STATIC_DRAW);
     }
 
     return g;
@@ -2901,49 +3008,72 @@ val parseGdsToLayers(const std::string& path) {
     uint64_t total_polygons = 0;
 
     val layers = val::array();
-    uint64_t layer_index = 0;
-    uint64_t layer_total = by_layer_static.size();
-    for (const auto& kv : groups) layer_total += kv.second.by_layer_unit.size();
+
+    // Queue every layer that needs triangulating -- static ones first, then
+    // label-only ones, then each instance group's unit shape -- and build
+    // them all in one shuffled pass below. Queue order is the order results
+    // are emitted in (and so the order layers stack in), which is why the
+    // shuffle permutes a separate index list rather than the jobs themselves.
+    std::vector<LayerJob> jobs;
+    std::vector<Polygon*> no_polygons;  // label-only layers: text, no geometry
+    auto queue_job = [&jobs](uint64_t tag, std::vector<Polygon*>& polys) {
+        LayerJob job;
+        job.tag = tag;
+        job.polys = &polys;
+        jobs.push_back(job);
+    };
+
+    for (auto& entry : by_layer_static) queue_job(entry.first, entry.second);
+    size_t static_end = jobs.size();
+
     // Tags that only ever appear as labels still become layers of their own
     // (real decks do put pin text on a texttype with no geometry on it).
-    for (const auto& kv : labels.by_tag) {
-        if (by_layer_static.count(kv.first) == 0) layer_total++;
+    for (auto& kv : labels.by_tag) {
+        if (by_layer_static.count(kv.first) == 0) queue_job(kv.first, no_polygons);
+    }
+    size_t label_only_end = jobs.size();
+
+    // Each group's jobs occupy jobs[cursor, end) -- the end index recorded
+    // here, the cursor walked forward as the group loop below consumes them.
+    std::vector<std::pair<InstanceGroupPolys*, size_t>> group_job_ends;
+    for (auto& kv : groups) {
+        for (auto& entry : kv.second.by_layer_unit) queue_job(entry.first, entry.second);
+        group_job_ends.emplace_back(&kv.second, jobs.size());
+    }
+
+    std::vector<size_t> run_order(jobs.size());
+    for (size_t i = 0; i < run_order.size(); i++) run_order[i] = i;
+    shuffle_run_order(run_order);
+
+    uint64_t layer_index = 0;
+    for (size_t i : run_order) {
+        LayerJob& job = jobs[i];
+        job.entry = build_layer_entry(job.tag, *job.polys, job.polygon_count, job.min_x, job.max_x, job.min_y,
+                                      job.max_y);
+        layer_index++;
+        report_progress("triangulating", layer_index, jobs.size());
     }
 
     const std::vector<CollectedLabel> kNoLabels;
-    for (auto& entry : by_layer_static) {
-        uint64_t layer_polygon_count = 0;
-        double lmin_x, lmax_x, lmin_y, lmax_y;
-        val layer_entry = build_layer_entry(entry.first, entry.second, layer_polygon_count, lmin_x, lmax_x, lmin_y, lmax_y);
-        if (layer_polygon_count > 0 && lmin_x <= lmax_x) {
-            min_x = std::min(min_x, lmin_x);
-            max_x = std::max(max_x, lmax_x);
-            min_y = std::min(min_y, lmin_y);
-            max_y = std::max(max_y, lmax_y);
+    for (size_t i = 0; i < static_end; i++) {
+        LayerJob& job = jobs[i];
+        if (job.polygon_count > 0 && job.min_x <= job.max_x) {
+            min_x = std::min(min_x, job.min_x);
+            max_x = std::max(max_x, job.max_x);
+            min_y = std::min(min_y, job.min_y);
+            max_y = std::max(max_y, job.max_y);
         }
-        auto label_it = labels.by_tag.find(entry.first);
-        attach_labels(layer_entry, label_it != labels.by_tag.end() ? label_it->second : kNoLabels, min_x, max_x,
+        auto label_it = labels.by_tag.find(job.tag);
+        attach_labels(job.entry, label_it != labels.by_tag.end() ? label_it->second : kNoLabels, min_x, max_x,
                       min_y, max_y);
-        total_polygons += layer_polygon_count;
-        layers.call<void>("push", layer_entry);
-
-        layer_index++;
-        report_progress("triangulating", layer_index, layer_total);
+        total_polygons += job.polygon_count;
+        layers.call<void>("push", job.entry);
     }
 
-    // Label-only layers: no polygons to build, just the text.
-    for (auto& kv : labels.by_tag) {
-        if (by_layer_static.count(kv.first) > 0) continue;
-        uint64_t layer_polygon_count = 0;
-        double lmin_x, lmax_x, lmin_y, lmax_y;
-        std::vector<Polygon*> no_polygons;
-        val layer_entry =
-            build_layer_entry(kv.first, no_polygons, layer_polygon_count, lmin_x, lmax_x, lmin_y, lmax_y);
-        attach_labels(layer_entry, kv.second, min_x, max_x, min_y, max_y);
-        layers.call<void>("push", layer_entry);
-
-        layer_index++;
-        report_progress("triangulating", layer_index, layer_total);
+    for (size_t i = static_end; i < label_only_end; i++) {
+        LayerJob& job = jobs[i];
+        attach_labels(job.entry, labels.by_tag.find(job.tag)->second, min_x, max_x, min_y, max_y);
+        layers.call<void>("push", job.entry);
     }
 
     // Each instance group becomes one JS entry: a flat per-instance affine
@@ -2954,30 +3084,26 @@ val parseGdsToLayers(const std::string& path) {
     // simple min/max of translations isn't enough) -- used both to grow the
     // design bbox here and, on the main thread, each touched layer's cull box.
     val instance_groups_js = val::array();
-    for (auto& kv : groups) {
-        InstanceGroupPolys& group = kv.second;
+    size_t group_job_cursor = label_only_end;
+    for (auto& gr : group_job_ends) {
+        InstanceGroupPolys& group = *gr.first;
         double group_min_x = HUGE_VAL, group_max_x = -HUGE_VAL;
         double group_min_y = HUGE_VAL, group_max_y = -HUGE_VAL;
         val group_layers = val::array();
         uint64_t unit_polygon_count_sum = 0;
 
-        for (auto& entry : group.by_layer_unit) {
-            uint64_t layer_polygon_count = 0;
-            double lmin_x, lmax_x, lmin_y, lmax_y;
-            val layer_entry =
-                build_layer_entry(entry.first, entry.second, layer_polygon_count, lmin_x, lmax_x, lmin_y, lmax_y);
-            if (layer_polygon_count > 0 && lmin_x <= lmax_x) {
-                group_min_x = std::min(group_min_x, lmin_x);
-                group_max_x = std::max(group_max_x, lmax_x);
-                group_min_y = std::min(group_min_y, lmin_y);
-                group_max_y = std::max(group_max_y, lmax_y);
+        for (size_t i = group_job_cursor; i < gr.second; i++) {
+            LayerJob& job = jobs[i];
+            if (job.polygon_count > 0 && job.min_x <= job.max_x) {
+                group_min_x = std::min(group_min_x, job.min_x);
+                group_max_x = std::max(group_max_x, job.max_x);
+                group_min_y = std::min(group_min_y, job.min_y);
+                group_max_y = std::max(group_max_y, job.max_y);
             }
-            unit_polygon_count_sum += layer_polygon_count;
-            group_layers.call<void>("push", layer_entry);
-
-            layer_index++;
-            report_progress("triangulating", layer_index, layer_total);
+            unit_polygon_count_sum += job.polygon_count;
+            group_layers.call<void>("push", job.entry);
         }
+        group_job_cursor = gr.second;
 
         uint64_t instance_count = group.instances.size();
         total_polygons += unit_polygon_count_sum * instance_count;
@@ -3131,8 +3257,8 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
         GLuint instance_vbo = 0;
         glGenBuffers(1, &instance_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(instances.size() * sizeof(float)), instances.data(),
-                     GL_STATIC_DRAW);
+        buffer_data_tracked(GL_ARRAY_BUFFER, instance_vbo, (GLsizeiptr)(instances.size() * sizeof(float)),
+                            instances.data(), GL_STATIC_DRAW);
 
         val group_layers = group["layers"];
         unsigned group_layer_count = group_layers["length"].as<unsigned>();
