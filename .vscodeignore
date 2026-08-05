@@ -19,3 +19,9 @@ src/wasm/build/cmake_install.cmake
 **/.vscode-test.*
 scripts/**
 .env.publish*
+
+# Internal docs — README.md, CHANGELOG.md and LICENCE.md still ship (vsce
+# surfaces those on the listing); everything else is for contributors only.
+DEVELOPING.md
+LYP_SPEC_GAPS.md
+KLAYOUT_RENDERER_COMPARISON.md
