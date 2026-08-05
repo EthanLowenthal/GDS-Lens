@@ -17,3 +17,5 @@ src/wasm/build/cmake_install.cmake
 **/*.map
 **/eslint.config.mjs
 **/.vscode-test.*
+scripts/**
+.env.publish*

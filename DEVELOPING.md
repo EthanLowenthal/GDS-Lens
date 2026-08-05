@@ -75,6 +75,109 @@ even read, since the raw bytes alone have to be copied into that same heap.
 Note that `#ui` — the upper-left readout — is `display:none` outside debug
 mode, so it must never be the only place an error is written.
 
+## Publishing
+
+The extension goes to two registries: the **VS Code Marketplace** (VS Code
+proper) and **Open VSX** (Cursor, Windsurf, VSCodium, code-server, Gitpod,
+Theia). Both should ship the same build.
+
+### One-time setup
+
+Copy [`.env.publish.example`](.env.publish.example) to `.env.publish` and fill
+in both tokens. That file is gitignored and excluded from the packaged `.vsix`
+via `.vscodeignore`; `scripts/with-env.sh` loads it so no token ever lands in
+shell history.
+
+- `VSCE_PAT` — an Azure DevOps personal access token, scoped **Marketplace →
+  Manage**, with organization set to **All accessible organizations**. Azure
+  caps PAT lifetime at one year, so this expires and has to be reissued.
+
+  > **Deadline: 1 December 2026.** Azure DevOps retires *global* PATs on that
+  > date — and "All accessible organizations" is exactly what makes this one
+  > global, so `VSCE_PAT` publishing stops working then. See
+  > [Migrating off `VSCE_PAT`](#migrating-off-vsce_pat) below. `OVSX_PAT` is an
+  > Eclipse token and is unaffected.
+- `OVSX_PAT` — from your open-vsx.org profile. Before the first publish you
+  must sign the Eclipse Publisher Agreement (with an Eclipse account whose
+  email matches your GitHub account) and claim the namespace, which has to
+  match `publisher` in `package.json`:
+
+  ```sh
+  sh scripts/with-env.sh npx ovsx create-namespace ethml
+  ```
+
+  The namespace starts unverified, which shows a warning on the listing;
+  ownership verification is requested via an issue on the
+  `EclipseFdn/open-vsx.org` repo.
+
+### Releasing
+
+Bump `version` in `package.json`, update `CHANGELOG.md`, rebuild the wasm
+(`npm run build:wasm` — the built bundle is committed, and stale output ships
+silently), then:
+
+```sh
+npm run package       # -> GDS-Lens-<version>.vsix
+npm run publish:all   # package + both registries
+```
+
+`publish:vsce` and `publish:ovsx` can be run individually; both publish the
+prebuilt `GDS-Lens-<version>.vsix` rather than repackaging, so the two
+registries get byte-identical artifacts.
+
+Marketplace metadata (`displayName`, `description`, `categories`, `keywords`,
+`galleryBanner`) only takes effect on the next publish — editing it without
+shipping a new version changes nothing on the listing.
+
+### Migrating off `VSCE_PAT`
+
+Global PATs stop working on 1 December 2026. Two replacements exist; only the
+Marketplace side is affected, so Open VSX keeps using `OVSX_PAT` either way.
+
+**`vsce publish --oidc` — the intended target, but NOT YET RELEASED.** As of
+vsce 3.9.2 this flag does not exist (`unknown option '--oidc'`); it is
+documented only on the vsce `main` branch README. Re-check with
+`npx @vscode/vsce publish --help | grep oidc` before planning around it.
+
+When it ships, it publishes from GitHub Actions with no stored Marketplace
+secret at all: the workflow requests a GitHub OIDC token for the
+`marketplace.visualstudio.com` audience and exchanges it for a short-lived
+credential. Setup is a trusted-publishing policy on the Marketplace naming this
+repo and workflow, plus `id-token: write` on the job:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+steps:
+  - uses: actions/checkout@v4
+  - uses: actions/setup-node@v4
+    with:
+      node-version: 22
+  - run: npm ci
+  - run: npx @vscode/vsce publish --oidc
+```
+
+It deliberately does *not* fall back to a PAT if the exchange fails. The
+tradeoff is that releases must run in CI — `--oidc` cannot work from a laptop,
+since there is no Actions token to exchange. Note the wasm bundle is committed
+rather than built in CI, so a CI release publishes whatever
+`src/wasm/build/gdstk_wasm.js` was last committed.
+
+**`vsce publish --azure-credential`.** Available today, and the only documented
+replacement. Entra ID via workload identity federation: an Azure DevOps service
+connection, a user-assigned managed identity in Azure with a Reader role,
+federated credentials exchanged between the two, the identity added as a
+Contributor member of the Marketplace publisher, and an Azure Pipelines job that
+mints an Entra token. It assumes an Azure subscription and Azure Pipelines,
+neither of which this project uses — disproportionate for a solo extension.
+
+**Plan of record:** stay on `VSCE_PAT` for now, and re-check `--oidc` around
+Q3 2026. Microsoft needs a GitHub Actions story before retiring PATs on
+1 December 2026, and `--oidc` already exists on `main`, so it is very likely to
+ship in time. If it has not shipped by ~November 2026, fall back to
+`--azure-credential`.
+
 ## Known issues
 
 - `eslint.config.mjs` imports `globals`, which isn't a declared dependency —

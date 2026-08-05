@@ -1,9 +1,35 @@
 {
   "name": "GDS-Lens",
-  "displayName": "GDS Lens",
-  "description": "View GDSII and OASIS chip layouts directly in VS Code",
+  "displayName": "GDS Lens — GDSII & OASIS Layout Viewer",
+  "description": "View GDSII and OASIS chip layouts directly in VS Code, with KLayout .lyp colors and DRC/LVS marker browsing",
   "version": "1.4.0",
   "icon": "images/logo.png",
+  "license": "MIT",
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "gdsii",
+    "gds",
+    "oasis",
+    "klayout",
+    "vlsi",
+    "eda",
+    "asic",
+    "ic-layout",
+    "chip-design",
+    "semiconductor",
+    "silicon",
+    "photonics",
+    "drc",
+    "lvs",
+    "tapeout"
+  ],
+  "galleryBanner": {
+    "color": "#0f1720",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.125.0"
   },
@@ -11,7 +37,11 @@
   "publisher": "ethml",
   "scripts": {
     "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "package": "npx @vscode/vsce package -o GDS-Lens-$npm_package_version.vsix",
+    "publish:vsce": "sh scripts/with-env.sh npx @vscode/vsce publish --packagePath GDS-Lens-$npm_package_version.vsix",
+    "publish:ovsx": "sh scripts/with-env.sh npx ovsx publish GDS-Lens-$npm_package_version.vsix",
+    "publish:all": "npm run package && npm run publish:vsce && npm run publish:ovsx"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -25,6 +55,10 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/EthanLowenthal/GDS-Lens"
+  },
+  "homepage": "https://github.com/EthanLowenthal/GDS-Lens#readme",
+  "bugs": {
+    "url": "https://github.com/EthanLowenthal/GDS-Lens/issues"
   },
   "contributes": {
     "commands": [
