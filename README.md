@@ -1,6 +1,7 @@
 # GDS Lens
 
-[View  GDS Lens on Marketplace](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
+[View GDS Lens on the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
+| [View GDS Lens on Open VSX](https://open-vsx.org/extension/ethml/GDS-Lens)
 
 A VS Code extension that adds a custom editor for `.gds` (GDSII) and `.oas` /
 `.oasis` (OASIS) layout files: open one and it's parsed and rendered in a
