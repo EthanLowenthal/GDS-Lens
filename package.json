@@ -65,6 +65,10 @@
       {
         "command": "GDS-Lens.showDebugTools",
         "title": "GDSLens: Toggle Debug Tools"
+      },
+      {
+        "command": "GDS-Lens.toggleAutoReload",
+        "title": "GDSLens: Toggle Auto-Reload on Change"
       }
     ],
     "customEditors": [
@@ -91,7 +95,7 @@
         "GDS-Lens.autoReload": {
           "type": "boolean",
           "default": false,
-          "description": "Reload the viewer automatically when the open layout file changes on disk. When off, a header offers a Reload button instead."
+          "description": "Reload the viewer automatically when the open layout file changes on disk. When off, a header offers Reload (once) and Always (turns this on) instead."
         }
       }
     }

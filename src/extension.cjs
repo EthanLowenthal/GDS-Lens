@@ -39,6 +39,13 @@ function autoReloadEnabled() {
     return vscode.workspace.getConfiguration('GDS-Lens').get('autoReload', false);
 }
 
+// Global rather than workspace: layouts are usually opened from outside any
+// workspace folder, where a workspace-scoped write would silently not apply.
+function setAutoReload(enabled) {
+    return vscode.workspace.getConfiguration('GDS-Lens')
+        .update('autoReload', enabled, vscode.ConfigurationTarget.Global);
+}
+
 function formatBytes(bytes) {
     if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + ' GB';
     if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(0) + ' MB';
@@ -70,6 +77,22 @@ function activate(context) {
     context.subscriptions.push(
         vscode.commands.registerCommand('GDS-Lens.showDebugTools', () => {
             provider.toggleDebugTools();
+        })
+    );
+
+    // The only in-editor way back out of auto-reload: with it on, the viewer's
+    // "newer version on disk" banner (which is where you turn it on) never
+    // appears, so without this the Settings UI would be the sole off switch.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('GDS-Lens.toggleAutoReload', async () => {
+            const enabled = !autoReloadEnabled();
+            await setAutoReload(enabled);
+            vscode.window.setStatusBarMessage(
+                enabled
+                    ? 'GDS Lens: auto-reload on layout change is ON'
+                    : 'GDS Lens: auto-reload on layout change is OFF',
+                4000
+            );
         })
     );
 }
@@ -386,28 +409,13 @@ class GdsEditorProvider {
                 watcher.onDidCreate(onWatchEvent)
             );
 
-            // Keep the banner's checkbox in step with the setting, including
-            // when it's changed from the Settings UI or another viewer.
-            post({ type: 'autoReloadState', enabled: autoReloadEnabled() });
-            disposables.push(
-                vscode.workspace.onDidChangeConfiguration((event) => {
-                    if (event.affectsConfiguration('GDS-Lens.autoReload')) {
-                        post({ type: 'autoReloadState', enabled: autoReloadEnabled() });
-                    }
-                })
-            );
-
             webviewPanel.webview.onDidReceiveMessage(async (message) => {
                 if (message.command === 'reloadFile') {
                     await sendLayout(true);
                     return;
                 }
                 if (message.command === 'setAutoReload') {
-                    // Global rather than workspace: layouts are usually opened
-                    // from outside any workspace folder, where a
-                    // workspace-scoped write would silently not apply.
-                    await vscode.workspace.getConfiguration('GDS-Lens')
-                        .update('autoReload', !!message.value, vscode.ConfigurationTarget.Global);
+                    await setAutoReload(!!message.value);
                     return;
                 }
                 if (message.command === 'loadLypFile') {

@@ -3382,9 +3382,9 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
 }
 
 void showLoadError(const std::string& message) {
-    // Write the visible panel FIRST and unconditionally: #ui below is a
-    // debug-only readout (display:none without the debug command), and a
-    // failure early enough to leave GL uninitialized is exactly when the user
+    // Write the visible panel FIRST and unconditionally: #ui below sits inside
+    // the debug panel, which is closed unless the debug command opened it, and
+    // a failure early enough to leave GL uninitialized is exactly when the user
     // most needs to see why. set_inner_text, not html -- the message can
     // carry a filename or a gdstk string we don't control.
     set_inner_text("loadError", std::string("Could not open this layout\n\n") + message);
@@ -3654,9 +3654,9 @@ void setMergeMode(bool on) {
 }
 
 // Discards any in-progress or finalized measurement (the label hides on the
-// next draw_frame via update_measure_label). Bound to Escape in viewer.js;
-// also called on mode exit and when a new file replaces the geometry the
-// measurement referred to.
+// next draw_frame via update_measure_label). Called on measure-mode exit
+// (which is what Escape in viewer.js does, by switching back to pan mode) and
+// when a new file replaces the geometry the measurement referred to.
 void clearMeasurement() {
     g_measure_has_line = false;
     g_measure_pending = false;
@@ -3668,9 +3668,10 @@ void clearMeasurement() {
     request_redraw();
 }
 
-// Ruler on/off (the dat.gui "Measure" checkbox / M key in viewer.js). While
-// on, canvas clicks measure instead of pan (see on_mousedown); wheel zoom
-// still works. The crosshair cursor is the mode's visual cue.
+// Ruler on/off -- i.e. measure mode vs pan mode (the Pan | Measure row / M
+// key in viewer.js). While on, canvas clicks measure instead of pan (see
+// on_mousedown); wheel zoom still works. The crosshair cursor is the mode's
+// visual cue on the canvas itself.
 void setMeasureMode(bool on) {
     g_measure_mode = on;
     g_dragging = false;

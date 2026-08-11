@@ -37,9 +37,15 @@ with an unexpected extension still loads correctly):
   respect that layer's visibility checkbox. Off by default, since a dense
   design's labels can bury the geometry underneath them.
 - **Reset View** — refit the layout to the window from the panel.
-- **Measure** — enable from the panel (or press `M`), then click two points
-  to measure the distance between them (total, Δx, and Δy). Press `Escape`
-  to clear the measurement; toggle the mode off to go back to panning.
+- **Mode: Pan | Measure** — pick the mouse's mode in the panel (or press `M` to
+  switch). In **Measure**, click two points to measure the distance between them
+  (total, Δx, and Δy); the cursor turns into a crosshair, and wheel zoom keeps
+  working. `Escape` returns to **Pan** and clears the measurement.
+- **Reload on change** — when the open layout is rewritten on disk (by a
+  generator script, KLayout, ...) a header offers **Reload**, which re-reads the
+  file while keeping the camera and per-layer visibility, so the new geometry
+  lands in place. **Always** reloads from then on without asking; the
+  "GDSLens: Toggle Auto-Reload on Change" command turns that back off.
 - **Load KLayout .lyp File** — apply custom layer colors from a `.lyp` file.
 - **Load Marker File** — load a DRC/LVS marker database (KLayout `.lyrdb`
   report database or Calibre DRC ASCII results database; the format is
@@ -53,8 +59,11 @@ with an unexpected extension still loads correctly):
   rulechecks with 0 violations. The marker file is
   remembered per layout file and re-applied when you reopen it; unload it with
   the ✕ on the panel row.
-- **GDSLens: Toggle Debug Tools** — command palette entry that shows/hides
-  the render stats readout and debug log.
+- **GDSLens: Toggle Debug Tools** — command palette entry that shows/hides the
+  debug panel button, which opens the render stats readout and debug log.
+- **GDSLens: Toggle Auto-Reload on Change** — command palette entry that turns
+  automatic reloading on layout changes on or off (the `GDS-Lens.autoReload`
+  setting).
 
 ## Release notes
 

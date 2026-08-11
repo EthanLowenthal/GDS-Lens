@@ -100,9 +100,7 @@ const actions = {
     resetView: () => modulePromise.then((Module) => Module.resetView()),
     showInfill: false,
     showText: false,
-    mergeOverlaps: false,
-    measure: false,
-    autoReload: false
+    mergeOverlaps: false
 };
 const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 const markerController = gui.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
@@ -117,19 +115,61 @@ const textController = gui.add(actions, "showText").name("Text")
 textController.domElement.title = "Show layout text labels, drawn in their layer's color";
 // Draw each layer as the union of its polygons (boundary + fill only, no
 // internal edges) -- a pure render-mode toggle, no re-parse involved.
-gui.add(actions, "mergeOverlaps").name("Merge Overlaps")
+const mergeController = gui.add(actions, "mergeOverlaps").name("Merge Overlaps")
     .onChange((on) => modulePromise.then((Module) => Module.setMergeMode(on)));
-const measureController = gui.add(actions, "measure").name("Measure")
-    .onChange((on) => modulePromise.then((Module) => Module.setMeasureMode(on)));
-// Mirrors the GDS-Lens.autoReload setting. It's duplicated in the
-// "newer version on disk" header, but that header only appears while a
-// change is pending -- with auto-reload on it never appears at all, so
-// without this row there'd be no way to turn it back off short of the
-// Settings UI.
-const autoReloadController = gui.add(actions, "autoReload").name("Auto-reload on change")
-    .onChange((on) => vscode.postMessage({ command: "setAutoReload", value: on }));
-autoReloadController.domElement.title =
-    "Re-read this layout automatically whenever it changes on disk, keeping the current view";
+
+// ---- Interaction mode (Pan / Measure) ----
+// The canvas can only do one thing with a click, so the two are exclusive
+// modes rather than an "on top of panning" toggle: in Pan mode a drag moves
+// the view, in Measure mode clicks place the ruler's two ends (see
+// on_mousedown in renderer.cpp) and dragging does nothing. Rendered as a
+// segmented pair of buttons -- a checkbox would say "measure is an extra",
+// which is exactly the wrong mental model. Wasm only needs the boolean; the
+// row below is the whole difference.
+const MODES = [
+    { id: "pan", label: "Pan", title: "Drag to pan the view, wheel to zoom" },
+    { id: "measure", label: "Measure", title: "Click two points to measure the distance between them (Esc to cancel)" }
+];
+let currentMode = "pan";
+const modeButtons = new Map();
+
+// Built by hand instead of via gui.add(): lil-gui has no segmented-control
+// type. Reusing its own .lil-controller/.lil-name/.lil-widget classes means
+// the row picks up the panel's row metrics and theme colors for free (the
+// button styling itself lives in viewer.html).
+const modeRow = document.createElement("div");
+modeRow.className = "lil-controller mode-row";
+const modeName = document.createElement("div");
+modeName.className = "lil-name";
+modeName.textContent = "Mode";
+const modeWidget = document.createElement("div");
+modeWidget.className = "lil-widget mode-widget";
+for (const mode of MODES) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = mode.label;
+    btn.title = mode.title;
+    btn.addEventListener("click", () => setMode(mode.id));
+    modeWidget.appendChild(btn);
+    modeButtons.set(mode.id, btn);
+}
+modeRow.appendChild(modeName);
+modeRow.appendChild(modeWidget);
+// Same slot the old "Measure" checkbox occupied: directly after the render
+// toggles, and ahead of the layer list the load handler appends below.
+mergeController.domElement.after(modeRow);
+
+function setMode(id) {
+    if (currentMode === id) return;
+    currentMode = id;
+    for (const [modeId, btn] of modeButtons) {
+        btn.classList.toggle("mode-active", modeId === id);
+    }
+    // Leaving measure mode also drops any in-progress/finished ruler
+    // (setMeasureMode(false) -> clearMeasurement in renderer.cpp).
+    modulePromise.then((Module) => Module.setMeasureMode(id === "measure"));
+}
+modeButtons.get(currentMode).classList.add("mode-active");
 
 // Reflects a loaded-file state in a lil-gui button row (used by both the
 // .lyp and marker-file rows). With no file it's a plain load button. Once a
@@ -445,6 +485,11 @@ window.addEventListener("keydown", (event) => {
     if (tag === "TEXTAREA" || (tag === "INPUT" && t.type !== "checkbox")) return;
     if (event.key === "[") stepMarker(-1);
     else if (event.key === "]") stepMarker(1);
+    // Mode switching from the keyboard, since measuring is a two-hand job
+    // (click, click, then back to panning): M enters measure mode, Escape
+    // always lands back in pan mode and drops the ruler.
+    else if (event.key === "m" || event.key === "M") setMode(currentMode === "measure" ? "pan" : "measure");
+    else if (event.key === "Escape") setMode("pan");
 }, true);
 
 // ---- "Newer version on disk" banner ----
@@ -455,7 +500,7 @@ window.addEventListener("keydown", (event) => {
 const staleBanner = document.getElementById("staleBanner");
 const staleText = document.getElementById("staleText");
 const staleReloadBtn = document.getElementById("staleReloadBtn");
-const staleAutoChk = document.getElementById("staleAutoChk");
+const staleAlwaysBtn = document.getElementById("staleAlwaysBtn");
 const staleDismiss = document.getElementById("staleDismiss");
 
 function showStaleBanner(show, text) {
@@ -470,18 +515,16 @@ if (staleReloadBtn) {
         vscode.postMessage({ command: "reloadFile" });
     });
 }
-if (staleAutoChk) {
-    // Writes through to the GDS-Lens.autoReload setting, so the choice sticks
-    // across viewers and restarts; the host echoes the new value back as
-    // 'autoReloadState' (which is what actually updates this checkbox).
-    staleAutoChk.addEventListener("change", () => {
-        vscode.postMessage({ command: "setAutoReload", value: staleAutoChk.checked });
-        // Turning it on while the banner is up means "and reload now" -- the
-        // banner is only ever visible because a change is already pending.
-        if (staleAutoChk.checked) {
-            showStaleBanner(false);
-            vscode.postMessage({ command: "reloadFile" });
-        }
+if (staleAlwaysBtn) {
+    // "Reload, and stop asking": writes through to the GDS-Lens.autoReload
+    // setting so the choice sticks across viewers and restarts. One-way by
+    // design -- the banner only exists while auto-reload is off, so there's
+    // nothing here to turn it back off with; that's the "GDSLens: Toggle
+    // Auto-Reload on Change" command (and the Settings UI).
+    staleAlwaysBtn.addEventListener("click", () => {
+        showStaleBanner(false);
+        vscode.postMessage({ command: "setAutoReload", value: true });
+        vscode.postMessage({ command: "reloadFile" });
     });
 }
 if (staleDismiss) {
@@ -523,6 +566,9 @@ const loadingOverlay = document.getElementById("loadingOverlay");
 const loadingBarFill = document.getElementById("loadingBarFill");
 const loadingPhase = document.getElementById("loadingPhase");
 const loadingPercent = document.getElementById("loadingPercent");
+const reloadProgress = document.getElementById("reloadProgress");
+const reloadBarFill = document.getElementById("reloadBarFill");
+const reloadLabel = document.getElementById("reloadLabel");
 const loadError = document.getElementById("loadError");
 
 // Every load-failure path ends here. Writing the DOM directly rather than
@@ -534,7 +580,7 @@ const loadError = document.getElementById("loadError");
 function showFatalError(message) {
     console.error("[GDS] load failed:", message);
     loadError.textContent = "Could not open this layout\n\n" + message;
-    loadingOverlay.classList.add("hidden");
+    endProgress();
     modulePromise.then((Module) => {
         Module.showLoadError(message);
         renderLayerList(Module.getLayers());
@@ -555,12 +601,41 @@ const phaseLabels = {
     triangulating: "Triangulating geometry..."
 };
 
+// Which of the two progress UIs the current load is driving (see
+// beginProgress). Only one is on screen at a time, so updateProgress writes
+// whichever that is.
+let progressInline = false;
+
+// inline: keep the viewport as it is and report progress in the top strip.
+// Otherwise take the screen with the full overlay. Reloads pass true only
+// when there's geometry already drawn to keep showing -- blanking the
+// viewport for a reload throws away the very view the reload restores.
+function beginProgress(inline) {
+    progressInline = inline;
+    loadingOverlay.classList.toggle("hidden", inline);
+    reloadProgress.classList.toggle("hidden", !inline);
+    updateProgress("parsing", 0, 1);
+}
+
+function endProgress() {
+    loadingOverlay.classList.add("hidden");
+    reloadProgress.classList.add("hidden");
+}
+
 function updateProgress(phase, current, total) {
     const label = phaseLabels[phase] || phase;
     const fraction = total > 0 ? current / total : 0;
+    const percent = Math.round(fraction * 100);
+    // Triangulation reports layers rather than a fraction of the file.
+    const detail = phase === "triangulating" ? `Layer ${current}/${total}` : `${percent}%`;
+    if (progressInline) {
+        reloadBarFill.style.width = `${percent}%`;
+        reloadLabel.textContent = `Reloading — ${label} ${detail}`;
+        return;
+    }
     loadingPhase.textContent = label;
-    loadingBarFill.style.width = `${Math.round(fraction * 100)}%`;
-    loadingPercent.textContent = phase === "triangulating" ? `Layer ${current}/${total}` : `${Math.round(fraction * 100)}%`;
+    loadingBarFill.style.width = `${percent}%`;
+    loadingPercent.textContent = detail;
 }
 
 // Registered synchronously (not inside the .then() below) so an 'init'
@@ -606,8 +681,6 @@ window.addEventListener("message", (event) => {
             activeWorker = null;
         }
         showStaleBanner(false);
-        loadingOverlay.classList.remove("hidden");
-        updateProgress("parsing", 0, 1);
 
         // Only meaningful on a reload: on first open there's nothing to keep,
         // and framing the view on the design is exactly what we want.
@@ -625,6 +698,11 @@ window.addEventListener("message", (event) => {
                 console.error("[GDS] could not capture view state, reloading framed:", err);
             }
         }
+
+        // Captured state doubles as the test for "is there a view worth
+        // keeping on screen": it's null exactly when nothing is drawn yet, and
+        // an empty viewport behind a hairline bar reads as a hung viewer.
+        beginProgress(pendingViewState !== null);
 
         let worker;
         try {
@@ -690,20 +768,10 @@ window.addEventListener("message", (event) => {
     } else if (message.type === "fileChanged") {
         // The file changed on disk and auto-reload is off, so offer it.
         showStaleBanner(true, message.text || "A newer version of this file is on disk.");
-    } else if (message.type === "autoReloadState") {
-        // Echoed by the host on open and whenever GDS-Lens.autoReload changes
-        // (including from the Settings UI, or another viewer), so both copies
-        // of the toggle mirror the real setting rather than this webview's
-        // guess at it. Assigning + updateDisplay rather than setValue on
-        // purpose: setValue would re-fire onChange and post the value straight
-        // back to the host.
-        actions.autoReload = !!message.enabled;
-        autoReloadController.updateDisplay();
-        if (staleAutoChk) staleAutoChk.checked = !!message.enabled;
     } else if (message.type === "toggleDebugTools") {
-        // "GDSLens: Toggle Debug Tools" command -- show/hide the upper-left
-        // #ui readout and the debug-log toggle button (both hidden by
-        // default, see viewer.html).
+        // "GDSLens: Toggle Debug Tools" command -- show/hide the debug entry
+        // point (the button that opens #debugPanel, which holds both the
+        // engine readout and the log), hidden by default, see viewer.html.
         document.body.classList.toggle("debug");
     }
 });
@@ -777,8 +845,8 @@ function startWorker(worker, fileData) {
                     pendingViewState = null;
                 }
                 renderLayerList(Module.getLayers());
-                loadingOverlay.classList.add("hidden");
-                console.log("[GDS] done, overlay hidden");
+                endProgress();
+                console.log("[GDS] done, progress hidden");
             }, (err) => {
                 showFatalError(`WebAssembly module failed to load: ${err && err.message ? err.message : err}`);
             });

@@ -2,18 +2,33 @@
 
 ## [Unreleased]
 
+- The measure tool is now a mouse mode instead of a checkbox: the panel shows a
+  Pan | Measure pair, with the active mode filled in. A checkbox implied
+  measuring was something layered on top of panning, when in fact it replaces
+  what a click does. `M` switches modes from the keyboard and `Escape` returns
+  to Pan (clearing the measurement), as the docs already claimed — neither key
+  had actually been wired up.
 - Reloading when the layout changes on disk. A viewer now watches its own
   file, and when a generator script or KLayout rewrites it, a header offers a
   Reload button. Reloading keeps the camera and the per-layer visibility
   checkboxes, so re-running a generator drops the new geometry in place
   instead of throwing you back to a framed view of the whole design; layers
-  the edit newly introduced keep the fresh load's defaults. A
-  `GDS-Lens.autoReload` setting (off by default, also togglable from the panel
-  and from the header itself) re-reads without asking. Reads wait for the file
+  the edit newly introduced keep the fresh load's defaults. An "Always" button
+  beside it re-reads without asking from then on, storing the
+  `GDS-Lens.autoReload` setting (off by default); "GDSLens: Toggle Auto-Reload
+  on Change" turns it back off. A reload leaves the design on screen and
+  reports progress in a hairline bar along the top edge — the full-screen
+  loading overlay is for opening a file, and blacking out the viewport would
+  undo the point of putting the camera back. Reads wait for the file
   to hold a steady size and mtime before starting, since layout writers rarely
   produce one clean change event — chunked writes and write-to-temp-then-rename
   would otherwise be read half-finished — and a reload supersedes any load
   still in flight rather than racing it.
+- The debug tools are one panel instead of two. The engine readout (polygon
+  and label counts, live visible-polygon stats, GPU memory) floated over the
+  top-left of the canvas while the log sat at the bottom, both lit up by the
+  same command; the readout now sits beside the log inside the debug panel,
+  and its text is selectable.
 - Switching away from a viewer tab and back no longer leaves it stuck on
   "Loading layout...". VS Code was destroying the webview's DOM whenever the
   tab was hidden and re-running the viewer from scratch on return, but the

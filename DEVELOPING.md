@@ -72,8 +72,9 @@ explanation, and shown in the viewer's `#loadError` panel. Files larger than
 `MAX_LAYOUT_BYTES` (2 GB) are refused by the extension host before they're
 even read, since the raw bytes alone have to be copied into that same heap.
 
-Note that `#ui` — the upper-left readout — is `display:none` outside debug
-mode, so it must never be the only place an error is written.
+Note that `#ui` — the engine readout — lives inside the debug panel, which is
+closed unless the debug command opened it, so it must never be the only place
+an error is written.
 
 ## Publishing
 
