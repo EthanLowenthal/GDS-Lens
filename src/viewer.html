@@ -7,11 +7,16 @@
     <style>
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0c0c0d; user-select: none; }
         canvas { width: 100%; height: 100%; display: block; }
-        #ui { color: #a5a5a5; position: absolute; top: 15px; left: 15px; font-family: monospace; font-size: 12px; pointer-events: none; line-height: 1.5; z-index: 10;}
-        /* Debug tools (#ui readout + debug log button) are hidden until the
-           "GDSLens: Show Debug Tools" command adds .debug to <body>. */
-        #ui, #debugToggleBtn { display: none; }
-        body.debug #ui { display: block; }
+        /* The engine readout (polygon/label counts + the per-frame #renderStats
+           span, both written from renderer.cpp). It lives inside #debugPanel
+           rather than floating over the canvas on its own: it's debug-only
+           either way, and two separate debug surfaces meant the same command
+           lit up two different corners of the screen. */
+        #ui { width: 320px; flex: none; overflow-y: auto; padding: 6px 8px; border-right: 1px solid #333;
+              color: #a5a5a5; font-family: monospace; font-size: 11px; line-height: 1.5; user-select: text; }
+        /* The debug entry point is hidden until the "GDSLens: Toggle Debug
+           Tools" command adds .debug to <body>. */
+        #debugToggleBtn { display: none; }
         body.debug #debugToggleBtn { display: block; }
         #scaleContainer { position: absolute; bottom: 20px; right: 20px; font-family: monospace; font-size: 11px; color: #ffffff; text-align: center; z-index: 10; pointer-events: none; }
         #scaleBar { height: 4px; background: #ffffff; border: 1px solid #000; margin-top: 4px; }
@@ -29,6 +34,22 @@
            label (the checkbox needs nowhere near half the row) and cut it
            character-level with an ellipsis. */
         .lil-gui .lil-controller.lil-boolean > .lil-name { min-width: 78%; width: 78%; overflow: hidden; text-overflow: ellipsis; }
+        /* Interaction-mode row (Pan | Measure), hand-built in viewer.js since
+           lil-gui has no segmented-control type. Because the row carries
+           lil-gui's own classes, its button theming (widget color, radius,
+           height, :hover/:active) already applies -- all that's left is
+           splitting the widget in two and filling in the selected mode. The
+           name column is narrower than lil-gui's 45% default to leave both
+           buttons a readable width. */
+        .lil-gui .lil-controller.mode-row .lil-name { min-width: 30%; }
+        .lil-gui .lil-controller.mode-row .mode-widget { gap: 4px; }
+        .lil-gui .lil-controller.mode-row .mode-widget button { flex: 1; }
+        /* :hover/:active spelled out too -- lil-gui's own button:hover rule
+           outranks a bare .mode-active, which would grey out the selected
+           mode as soon as the pointer crossed it. */
+        .lil-gui .lil-controller.mode-row .mode-widget button.mode-active,
+        .lil-gui .lil-controller.mode-row .mode-widget button.mode-active:hover,
+        .lil-gui .lil-controller.mode-row .mode-widget button.mode-active:active { background: #4a9eff; color: #06121f; font-weight: bold; }
         /* Loaded-.lyp chip: the row shows the filename with an ✕ on the right
            (injected by setLypChip in viewer.js) to unload it. */
         .lil-gui .lil-controller.lyp-loaded { position: relative; }
@@ -57,7 +78,11 @@
         #staleBanner button { font-family: monospace; font-size: 11px; background: #7a5a1c; color: #fff6e5;
                               border: 1px solid #a37a26; border-radius: 3px; padding: 3px 12px; cursor: pointer; }
         #staleBanner button:hover { background: #a37a26; }
-        #staleAutoLabel { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+        /* Secondary next to Reload: same action plus a persisted setting, so it
+           reads as the quieter of the two. */
+        #staleBanner button.secondary { background: transparent; border-color: transparent;
+                                        color: #e5cfa4; padding: 3px 6px; }
+        #staleBanner button.secondary:hover { background: transparent; color: #fff6e5; text-decoration: underline; }
         #staleDismiss { cursor: pointer; opacity: 0.7; padding: 0 2px; }
         #staleDismiss:hover { opacity: 1; }
         #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: #d0d0d0; background: #0c0c0d; z-index: 30; }
@@ -66,6 +91,19 @@
         #loadingBarFill { width: 0%; height: 100%; background: #4a9eff; transition: width 0.15s ease-out; }
         #loadingPhase { font-size: 12px; }
         #loadingPercent { font-size: 11px; color: #808080; }
+        /* The reload flavour of the same progress (see beginProgress in
+           viewer.js): a hairline bar along the top edge plus a small chip,
+           over a viewport that keeps showing the geometry already loaded.
+           Restoring the camera across a reload is pointless if the view is
+           blacked out while it happens. pointer-events stay off so a drag
+           that starts under the chip still pans the canvas. */
+        #reloadProgress { position: absolute; top: 0; left: 0; right: 0; z-index: 26; pointer-events: none; }
+        #reloadProgress.hidden { display: none; }
+        #reloadBarTrack { height: 2px; background: #2a2a2c; }
+        #reloadBarFill { width: 0%; height: 100%; background: #4a9eff; transition: width 0.15s ease-out; }
+        #reloadLabel { display: inline-block; margin: 6px 0 0 10px; padding: 3px 8px; font-family: monospace;
+                       font-size: 11px; color: #cfe6ff; background: rgba(12, 12, 13, 0.85);
+                       border: 1px solid #2a3f57; border-radius: 3px; }
         /* Load failures. This is deliberately NOT part of the debug tools:
            #ui above is display:none unless the debug command is run, so an
            error written only there is invisible to a normal user. Empty means
@@ -77,38 +115,47 @@
         #debugPanel.hidden { display: none; }
         #debugPanelHeader { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; font-family: monospace; font-size: 11px; color: #999; border-bottom: 1px solid #333; }
         #debugPanelHeader button { font-family: monospace; font-size: 10px; background: #2a2a2c; color: #ddd; border: 1px solid #444; border-radius: 3px; padding: 2px 8px; cursor: pointer; }
-        #debugLog { overflow-y: auto; padding: 6px 8px; font-family: monospace; font-size: 10px; color: #7fff7f; white-space: pre-wrap; word-break: break-all; user-select: text; }
+        /* Readout beside the log rather than above it: the panel is capped at
+           240px tall, and stacking them would leave the log a few lines. */
+        #debugBody { display: flex; flex: 1; min-height: 0; }
+        #debugLog { flex: 1; overflow-y: auto; padding: 6px 8px; font-family: monospace; font-size: 10px; color: #7fff7f; white-space: pre-wrap; word-break: break-all; user-select: text; }
         #debugLog .err { color: #ff7f7f; }
         #debugToggleBtn { position: absolute; bottom: 8px; left: 8px; z-index: 41; font-family: monospace; font-size: 10px; background: #2a2a2c; color: #999; border: 1px solid #444; border-radius: 3px; padding: 2px 8px; cursor: pointer; opacity: 0.6; }
         #debugToggleBtn:hover { opacity: 1; }
     </style>
 </head>
 <body>
-    <div id="ui"></div>
     <div id="loadingOverlay">
         <div id="loadingBarTrack"><div id="loadingBarFill"></div></div>
         <div id="loadingPhase">Loading layout...</div>
         <div id="loadingPercent"></div>
     </div>
     <div id="loadError"></div>
+    <div id="reloadProgress" class="hidden">
+        <div id="reloadBarTrack"><div id="reloadBarFill"></div></div>
+        <div id="reloadLabel">Reloading...</div>
+    </div>
     <div id="staleBanner" class="hidden">
         <span id="staleText">A newer version of this file is on disk.</span>
         <button id="staleReloadBtn" type="button">Reload</button>
-        <label id="staleAutoLabel" title="Reload automatically whenever this file changes on disk">
-            <input type="checkbox" id="staleAutoChk"> Auto-reload
-        </label>
+        <button id="staleAlwaysBtn" type="button" class="secondary"
+                title="Reload now, and automatically whenever this file changes from now on">Always</button>
         <span id="staleDismiss" title="Dismiss until the next change">✕</span>
     </div>
     <canvas id="glCanvas"></canvas>
 
     <div id="debugPanel" class="hidden">
         <div id="debugPanelHeader">
-            <span>Debug log</span>
-            <button id="debugCopyBtn" type="button">Copy all</button>
+            <span>Debug tools</span>
+            <button id="debugCopyBtn" type="button">Copy log</button>
         </div>
-        <div id="debugLog"></div>
+        <div id="debugBody">
+            <!-- Engine readout, written from renderer.cpp (set_inner_html("ui", ...)). -->
+            <div id="ui"></div>
+            <div id="debugLog"></div>
+        </div>
     </div>
-    <button id="debugToggleBtn" type="button">Debug log</button>
+    <button id="debugToggleBtn" type="button">Debug tools</button>
 
     <div id="scaleContainer">
         <div id="scaleLabel">0 μm</div>
