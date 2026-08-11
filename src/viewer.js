@@ -101,7 +101,8 @@ const actions = {
     showInfill: false,
     showText: false,
     mergeOverlaps: false,
-    measure: false
+    measure: false,
+    autoReload: false
 };
 const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 const markerController = gui.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
@@ -120,6 +121,15 @@ gui.add(actions, "mergeOverlaps").name("Merge Overlaps")
     .onChange((on) => modulePromise.then((Module) => Module.setMergeMode(on)));
 const measureController = gui.add(actions, "measure").name("Measure")
     .onChange((on) => modulePromise.then((Module) => Module.setMeasureMode(on)));
+// Mirrors the GDS-Lens.autoReload setting. It's duplicated in the
+// "newer version on disk" header, but that header only appears while a
+// change is pending -- with auto-reload on it never appears at all, so
+// without this row there'd be no way to turn it back off short of the
+// Settings UI.
+const autoReloadController = gui.add(actions, "autoReload").name("Auto-reload on change")
+    .onChange((on) => vscode.postMessage({ command: "setAutoReload", value: on }));
+autoReloadController.domElement.title =
+    "Re-read this layout automatically whenever it changes on disk, keeping the current view";
 
 // Reflects a loaded-file state in a lil-gui button row (used by both the
 // .lyp and marker-file rows). With no file it's a plain load button. Once a
@@ -437,6 +447,78 @@ window.addEventListener("keydown", (event) => {
     else if (event.key === "]") stepMarker(1);
 }, true);
 
+// ---- "Newer version on disk" banner ----
+// The extension host watches the layout file and posts 'fileChanged' when it
+// changes underneath us (see the watcher in extension.cjs); this is only the
+// UI for that. Clicking Reload asks the host to re-read and re-send the file
+// as a fresh 'init' -- the webview never touches disk itself.
+const staleBanner = document.getElementById("staleBanner");
+const staleText = document.getElementById("staleText");
+const staleReloadBtn = document.getElementById("staleReloadBtn");
+const staleAutoChk = document.getElementById("staleAutoChk");
+const staleDismiss = document.getElementById("staleDismiss");
+
+function showStaleBanner(show, text) {
+    if (!staleBanner) return;
+    if (text) staleText.textContent = text;
+    staleBanner.classList.toggle("hidden", !show);
+}
+
+if (staleReloadBtn) {
+    staleReloadBtn.addEventListener("click", () => {
+        showStaleBanner(false);
+        vscode.postMessage({ command: "reloadFile" });
+    });
+}
+if (staleAutoChk) {
+    // Writes through to the GDS-Lens.autoReload setting, so the choice sticks
+    // across viewers and restarts; the host echoes the new value back as
+    // 'autoReloadState' (which is what actually updates this checkbox).
+    staleAutoChk.addEventListener("change", () => {
+        vscode.postMessage({ command: "setAutoReload", value: staleAutoChk.checked });
+        // Turning it on while the banner is up means "and reload now" -- the
+        // banner is only ever visible because a change is already pending.
+        if (staleAutoChk.checked) {
+            showStaleBanner(false);
+            vscode.postMessage({ command: "reloadFile" });
+        }
+    });
+}
+if (staleDismiss) {
+    staleDismiss.addEventListener("click", () => showStaleBanner(false));
+}
+
+// State carried across a reload so re-reading the file doesn't reset the
+// user's working context. Captured just before the new geometry is uploaded
+// (uploadLayers re-frames the camera and rebuilds the layer table from the
+// new file), re-applied just after.
+function captureViewState(Module) {
+    const layers = Module.getLayers();
+    // Nothing drawn yet (reload triggered while the first load was still in
+    // flight) -- there's no camera worth keeping, and restoring the default
+    // zoom-1-at-origin would override the framing uploadLayers is about to do.
+    if (layers.length === 0) return null;
+    const visibility = {};
+    for (const layer of layers) {
+        visibility[`${layer.layer}/${layer.datatype}`] = layer.visible;
+    }
+    return { camera: Module.getCamera(), visibility: visibility };
+}
+
+function restoreViewState(Module, saved) {
+    if (!saved) return;
+    // Only layers that existed before are restored -- ones the edit newly
+    // introduced keep the fresh load's default so they aren't invisible for
+    // no discoverable reason.
+    for (const layer of Module.getLayers()) {
+        const wasVisible = saved.visibility[`${layer.layer}/${layer.datatype}`];
+        if (wasVisible !== undefined && wasVisible !== layer.visible) {
+            Module.setLayerVisible(layer.layer, layer.datatype, wasVisible);
+        }
+    }
+    Module.setCamera(saved.camera.zoom, saved.camera.panX, saved.camera.panY);
+}
+
 const loadingOverlay = document.getElementById("loadingOverlay");
 const loadingBarFill = document.getElementById("loadingBarFill");
 const loadingPhase = document.getElementById("loadingPhase");
@@ -485,9 +567,21 @@ function updateProgress(phase, current, total) {
 // message that arrives before wasm instantiation finishes isn't dropped --
 // window message events aren't queued for late listeners.
 console.log("[GDS] calling createGdstkModule() on main thread...");
+// Synchronous handle on the same module modulePromise resolves to. The
+// 'init' handler needs to read the *current* camera/layer state before the
+// incoming parse replaces it, and a .then() would run too late for that.
+let resolvedModule = null;
+// The load currently in flight, so a reload can cancel it (see 'init').
+let activeWorker = null;
+// View state captured for the in-flight reload, re-applied once its geometry
+// is uploaded. Null on a first open.
+let pendingViewState = null;
 const modulePromise = createGdstkModule();
 modulePromise.then(
-    () => console.log("[GDS] main-thread createGdstkModule() resolved OK"),
+    (Module) => {
+        resolvedModule = Module;
+        console.log("[GDS] main-thread createGdstkModule() resolved OK");
+    },
     (err) => {
         console.error("[GDS] main-thread createGdstkModule() REJECTED:", err);
         // Nothing else will ever run if this fails, so this is the one place
@@ -501,9 +595,36 @@ window.addEventListener("message", (event) => {
     const message = event.data;
     console.log("[GDS] window message received, type:", message.type);
     if (message.type === "init") {
-        console.log("[GDS] init payload: fileData byteLength =", message.fileData && message.fileData.byteLength);
+        console.log("[GDS] init payload: fileData byteLength =", message.fileData && message.fileData.byteLength,
+                    "reload:", !!message.reload);
+        // A reload supersedes any load still running (the file can change
+        // again while a slow one is in flight) -- drop the old worker rather
+        // than letting two of them race to upload geometry.
+        if (activeWorker) {
+            console.log("[GDS] superseding an in-flight load");
+            activeWorker.terminate();
+            activeWorker = null;
+        }
+        showStaleBanner(false);
         loadingOverlay.classList.remove("hidden");
         updateProgress("parsing", 0, 1);
+
+        // Only meaningful on a reload: on first open there's nothing to keep,
+        // and framing the view on the design is exactly what we want.
+        // Captured synchronously off resolvedModule rather than through
+        // modulePromise: the geometry has to be read *before* the new parse
+        // lands, and a .then() would run after this handler returns.
+        pendingViewState = null;
+        if (message.reload && resolvedModule) {
+            try {
+                pendingViewState = captureViewState(resolvedModule);
+            } catch (err) {
+                // Nothing loaded yet, or the module is wedged -- reload as if
+                // it were a first open (framed on the design) rather than
+                // failing the reload outright.
+                console.error("[GDS] could not capture view state, reloading framed:", err);
+            }
+        }
 
         let worker;
         try {
@@ -566,6 +687,19 @@ window.addEventListener("message", (event) => {
             renderMarkerBrowser(model);
             setMarkerChip(message.name || null);
         });
+    } else if (message.type === "fileChanged") {
+        // The file changed on disk and auto-reload is off, so offer it.
+        showStaleBanner(true, message.text || "A newer version of this file is on disk.");
+    } else if (message.type === "autoReloadState") {
+        // Echoed by the host on open and whenever GDS-Lens.autoReload changes
+        // (including from the Settings UI, or another viewer), so both copies
+        // of the toggle mirror the real setting rather than this webview's
+        // guess at it. Assigning + updateDisplay rather than setValue on
+        // purpose: setValue would re-fire onChange and post the value straight
+        // back to the host.
+        actions.autoReload = !!message.enabled;
+        autoReloadController.updateDisplay();
+        if (staleAutoChk) staleAutoChk.checked = !!message.enabled;
     } else if (message.type === "toggleDebugTools") {
         // "GDSLens: Toggle Debug Tools" command -- show/hide the upper-left
         // #ui readout and the debug-log toggle button (both hidden by
@@ -575,6 +709,7 @@ window.addEventListener("message", (event) => {
 });
 
 function startWorker(worker, fileData) {
+    activeWorker = worker;
     // Only fires for the Worker failing to start at all (e.g. its script
     // URL rejected by CSP) -- failures inside the worker's own async code
     // are reported via a 'gdsResult' message instead (see wasm-worker.js),
@@ -611,6 +746,7 @@ function startWorker(worker, fileData) {
             // on a big design both threads holding it at once is what tips a
             // borderline load over the edge.
             worker.terminate();
+            if (activeWorker === worker) activeWorker = null;
             if (!workerMessage.ok) {
                 showFatalError(workerMessage.error);
                 return;
@@ -629,6 +765,17 @@ function startWorker(worker, fileData) {
                     return;
                 }
                 clearFatalError();
+                // Put the camera and per-layer visibility back before the
+                // panel is rebuilt, so renderLayerList reflects the restored
+                // checkboxes rather than the fresh load's defaults.
+                if (pendingViewState) {
+                    try {
+                        restoreViewState(Module, pendingViewState);
+                    } catch (err) {
+                        console.error("[GDS] could not restore view state:", err);
+                    }
+                    pendingViewState = null;
+                }
                 renderLayerList(Module.getLayers());
                 loadingOverlay.classList.add("hidden");
                 console.log("[GDS] done, overlay hidden");

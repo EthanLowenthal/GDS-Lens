@@ -42,6 +42,24 @@
         .lil-gui .lil-controller.marker-selected button { background: #5a1f1f !important; }
         .lil-gui .lil-controller.marker-selected .lil-name { color: #ffd9d9; }
         .lil-gui .lil-controller.marker-more-row { opacity: 0.55; pointer-events: none; }
+        /* "Newer version on disk" header (see the fileChanged handler in
+           viewer.js). Sits above the lil-gui panel (z 20) but below the
+           loading overlay (z 30), since it's hidden while a load runs
+           anyway. */
+        /* Stops short of the right edge so it doesn't cover the lil-gui panel
+           (260px wide, top-right) that it outranks on z-index. */
+        #staleBanner { position: absolute; top: 0; left: 0; right: 276px; box-sizing: border-box; z-index: 25;
+                       display: flex; align-items: center; gap: 12px; padding: 7px 12px;
+                       font-family: monospace; font-size: 12px; color: #ffe9c2;
+                       background: #4a3410; border-bottom: 1px solid #7a5a1c; }
+        #staleBanner.hidden { display: none; }
+        #staleText { flex: 1; }
+        #staleBanner button { font-family: monospace; font-size: 11px; background: #7a5a1c; color: #fff6e5;
+                              border: 1px solid #a37a26; border-radius: 3px; padding: 3px 12px; cursor: pointer; }
+        #staleBanner button:hover { background: #a37a26; }
+        #staleAutoLabel { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+        #staleDismiss { cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        #staleDismiss:hover { opacity: 1; }
         #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: #d0d0d0; background: #0c0c0d; z-index: 30; }
         #loadingOverlay.hidden { display: none; }
         #loadingBarTrack { width: 320px; height: 8px; background: #2a2a2c; border-radius: 4px; overflow: hidden; }
@@ -73,6 +91,14 @@
         <div id="loadingPercent"></div>
     </div>
     <div id="loadError"></div>
+    <div id="staleBanner" class="hidden">
+        <span id="staleText">A newer version of this file is on disk.</span>
+        <button id="staleReloadBtn" type="button">Reload</button>
+        <label id="staleAutoLabel" title="Reload automatically whenever this file changes on disk">
+            <input type="checkbox" id="staleAutoChk"> Auto-reload
+        </label>
+        <span id="staleDismiss" title="Dismiss until the next change">✕</span>
+    </div>
     <canvas id="glCanvas"></canvas>
 
     <div id="debugPanel" class="hidden">
