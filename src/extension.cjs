@@ -24,6 +24,21 @@ const MARKER_PATHS_KEY = 'GDS-Lens.markerPathByGds';
 // viewer reports an out-of-memory error if it doesn't fit after all.
 const MAX_LAYOUT_BYTES = 2 * 1024 * 1024 * 1024;
 
+// How long the layout file has to hold a steady size+mtime before a reload
+// reads it. Layout writers rarely produce one clean change event: generator
+// scripts and KLayout write in chunks, and some tools write a temp file and
+// rename it over the target (which arrives as delete-then-create). Reading on
+// the first event would routinely hit a half-written file and report a bogus
+// parse error.
+const SETTLE_MS = 400;
+// Give up waiting for quiet after this and read what's there -- a file being
+// appended to continuously would otherwise never reload at all.
+const SETTLE_TIMEOUT_MS = 30000;
+
+function autoReloadEnabled() {
+    return vscode.workspace.getConfiguration('GDS-Lens').get('autoReload', false);
+}
+
 function formatBytes(bytes) {
     if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + ' GB';
     if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(0) + ' MB';
@@ -36,7 +51,17 @@ function activate(context) {
 
     const provider = new GdsEditorProvider(context);
     context.subscriptions.push(
-        vscode.window.registerCustomEditorProvider('GDS-Lens.editor', provider)
+        vscode.window.registerCustomEditorProvider('GDS-Lens.editor', provider, {
+            // Without this, VS Code destroys the webview's DOM whenever the tab
+            // is hidden and re-runs viewer.js from scratch when it comes back --
+            // but resolveCustomEditor() (the only thing that posts 'init' with
+            // the file bytes) runs once per editor, so the restored webview sits
+            // on "Loading layout..." forever. Keeping the context also means a
+            // tab switch doesn't re-parse the layout, which for a large GDS is
+            // the difference between instant and tens of seconds. The cost is
+            // that the wasm heap and GL context stay resident while hidden.
+            webviewOptions: { retainContextWhenHidden: true }
+        })
     );
 
     // "GDSLens: Toggle Debug Tools" -- shows/hides the upper-left readout and
@@ -179,45 +204,212 @@ class GdsEditorProvider {
 
             // Track this panel so the "Show Debug Tools" command can post to it.
             this.panels.add(webviewPanel);
-            webviewPanel.onDidDispose(() => this.panels.delete(webviewPanel));
+            // Everything registered per-editor below (watcher, its event
+            // handlers, the settings listener) has to go when the tab does --
+            // unlike the panel itself, none of it is cleaned up automatically.
+            const disposables = [];
+            let disposed = false;
+            webviewPanel.onDidDispose(() => {
+                disposed = true;
+                this.panels.delete(webviewPanel);
+                for (const d of disposables) d.dispose();
+            });
+
+            // postMessage on a disposed webview throws, and every path below
+            // can reach one: the reload flow awaits stats and reads, and the
+            // user is free to close the tab in the middle of any of them.
+            const post = (message) => {
+                if (disposed) return;
+                webviewPanel.webview.postMessage(message);
+            };
 
             logger.appendLine('\n>>> Intercepted layout open call for file: ' + document.uri.fsPath);
 
-            // Size-check before reading: the read itself allocates the whole
-            // file, so on an oversized one this is the difference between an
-            // instant explanation and a long stall ending in a failure the
-            // webview never hears about (it would sit on the loading overlay
-            // forever, since 'init' is what starts its progress reporting).
-            const stat = await vscode.workspace.fs.stat(document.uri);
-            logger.appendLine('    file size: ' + formatBytes(stat.size));
-            if (stat.size > MAX_LAYOUT_BYTES) {
-                const message =
-                    `This layout is ${formatBytes(stat.size)}, past the ${formatBytes(MAX_LAYOUT_BYTES)} ` +
-                    `limit GDS Lens can load.\n\nThe viewer parses layouts in a 32-bit WebAssembly module, ` +
-                    `which has to hold the file and the geometry built from it in 4 GB of memory.`;
-                logger.appendLine('>>> Refusing oversized layout: ' + formatBytes(stat.size));
-                webviewPanel.webview.postMessage({ type: 'loadError', message: message });
-                vscode.window.showErrorMessage(`GDS Lens: layout is too large to open (${formatBytes(stat.size)}).`);
-                return;
-            }
+            // Size+mtime of the bytes currently loaded in the viewer. The
+            // watcher compares against this so events that don't reflect a
+            // real content change (a touch, an editor saving an unchanged
+            // buffer) don't cost a multi-second re-parse.
+            let loadedStamp = null;
 
-            let fileData;
-            try {
-                fileData = await vscode.workspace.fs.readFile(document.uri);
-            } catch (err) {
-                // Out of memory on a large-but-allowed file, a disk error, a
-                // vanished network mount -- the viewer is already showing its
-                // progress bar, so it needs telling either way.
-                logger.appendLine('>>> Failed to read layout: ' + err.stack);
-                webviewPanel.webview.postMessage({
-                    type: 'loadError',
-                    message: `Could not read ${path.basename(document.uri.fsPath)}: ${err.message}`
+            const statOrNull = async () => {
+                try {
+                    return await vscode.workspace.fs.stat(document.uri);
+                } catch {
+                    return null;  // deleted, or mid-rename
+                }
+            };
+
+            // Reads the file and hands it to the webview, as the first load
+            // (isReload false, viewer frames the design) or a re-read
+            // (isReload true, viewer keeps camera and layer visibility).
+            const sendLayout = async (isReload) => {
+                // Size-check before reading: the read itself allocates the
+                // whole file, so on an oversized one this is the difference
+                // between an instant explanation and a long stall ending in a
+                // failure the webview never hears about (it would sit on the
+                // loading overlay forever, since 'init' is what starts its
+                // progress reporting).
+                const stat = await statOrNull();
+                if (!stat) {
+                    logger.appendLine('>>> Layout file is not readable (deleted or moved?)');
+                    post({
+                        type: 'loadError',
+                        message: `${path.basename(document.uri.fsPath)} is no longer on disk.`
+                    });
+                    return false;
+                }
+                logger.appendLine('    file size: ' + formatBytes(stat.size));
+                if (stat.size > MAX_LAYOUT_BYTES) {
+                    const message =
+                        `This layout is ${formatBytes(stat.size)}, past the ${formatBytes(MAX_LAYOUT_BYTES)} ` +
+                        `limit GDS Lens can load.\n\nThe viewer parses layouts in a 32-bit WebAssembly module, ` +
+                        `which has to hold the file and the geometry built from it in 4 GB of memory.`;
+                    logger.appendLine('>>> Refusing oversized layout: ' + formatBytes(stat.size));
+                    post({ type: 'loadError', message: message });
+                    vscode.window.showErrorMessage(`GDS Lens: layout is too large to open (${formatBytes(stat.size)}).`);
+                    return false;
+                }
+
+                let fileData;
+                try {
+                    fileData = await vscode.workspace.fs.readFile(document.uri);
+                } catch (err) {
+                    // Out of memory on a large-but-allowed file, a disk error,
+                    // a vanished network mount -- the viewer is already showing
+                    // its progress bar, so it needs telling either way.
+                    logger.appendLine('>>> Failed to read layout: ' + err.stack);
+                    post({
+                        type: 'loadError',
+                        message: `Could not read ${path.basename(document.uri.fsPath)}: ${err.message}`
+                    });
+                    vscode.window.showErrorMessage('GDS Lens: could not read layout file: ' + err.message);
+                    return false;
+                }
+
+                // Stamped from the pre-read stat: if the file changes again
+                // between the stat and the read, the watcher fires once more
+                // and this compares unequal, so the newer bytes still land.
+                loadedStamp = { mtime: stat.mtime, size: stat.size };
+
+                logger.appendLine(
+                    (isReload ? '>>> Re-reading changed layout' : '>>> Streaming raw layout bytes') +
+                    ' down into the wasm webview context...');
+                logger.appendLine('    fileData bytes: ' + fileData.byteLength);
+                // fileData crosses as a raw ArrayBuffer (as it always has) --
+                // only the worker bundle text needed the HTML-embedding
+                // workaround above; binary ArrayBuffers here haven't shown the
+                // same RPC-channel issue large strings did.
+                post({
+                    type: 'init',
+                    fileData: Uint8Array.from(fileData).buffer,
+                    reload: !!isReload
                 });
-                vscode.window.showErrorMessage('GDS Lens: could not read layout file: ' + err.message);
-                return;
-            }
+                return true;
+            };
+
+            // Polls until size and mtime stop moving (see SETTLE_MS), so a
+            // reload reads a finished file rather than a partial one.
+            const waitForQuiet = async () => {
+                const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+                let previous = await statOrNull();
+                while (Date.now() < deadline && !disposed) {
+                    await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+                    const current = await statOrNull();
+                    if (current && previous &&
+                        current.size === previous.size && current.mtime === previous.mtime) {
+                        return current;
+                    }
+                    previous = current;
+                }
+                return previous;
+            };
+
+            // Serialized: watcher events arrive in bursts, and running this
+            // concurrently would stack up reads of the same file. A change
+            // seen while one pass is in flight re-runs the loop instead.
+            let checking = false;
+            let changedWhileChecking = false;
+            const onDiskChange = async () => {
+                if (checking) {
+                    changedWhileChecking = true;
+                    return;
+                }
+                checking = true;
+                try {
+                    do {
+                        changedWhileChecking = false;
+                        const stat = await waitForQuiet();
+                        if (disposed) return;
+                        // Gone for now -- a temp-file-plus-rename writer will
+                        // fire onDidCreate once the new file lands, so this
+                        // isn't the moment to complain about it.
+                        if (!stat) continue;
+                        if (loadedStamp &&
+                            stat.mtime === loadedStamp.mtime && stat.size === loadedStamp.size) {
+                            continue;
+                        }
+                        if (autoReloadEnabled()) {
+                            logger.appendLine('>>> Layout changed on disk, auto-reloading');
+                            await sendLayout(true);
+                        } else {
+                            logger.appendLine('>>> Layout changed on disk, offering reload');
+                            post({ type: 'fileChanged' });
+                        }
+                    } while (changedWhileChecking && !disposed);
+                } catch (err) {
+                    logger.appendLine('>>> Reload check failed: ' + err.stack);
+                } finally {
+                    checking = false;
+                }
+            };
+
+            // A RelativePattern rooted at the file's own directory (rather
+            // than a workspace-relative glob) is what makes this work for
+            // layouts opened from outside the workspace, which is the common
+            // case -- a GDS usually lives in a build/output directory, not
+            // the repo. The pattern is a non-recursive '*' with the filename
+            // matched in the handler instead of baked into the glob: layout
+            // names do contain glob metacharacters ("chip[v2].gds"), and
+            // there's no way to escape those in a VS Code glob.
+            const watchedPath = document.uri.fsPath;
+            const watcher = vscode.workspace.createFileSystemWatcher(
+                new vscode.RelativePattern(vscode.Uri.file(path.dirname(watchedPath)), '*')
+            );
+            const onWatchEvent = (uri) => {
+                if (uri.fsPath === watchedPath) onDiskChange();
+            };
+            disposables.push(
+                watcher,
+                watcher.onDidChange(onWatchEvent),
+                // Rename-over-target writers delete and re-create rather than
+                // modifying in place, so a create is a content change too.
+                watcher.onDidCreate(onWatchEvent)
+            );
+
+            // Keep the banner's checkbox in step with the setting, including
+            // when it's changed from the Settings UI or another viewer.
+            post({ type: 'autoReloadState', enabled: autoReloadEnabled() });
+            disposables.push(
+                vscode.workspace.onDidChangeConfiguration((event) => {
+                    if (event.affectsConfiguration('GDS-Lens.autoReload')) {
+                        post({ type: 'autoReloadState', enabled: autoReloadEnabled() });
+                    }
+                })
+            );
 
             webviewPanel.webview.onDidReceiveMessage(async (message) => {
+                if (message.command === 'reloadFile') {
+                    await sendLayout(true);
+                    return;
+                }
+                if (message.command === 'setAutoReload') {
+                    // Global rather than workspace: layouts are usually opened
+                    // from outside any workspace folder, where a
+                    // workspace-scoped write would silently not apply.
+                    await vscode.workspace.getConfiguration('GDS-Lens')
+                        .update('autoReload', !!message.value, vscode.ConfigurationTarget.Global);
+                    return;
+                }
                 if (message.command === 'loadLypFile') {
                     const options = {
                         canSelectMany: false,
@@ -257,17 +449,8 @@ class GdsEditorProvider {
                 }
             });
 
-            logger.appendLine('>>> Streaming raw layout bytes down into the wasm webview context...');
-            logger.appendLine('    fileData bytes: ' + fileData.byteLength);
             logger.appendLine('    cspSource: ' + webviewPanel.webview.cspSource);
-            // fileData crosses as a raw ArrayBuffer (as it always has) --
-            // only the worker bundle text needed the HTML-embedding
-            // workaround above; binary ArrayBuffers here haven't shown the
-            // same RPC-channel issue large strings did.
-            webviewPanel.webview.postMessage({
-                type: 'init',
-                fileData: Uint8Array.from(fileData).buffer
-            });
+            if (!(await sendLayout(false))) return;
 
             // Re-apply the most recently loaded .lyp, if any. Safe to post now:
             // viewer.js's 'lypLoaded' handler waits on the wasm module, and the

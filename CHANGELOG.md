@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- Reloading when the layout changes on disk. A viewer now watches its own
+  file, and when a generator script or KLayout rewrites it, a header offers a
+  Reload button. Reloading keeps the camera and the per-layer visibility
+  checkboxes, so re-running a generator drops the new geometry in place
+  instead of throwing you back to a framed view of the whole design; layers
+  the edit newly introduced keep the fresh load's defaults. A
+  `GDS-Lens.autoReload` setting (off by default, also togglable from the panel
+  and from the header itself) re-reads without asking. Reads wait for the file
+  to hold a steady size and mtime before starting, since layout writers rarely
+  produce one clean change event — chunked writes and write-to-temp-then-rename
+  would otherwise be read half-finished — and a reload supersedes any load
+  still in flight rather than racing it.
+- Switching away from a viewer tab and back no longer leaves it stuck on
+  "Loading layout...". VS Code was destroying the webview's DOM whenever the
+  tab was hidden and re-running the viewer from scratch on return, but the
+  file bytes are only ever sent once per editor, so the restored webview had
+  nothing to load. The webview now retains its context while hidden, which
+  also means a tab switch no longer costs a re-parse on a large design. The
+  trade-off is that a hidden viewer keeps its wasm heap and GL context
+  resident.
+
 ## [1.4.1] - 2026-08-05
 
 - GDS Lens is now published on [Open VSX](https://open-vsx.org/extension/ethml/GDS-Lens)

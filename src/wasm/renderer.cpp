@@ -2607,6 +2607,35 @@ void reset_view() {
     request_redraw();
 }
 
+// Camera read/write, used to reload a layout in place (see the
+// "newer version on disk" banner in viewer.js). A reload runs the whole
+// parse -> uploadLayers path again, and uploadLayers always re-frames the
+// view on the new design's bbox -- fine on first open, but it would throw
+// away wherever the user was looking on every re-read, which is exactly the
+// thing you don't want while a generator rewrites the file underneath you.
+// Capturing before and restoring after keeps the view put.
+val getCamera() {
+    val out = val::object();
+    out.set("zoom", g_zoom);
+    out.set("panX", g_pan_x);
+    out.set("panY", g_pan_y);
+    return out;
+}
+
+// Clamped against the *new* design's fit zoom and bbox, not the old one --
+// if the layout shrank drastically between reads, the old camera can sit
+// outside what the new geometry allows, and the clamps are what keep the
+// restore from parking the view in empty space.
+void setCamera(float zoom, float pan_x, float pan_y) {
+    if (!(zoom > 0.0f)) return;  // also rejects NaN
+    g_zoom = clamp_zoom_value(zoom);
+    g_pan_x = pan_x;
+    g_pan_y = pan_y;
+    clamp_pan();
+    update_scale_bar();
+    request_redraw();
+}
+
 bool on_resize(int /*eventType*/, const EmscriptenUiEvent* /*e*/, void* /*userData*/) {
     resize_canvas();
     return true;
@@ -3771,6 +3800,8 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("getLayers", &getLayers);
     function("setLayerVisible", &setLayerVisible);
     function("resetView", &reset_view);
+    function("getCamera", &getCamera);
+    function("setCamera", &setCamera);
     function("setShowInfill", &setShowInfill);
     function("setShowText", &setShowText);
     function("setMergeMode", &setMergeMode);
