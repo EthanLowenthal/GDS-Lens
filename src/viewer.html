@@ -175,6 +175,66 @@
         .lil-gui .lil-controller.marker-selected button { background: var(--select-bg) !important; }
         .lil-gui .lil-controller.marker-selected .lil-name { color: var(--select-fg); }
         .lil-gui .lil-controller.marker-more-row { opacity: 0.55; pointer-events: none; }
+        /* ---- Hierarchy tree (see renderHierarchy in viewer.js) ----
+           The design's cell tree, down the left edge. Like the lil-gui panel
+           on the right it floats over the canvas rather than taking width
+           from it: the canvas stays the full window, so nothing about the
+           renderer's sizing, hit-testing or camera has to know this panel
+           exists. It outranks both progress UIs (z 25/26) so a reload doesn't
+           draw its hairline bar across the tree, but stays under the
+           full-screen loading overlay (z 30) and the debug panel (z 40). */
+        #hierarchyPanel { position: absolute; top: 0; left: 0; bottom: 0; width: 260px; z-index: 27;
+                          box-sizing: border-box; display: flex; flex-direction: column;
+                          background: var(--scrim); border-right: 1px solid var(--border);
+                          font-family: monospace; font-size: 11px; color: var(--surface-fg); }
+        #hierarchyPanel.hidden { display: none; }
+        #hierarchyHeader { display: flex; align-items: center; gap: 8px; flex: none; padding: 6px 8px;
+                           color: var(--fg-dim); border-bottom: 1px solid var(--border); }
+        #hierarchyTitle { flex: 1; }
+        #hierarchyCount { color: var(--fg-faint); }
+        #hierarchyHide { cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        #hierarchyHide:hover { opacity: 1; }
+        #hierarchyTree { flex: 1; overflow: auto; padding: 4px 0 8px; }
+        /* One row per node. The whole row frames its cell on click, so it's
+           the click target; only the left indent varies with depth (set
+           inline, since it's per-row). */
+        .hier-row { display: flex; align-items: center; gap: 4px; padding: 2px 8px 2px 0;
+                    white-space: nowrap; cursor: pointer; }
+        .hier-row:hover { background: var(--surface); }
+        .hier-row.hier-selected, .hier-row.hier-selected:hover { background: var(--accent); color: var(--accent-fg); }
+        /* A cell with no geometry anywhere under it -- there's nothing to
+           frame, so the row only selects. */
+        .hier-row.hier-boxless { opacity: 0.55; cursor: default; }
+        .hier-twisty { flex: none; width: 12px; text-align: center; color: var(--fg-faint); }
+        /* flex + min-width:0 is what lets a long cell name actually truncate:
+           a flex item's default min-width is its content, and a cell name is
+           one unbreakable word, so without this the row grows and the panel
+           scrolls sideways instead. Taking the leftover width also pins the
+           placement count to the right edge. */
+        .hier-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        /* Placement count ("×64"), shown only when the cell is placed more
+           than once by its parent. */
+        .hier-count { flex: none; color: var(--fg-faint); }
+        .hier-row.hier-selected .hier-twisty, .hier-row.hier-selected .hier-count { color: var(--accent-fg); }
+        .hier-children.hidden { display: none; }
+        /* Stand-in for a tree: no cells to show, or too many to describe. */
+        #hierarchyTree .hier-note { padding: 6px 10px; color: var(--fg-faint); white-space: normal; line-height: 1.5; }
+        /* Reopens the panel after it's been hidden; sits where the panel's own
+           header was. Hidden while the panel is open, and while there's no
+           tree to reopen (viewer.js adds .hidden for that). */
+        #hierarchyShowBtn { position: absolute; top: 8px; left: 8px; z-index: 27; font-family: monospace;
+                            font-size: 10px; background: var(--surface); color: var(--fg-dim);
+                            border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 8px;
+                            cursor: pointer; opacity: 0.6; }
+        #hierarchyShowBtn:hover { opacity: 1; }
+        #hierarchyShowBtn.hidden, body.hierarchy-open #hierarchyShowBtn { display: none; }
+        /* Everything else anchored to the left edge starts after whichever of
+           the two is on screen -- the panel, or just the button that reopens
+           it (.hierarchy-available). The open rule comes second so it wins
+           when both classes are set. */
+        body.hierarchy-available #staleBanner { left: 88px; }
+        body.hierarchy-open #staleBanner { left: 268px; }
+        body.hierarchy-open #debugToggleBtn { left: 268px; }
         /* "Newer version on disk" header (see the fileChanged handler in
            viewer.js). Sits above the lil-gui panel (z 20) but below the
            loading overlay (z 30), since it's hidden while a load runs
@@ -255,6 +315,19 @@
         <span id="staleDismiss" title="Dismiss until the next change">✕</span>
     </div>
     <canvas id="glCanvas"></canvas>
+
+    <!-- Cell hierarchy: rows are built by renderHierarchy in viewer.js from
+         the tree parseGdsToLayers hands back, lazily as branches open. -->
+    <div id="hierarchyPanel" class="hidden">
+        <div id="hierarchyHeader">
+            <span id="hierarchyTitle">Hierarchy</span>
+            <span id="hierarchyCount"></span>
+            <span id="hierarchyHide" title="Hide the hierarchy tree (H)">✕</span>
+        </div>
+        <div id="hierarchyTree"></div>
+    </div>
+    <button id="hierarchyShowBtn" type="button" class="hidden"
+            title="Show the design's cell hierarchy (H)">Hierarchy</button>
 
     <div id="debugPanel" class="hidden">
         <div id="debugPanelHeader">

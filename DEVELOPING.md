@@ -76,6 +76,15 @@ Note that `#ui` — the engine readout — lives inside the debug panel, which i
 closed unless the debug command opened it, so it must never be the only place
 an error is written.
 
+The hierarchy tree (`build_hierarchy` in `renderer.cpp`) is sized by the
+*library*, not by the flattened design: one JS object and one memoized bounding
+box per cell in the file, regardless of how many times each cell is placed. So
+it costs a fraction of the flatten that follows it, and `kMaxHierarchyCells`
+(50,000) is a guard against pathological generated libraries rather than a
+limit real designs approach — past it the tree is omitted and the panel says
+why, since describing a library that large costs more than the geometry the
+tree exists to navigate.
+
 ## Publishing
 
 The extension goes to two registries: the **VS Code Marketplace** (VS Code

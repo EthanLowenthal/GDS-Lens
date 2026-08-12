@@ -1,5 +1,55 @@
 # Change Log
 
+## [Unreleased]
+
+- Wheel zoom is no longer wildly over-sensitive on a trackpad. Every wheel
+  event applied one fixed 1.15× step regardless of how far the event said the
+  wheel had turned, which is right for a stepped mouse wheel (one event per
+  detent) and badly wrong for a trackpad or any smooth-scrolling wheel, which
+  report a stream of small deltas instead — a single two-finger swipe could
+  arrive as 40 events and zoom by more than 100×. The step is now proportional
+  to the event's delta, normalized against the conventional 100 pixels (or 3
+  lines) per notch, and capped per event so momentum scrolling can't leap
+  decades of zoom in one frame. A notch is now 1.10× rather than 1.15×, so a
+  stepped wheel is also slightly calmer than before.
+- A cell hierarchy tree down the left edge of the viewer. The renderer
+  flattens the design to draw it, which left nothing on screen saying what the
+  design is *made of*; the panel now lists the top cell(s) and, as branches are
+  opened, the cells each one places. Clicking a row frames that cell in the
+  view, which makes the tree a way to navigate a layout rather than just read
+  it — the fastest way to get from a whole reticle to one macro.
+  - Rows collapse per cell, not per placement: a cell a parent places 40,000
+    times is one row marked `×40000`, since the alternative is a panel with
+    40,000 identical siblings in it. Clicking that row frames all of the
+    placements; opening it descends into the first, because a repeated cell has
+    no single deeper coordinate frame to offer. The row's tooltip says so,
+    along with the cell's own shape/label/child counts and its size and centre.
+  - Rows are built only for branches that are open. `cells[]` describes each
+    cell once, but the tree it spans is that DAG expanded, which for a real
+    chip is orders of magnitude larger than the library it came from — and
+    nobody reads more of it than they opened.
+  - The structure comes out of the same wasm parse as the geometry (a new
+    `build_hierarchy` in `renderer.cpp`), before the flatten, since it needs
+    the gdstk `Library`'s reference arrays. Nothing per-polygon crosses into JS
+    with it: one entry per cell in the file, carrying names, counts, and a box.
+  - Each cell's extent is measured bottom-up over a memo, so a cell shared by a
+    thousand parents is measured once, and an arrayed reference is sized from
+    its repetition's extreme offsets rather than by walking every copy — an
+    AREF can hold millions. The one deliberate approximation is that a rotated
+    cell is framed by the box of its box's mapped corners, which over-estimates
+    slightly and is invisible when it's used to aim a camera. Past 50,000 cells
+    the tree is dropped rather than built (the panel says so): describing a
+    library that size costs more than the geometry it's meant to navigate.
+  - The panel floats over the canvas like the layer panel on the right rather
+    than taking width from it, so nothing about the renderer's sizing,
+    hit-testing or camera had to learn it exists. It starts collapsed behind a
+    button in the top-left corner (`H` toggles it too) — the viewport belongs
+    to the layout, and 260px of it is something to ask for rather than be
+    given — and opening it by hand makes that choice stick for the rest of the
+    session. Open branches and the selected cell are keyed by cell-name path,
+    so reloading an edited file leaves the tree where it was instead of
+    collapsing it to the roots.
+
 ## [1.5.0] - 2026-08-11
 
 - The measure tool is now a mouse mode instead of a checkbox: the panel shows a

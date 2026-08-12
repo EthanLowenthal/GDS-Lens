@@ -16,6 +16,8 @@ colors.
 - Optional KLayout `.lyp` file loading for custom layer colors.
 - Handles SREF/AREF (including array references), rotation, mirroring, and
   magnification via gdstk's flattening.
+- A cell hierarchy tree down the left edge: browse the design's cells and
+  click one to frame it.
 - Per-layer visibility toggles, an infill (fill pattern) toggle, and a text
   toggle for the layout's own labels.
 - Measure tool: click two points to read out the distance between them.
@@ -34,6 +36,15 @@ Lens viewer (the format is read from the file's own header, so a layout named
 with an unexpected extension still loads correctly):
 
 - **Pan / zoom** — drag to pan, scroll to zoom.
+- **Hierarchy** — the panel down the left edge is the design's cell tree,
+  starting from its top cell(s). Click the ▸ to open a cell and see the cells
+  it places; click the row itself to frame that cell in the view. A cell placed
+  more than once by its parent is one row marked `×N` — clicking it frames all
+  N placements, and opening it follows the first. The panel starts collapsed:
+  the **Hierarchy** button in the top-left corner opens it (as does `H`), and
+  the ✕ in its header puts it away again. Once opened it stays open for the rest
+  of the session, and open branches and the selected cell survive a reload, so
+  re-running a generator leaves the tree where you had it.
 - **Layers** — toggle individual layer visibility from the panel.
 - **Infill** — toggle the hatched layer fill on or off from the panel.
 - **Text** — toggle the layout's text labels (GDSII/OASIS `TEXT` elements) on

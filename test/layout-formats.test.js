@@ -89,6 +89,69 @@ test("parses GDSII and OASIS, detecting the format from the header", { skip }, a
     assert.strictEqual(oas.totalPolygons, 9n);
 });
 
+// The cell tree the viewer's hierarchy panel is built from (build_hierarchy in
+// renderer.cpp): structure only -- names, child lists, placement counts and
+// boxes -- alongside the flattened geometry the same parse produces.
+test("describes the cell hierarchy, collapsing an AREF into one child entry", { skip }, async () => {
+    const Module = await loadModule();
+
+    // Everything except each child entry's xform, which is the *first*
+    // placement's transform: the two fixtures are two writes of one design and
+    // list TOP's three references to CHILD in different orders, so which copy
+    // comes first legitimately differs between them.
+    const structure = (hierarchy) => ({
+        cellCount: hierarchy.cellCount,
+        omitted: hierarchy.omitted,
+        roots: hierarchy.roots,
+        cells: hierarchy.cells.map((cell) => ({
+            name: cell.name,
+            polygons: cell.polygons,
+            labels: cell.labels,
+            bbox: cell.bbox,
+            refs: cell.refs.map((ref) => ({ cell: ref.cell, count: ref.count, bbox: ref.bbox })),
+        })),
+    });
+
+    const gds = parseFixture(Module, "sample_layout.gds");
+    assert.strictEqual(gds.ok, true, gds.error);
+    const hierarchy = gds.hierarchy;
+
+    assert.strictEqual(hierarchy.cellCount, 2);
+    assert.strictEqual(hierarchy.omitted, false);
+    assert.strictEqual(hierarchy.roots.length, 1);
+
+    const top = hierarchy.cells[hierarchy.roots[0]];
+    assert.strictEqual(top.name, "TOP");
+    assert.strictEqual(top.polygons, 1);
+    // A top cell's own frame is world space, so its box is the design's.
+    assert.deepStrictEqual(top.bbox, gds.bbox);
+
+    // TOP places CHILD three times -- twice standalone and once as a 3x2 array
+    // -- which is one child entry standing for 8 placements, not three entries
+    // or eight.
+    assert.strictEqual(top.refs.length, 1);
+    const child = top.refs[0];
+    assert.strictEqual(child.count, 8);
+    // Spans every one of those 8 placements, in TOP's coordinates: the pair of
+    // standalone 2x1um boxes plus the array reaching x=8um and y=13um.
+    assert.deepStrictEqual(child.bbox, {minX: 0, maxX: 8, minY: 6, maxY: 13});
+    // The first placement's transform, as [a, b, c, d, tx, ty]: nothing in this
+    // fixture is rotated or mirrored, so the linear part is the identity (the
+    // +0 normalizes the -0 that the sin(0) term leaves in b).
+    assert.deepStrictEqual(child.xform.slice(0, 4).map((v) => v + 0), [1, 0, 0, 1]);
+
+    const leaf = hierarchy.cells[child.cell];
+    assert.strictEqual(leaf.name, "CHILD");
+    assert.deepStrictEqual(leaf.refs, []);
+    // In CHILD's own frame, which is what makes the same entry reusable for
+    // every parent that places it.
+    assert.deepStrictEqual(leaf.bbox, {minX: 0, maxX: 2, minY: 0, maxY: 1});
+
+    const oas = parseFixture(Module, "sample_layout.oas");
+    assert.strictEqual(oas.ok, true, oas.error);
+    assert.deepStrictEqual(structure(oas.hierarchy), structure(hierarchy));
+});
+
 test("rejects a file that is neither GDSII nor OASIS", { skip }, async () => {
     const Module = await loadModule();
 
