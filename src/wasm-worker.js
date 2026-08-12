@@ -97,7 +97,7 @@ self.onmessage = (event) => {
             return;
         }
 
-        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "labels:", result.totalLabels, "-- posting gdsResult back to main thread");
+        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "labels:", result.totalLabels, "cells:", result.hierarchy.cellCount, "-- posting gdsResult back to main thread");
         const transferList = [];
         for (const layer of result.layers) {
             transferList.push(layer.outlineVertices.buffer, layer.fillVertices.buffer);
@@ -114,8 +114,12 @@ self.onmessage = (event) => {
                 transferList.push(layer.outlineVertices.buffer, layer.fillVertices.buffer);
             }
         }
+        // hierarchy (see build_hierarchy in renderer.cpp) is plain objects and
+        // numbers -- no typed arrays to transfer, and small next to the
+        // geometry above: one entry per cell in the file, not per placement.
         postMessage(
-            {type: "gdsResult", ok: true, layers: result.layers, instanceGroups: result.instanceGroups, bbox: result.bbox},
+            {type: "gdsResult", ok: true, layers: result.layers, instanceGroups: result.instanceGroups,
+             hierarchy: result.hierarchy, bbox: result.bbox},
             transferList
         );
         console.log("[GDS worker] postMessage(gdsResult) call returned");

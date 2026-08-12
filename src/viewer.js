@@ -339,6 +339,268 @@ function renderLayerList(layers) {
     }
 }
 
+// ---- Hierarchy tree (left panel) ----
+// The design's cell tree, as parseGdsToLayers hands it back (see
+// build_hierarchy in renderer.cpp): a flat cells[] array of
+// {name, polygons, labels, bbox, refs} plus the indices of the top-level
+// cells, where each ref is {cell, count, bbox, xform} -- one entry per
+// distinct cell a parent places, however many times it places it.
+//
+// Rows are built lazily, only when a branch is opened: cells[] describes each
+// cell once, but the tree it spans is the expansion of a DAG, so a mid-sized
+// chip's fully materialized tree is far larger than its library -- and nobody
+// reads more than the few branches they opened.
+const hierarchyPanel = document.getElementById("hierarchyPanel");
+const hierarchyTree = document.getElementById("hierarchyTree");
+const hierarchyCount = document.getElementById("hierarchyCount");
+const hierarchyHide = document.getElementById("hierarchyHide");
+const hierarchyShowBtn = document.getElementById("hierarchyShowBtn");
+
+let hierarchyModel = null;
+// Open branches and the selected row are keyed by their path of cell names
+// ("TOP/PIXEL/TAP"), not by DOM node: a reload throws every row away, and a
+// path still identifies the same branch in the re-read file, so an edit-and-
+// reload lands back where you were rather than collapsed to the roots.
+const hierarchyExpanded = new Set();
+let hierarchySelectedPath = null;
+let hierarchySelectedRow = null;
+// Which design the state above belongs to, so opening a different file starts
+// from a clean tree instead of inheriting another design's open branches.
+let hierarchyRootKey = null;
+// Set once the user hides or shows the panel by hand; from then on that
+// decision wins over the default below on every subsequent load.
+let hierarchyUserChoice = null;
+// Mirrors kMaxHierarchyDepth in renderer.cpp. References form a DAG in any
+// valid file, so this only bites a malformed one that closes a loop -- where a
+// branch could otherwise be opened without end.
+const HIERARCHY_MAX_DEPTH = 256;
+
+// [a, b, c, d, tx, ty] laid out as renderer.cpp's Affine2D: x' = a*x + b*y + tx,
+// y' = c*x + d*y + ty.
+const HIERARCHY_IDENTITY = [1, 0, 0, 1, 0, 0];
+
+// compose(outer, inner) applied to a point == outer applied to inner applied
+// to it (the JS twin of compose_affine in renderer.cpp).
+function composeXform(outer, inner) {
+    return [
+        outer[0] * inner[0] + outer[1] * inner[2],
+        outer[0] * inner[1] + outer[1] * inner[3],
+        outer[2] * inner[0] + outer[3] * inner[2],
+        outer[2] * inner[1] + outer[3] * inner[3],
+        outer[0] * inner[4] + outer[1] * inner[5] + outer[4],
+        outer[2] * inner[4] + outer[3] * inner[5] + outer[5]
+    ];
+}
+
+// A box mapped through a transform, as the box of its four mapped corners --
+// an over-estimate under a non-90° rotation, same as the wasm side's
+// placed_box, and for framing the camera that's immaterial.
+function transformBox(m, box) {
+    const corners = [[box.minX, box.minY], [box.maxX, box.minY], [box.minX, box.maxY], [box.maxX, box.maxY]];
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const [x, y] of corners) {
+        const wx = m[0] * x + m[1] * y + m[4];
+        const wy = m[2] * x + m[3] * y + m[5];
+        minX = Math.min(minX, wx);
+        maxX = Math.max(maxX, wx);
+        minY = Math.min(minY, wy);
+        maxY = Math.max(maxY, wy);
+    }
+    return { minX, maxX, minY, maxY };
+}
+
+// Shows/hides the panel. byUser marks the entry points the user drives (the
+// header's ✕, the reopen button, the H key), which is what makes the choice
+// stick across loads.
+function setHierarchyOpen(open, byUser) {
+    if (byUser) hierarchyUserChoice = open;
+    if (hierarchyPanel) hierarchyPanel.classList.toggle("hidden", !open);
+    document.body.classList.toggle("hierarchy-open", open);
+}
+
+function hierarchySelect(row, path) {
+    if (hierarchySelectedRow) hierarchySelectedRow.classList.remove("hier-selected");
+    hierarchySelectedRow = row;
+    hierarchySelectedPath = path;
+    row.classList.add("hier-selected");
+}
+
+function hierarchyTooltip(cell, node, box) {
+    const lines = [cell.name];
+    if (node.count > 1) {
+        // Only the first copy is walked into, so say so on the row rather than
+        // leaving "expand" and "×64" to look like a contradiction.
+        lines.push(`${node.count} placements here (expanding follows the first)`);
+    }
+    lines.push(`${cell.polygons} own shape${cell.polygons === 1 ? "" : "s"}, ` +
+               `${cell.labels} label${cell.labels === 1 ? "" : "s"}, ` +
+               `${cell.refs.length} child cell${cell.refs.length === 1 ? "" : "s"}`);
+    if (box) {
+        lines.push(`${fmtCoord(box.maxX - box.minX)} × ${fmtCoord(box.maxY - box.minY)} µm ` +
+                   `at (${fmtCoord((box.minX + box.maxX) / 2)}, ${fmtCoord((box.minY + box.maxY) / 2)}) — click to zoom`);
+    } else {
+        lines.push("empty — no geometry to zoom to");
+    }
+    return lines.join("\n");
+}
+
+// Appends a row per entry of `nodes` (ref entries, or the synthetic root
+// entries built in renderHierarchy) to `container`.
+//
+// parentXform maps the parent cell's own coordinates into world space, so a
+// node's world box is its bbox -- which is in the parent's frame, spanning
+// every placement the entry stands for -- mapped through it. Descending
+// instead composes the entry's own xform, the *first* placement's: a cell
+// placed 64 times is one row that frames all 64, and opening it walks into one
+// of them, because there is no single deeper coordinate frame to offer.
+function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
+    for (const node of nodes) {
+        const cell = hierarchyModel.cells[node.cell];
+        if (!cell) continue;
+
+        const path = parentPath ? `${parentPath}/${cell.name}` : cell.name;
+        const box = node.bbox ? transformBox(parentXform, node.bbox) : null;
+        const childXform = composeXform(parentXform, node.xform);
+        const expandable = cell.refs.length > 0 && depth + 1 < HIERARCHY_MAX_DEPTH;
+
+        const row = document.createElement("div");
+        row.className = "hier-row";
+        row.style.paddingLeft = `${6 + depth * 12}px`;
+        if (!box) row.classList.add("hier-boxless");
+
+        const twisty = document.createElement("span");
+        twisty.className = "hier-twisty";
+        twisty.textContent = expandable ? "▸" : "";
+        const name = document.createElement("span");
+        name.className = "hier-name";
+        name.textContent = cell.name;
+        const count = document.createElement("span");
+        count.className = "hier-count";
+        if (node.count > 1) count.textContent = `×${node.count}`;
+        row.append(twisty, name, count);
+        row.title = hierarchyTooltip(cell, node, box);
+
+        const children = document.createElement("div");
+        children.className = "hier-children hidden";
+        container.append(row, children);
+
+        let built = false;
+        function setExpanded(open) {
+            if (!expandable) return;
+            if (open && !built) {
+                built = true;
+                addHierarchyRows(children, cell.refs, depth + 1, path, childXform);
+            }
+            children.classList.toggle("hidden", !open);
+            twisty.textContent = open ? "▾" : "▸";
+            if (open) hierarchyExpanded.add(path);
+            else hierarchyExpanded.delete(path);
+        }
+
+        twisty.addEventListener("click", (event) => {
+            // The twisty sits inside the row, whose own click moves the
+            // camera -- opening a branch shouldn't also fly the view there.
+            event.stopPropagation();
+            setExpanded(children.classList.contains("hidden"));
+        });
+        row.addEventListener("click", () => {
+            hierarchySelect(row, path);
+            if (!box) return;
+            modulePromise.then((Module) => Module.zoomToBox(box.minX, box.minY, box.maxX, box.maxY));
+        });
+
+        if (path === hierarchySelectedPath) hierarchySelect(row, path);
+        if (hierarchyExpanded.has(path)) setExpanded(true);
+    }
+}
+
+// Rebuilds the tree from a freshly loaded design (or clears it, for model
+// null -- a load that failed has no hierarchy to browse).
+function renderHierarchy(model) {
+    if (!hierarchyTree) return;
+    hierarchyModel = model;
+    hierarchySelectedRow = null;
+    hierarchyTree.textContent = "";
+
+    const cells = (model && model.cells) || [];
+    // Filtered once here so everything below can index cells[] freely -- the
+    // omitted case ships no cells at all, and a root that names no cell would
+    // otherwise throw somewhere less obvious.
+    const roots = ((model && model.roots) || []).filter((index) => cells[index]);
+    const cellCount = model ? model.cellCount : 0;
+
+    // .hierarchy-available says there's a tree to show, open or not, which is
+    // what the stale banner's left edge keys off (the reopen button sits in
+    // the same corner it starts in).
+    document.body.classList.toggle("hierarchy-available", cellCount > 0);
+
+    if (!model || cellCount === 0) {
+        if (hierarchyCount) hierarchyCount.textContent = "";
+        if (hierarchyShowBtn) hierarchyShowBtn.classList.add("hidden");
+        setHierarchyOpen(false);
+        return;
+    }
+    if (hierarchyShowBtn) hierarchyShowBtn.classList.remove("hidden");
+    if (hierarchyCount) hierarchyCount.textContent = `${cellCount} cell${cellCount === 1 ? "" : "s"}`;
+
+    // A different design: drop the previous one's open branches and selection
+    // rather than matching them against unrelated cell names.
+    const rootKey = roots.map((i) => cells[i].name).join(" ");
+    if (rootKey !== hierarchyRootKey) {
+        hierarchyRootKey = rootKey;
+        hierarchyExpanded.clear();
+        hierarchySelectedPath = null;
+    }
+
+    if (model.omitted) {
+        const note = document.createElement("div");
+        note.className = "hier-note";
+        note.textContent = `This design has ${cellCount} cells — too many to browse as a tree, so it isn't built.`;
+        hierarchyTree.append(note);
+        setHierarchyOpen(hierarchyUserChoice === true);
+        return;
+    }
+
+    // First look at a design: open the top cell, so the panel shows what it's
+    // made of instead of a single row you have to click to learn anything.
+    if (hierarchyExpanded.size === 0 && roots.length > 0) {
+        hierarchyExpanded.add(cells[roots[0]].name);
+    }
+
+    // Top-level cells are drawn as if referenced once by an invisible parent
+    // at the identity transform -- their own coordinates *are* world
+    // coordinates, which is exactly what that entry says.
+    const rootNodes = roots.map((index) => ({
+        cell: index,
+        count: 1,
+        bbox: cells[index].bbox,
+        xform: HIERARCHY_IDENTITY
+    }));
+    addHierarchyRows(hierarchyTree, rootNodes, 0, "", HIERARCHY_IDENTITY);
+
+    // Closed by default: the viewport belongs to the layout, and a panel that
+    // takes 260px of it should be something you ask for. The rows above are
+    // built either way -- they're what makes reopening instant -- and once the
+    // panel has been opened by hand it stays open for the rest of the session,
+    // including across reloads and other files.
+    setHierarchyOpen(hierarchyUserChoice === true);
+}
+
+// Both the ✕ and the reopen button are the user speaking, as is the H key
+// below -- all three go through here so the choice sticks.
+function toggleHierarchy() {
+    // Nothing loaded (or nothing to show): don't open an empty panel.
+    if (!hierarchyPanel || !hierarchyModel || !hierarchyModel.cellCount) return;
+    setHierarchyOpen(hierarchyPanel.classList.contains("hidden"), true);
+}
+
+if (hierarchyHide) {
+    hierarchyHide.addEventListener("click", () => setHierarchyOpen(false, true));
+}
+if (hierarchyShowBtn) {
+    hierarchyShowBtn.addEventListener("click", () => setHierarchyOpen(true, true));
+}
+
 // ---- Marker browser (DRC/LVS violation databases) ----
 // The parsed normalized model (see marker-parsers.js) is the JS-side source
 // of truth for the browser UI; wasm only holds the flattened geometry it
@@ -498,6 +760,9 @@ window.addEventListener("keydown", (event) => {
     // always lands back in pan mode and drops the ruler.
     else if (event.key === "m" || event.key === "M") setMode(currentMode === "measure" ? "pan" : "measure");
     else if (event.key === "Escape") setMode("pan");
+    // H shows/hides the hierarchy tree -- it's the one panel that takes a
+    // slice of the viewport, so getting it out of the way is worth a key.
+    else if (event.key === "h" || event.key === "H") toggleHierarchy();
 }, true);
 
 // ---- "Newer version on disk" banner ----
@@ -589,6 +854,10 @@ function showFatalError(message) {
     console.error("[GDS] load failed:", message);
     loadError.textContent = "Could not open this layout\n\n" + message;
     endProgress();
+    // Nothing loaded, so there's no cell tree to browse -- and leaving the
+    // previous file's one up beside the error would invite clicking rows that
+    // frame geometry no longer on screen.
+    renderHierarchy(null);
     modulePromise.then((Module) => {
         Module.showLoadError(message);
         renderLayerList(Module.getLayers());
@@ -904,6 +1173,7 @@ function startWorker(worker, fileData) {
                     pendingViewState = null;
                 }
                 renderLayerList(Module.getLayers());
+                renderHierarchy(workerMessage.hierarchy);
                 endProgress();
                 console.log("[GDS] done, progress hidden");
             }, (err) => {

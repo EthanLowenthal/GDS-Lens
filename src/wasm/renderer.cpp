@@ -2595,6 +2595,308 @@ void report_progress(const char* phase, uint64_t current, uint64_t total) {
         phase, (double)current, (double)total);
 }
 
+// ---- Cell hierarchy (the viewer's left-hand tree) ----
+// Structure only: each cell's name, which cells it places, and where those
+// placements land. No geometry crosses into JS here -- what gets drawn is
+// still the flattened per-layer buffers, and the tree exists to navigate the
+// design (click a cell, frame it) rather than to render it. Read off the
+// Library before the flatten, since lib.free_all() takes the reference arrays
+// with it.
+
+// Ceiling on how many cells the tree describes. Every cell becomes a JS
+// object carrying its own child list, so a machine-generated library with a
+// million single-shape cells would spend more memory describing the design
+// than drawing it -- and a tree that large is not something anyone browses.
+// Past this the tree is dropped and the panel says why.
+constexpr size_t kMaxHierarchyCells = 50000;
+
+// Depth ceiling for the bbox recursion below. References form a DAG in any
+// valid file and the memo makes even a wide one cheap; `visiting` catches a
+// malformed file that closes a loop, and this catches a pathological but
+// acyclic depth before the stack does.
+constexpr int kMaxHierarchyDepth = 256;
+
+// min > max means "nothing in it", the same sentinel parseGdsToLayers uses for
+// the design bbox: an empty cell is a real thing in a layout (a placeholder,
+// or one holding only references to empty cells) and has no box to frame.
+struct HierBox {
+    double min_x = HUGE_VAL, max_x = -HUGE_VAL, min_y = HUGE_VAL, max_y = -HUGE_VAL;
+
+    bool valid() const { return min_x <= max_x; }
+
+    void add(const Vec2& p) {
+        min_x = std::min(min_x, p.x);
+        max_x = std::max(max_x, p.x);
+        min_y = std::min(min_y, p.y);
+        max_y = std::max(max_y, p.y);
+    }
+
+    void add(const HierBox& other) {
+        if (!other.valid()) return;
+        add(Vec2{other.min_x, other.min_y});
+        add(Vec2{other.max_x, other.max_y});
+    }
+};
+
+val hier_box_to_val(const HierBox& box) {
+    if (!box.valid()) return val::null();
+    val out = val::object();
+    out.set("minX", box.min_x);
+    out.set("maxX", box.max_x);
+    out.set("minY", box.min_y);
+    out.set("maxY", box.max_y);
+    return out;
+}
+
+// A box widened to cover every copy a repetition makes of it. Only the
+// translation varies across the copies, so the box is slid to the repetition's
+// extreme offsets -- get_extrema rather than get_offsets, because a single
+// repetition can hold millions of copies and only its corners can move the
+// box. A degenerate repetition (zero rows or columns) yields no extrema and so
+// no box, matching a flatten that places nothing for it.
+HierBox spread_repetition(const HierBox& box, const Repetition& repetition) {
+    if (!box.valid() || repetition.type == RepetitionType::None) return box;
+
+    Array<Vec2> extrema = {};
+    repetition.get_extrema(extrema);
+    HierBox out;
+    for (uint64_t i = 0; i < extrema.count; i++) {
+        out.add(Vec2{box.min_x + extrema[i].x, box.min_y + extrema[i].y});
+        out.add(Vec2{box.max_x + extrema[i].x, box.max_y + extrema[i].y});
+    }
+    extrema.clear();
+    return out;
+}
+
+// Extent of a cell's own geometry -- its polygons, paths and label origins,
+// each spread over its own repetition if it has one, and nothing it references
+// -- in the cell's own frame. Label origins count, matching how
+// parseGdsToLayers frames the design: a cell holding only pin text still has a
+// place to be.
+//
+// Deliberately walks the cell's arrays rather than calling get_polygons, whose
+// result is a freshly allocated copy of every polygon: a flat top cell holds
+// millions of them, and this runs *before* the flatten, so a second copy of the
+// largest cell in the design is the last thing to spend the heap on.
+HierBox own_geometry_box(Cell* cell) {
+    HierBox box;
+
+    for (uint64_t i = 0; i < cell->polygon_array.count; i++) {
+        Polygon* poly = cell->polygon_array[i];
+        HierBox shape;
+        for (uint64_t k = 0; k < poly->point_array.count; k++) shape.add(poly->point_array[k]);
+        box.add(spread_repetition(shape, poly->repetition));
+    }
+
+    for (uint64_t i = 0; i < cell->label_array.count; i++) {
+        Label* label = cell->label_array[i];
+        HierBox origin;
+        origin.add(label->origin);
+        box.add(spread_repetition(origin, label->repetition));
+    }
+
+    // Paths are the one thing that has to be built to be measured -- gdstk
+    // gives them no bounding box of their own -- so each is converted on its
+    // own and freed before the next, which holds this to one path's worth of
+    // polygons rather than the whole cell's. to_polygons copies the path's
+    // repetition onto each polygon it produces, which is what spreads it here.
+    Array<Polygon*> path_polygons = {};
+    auto measure_path_polygons = [&box, &path_polygons]() {
+        for (uint64_t k = 0; k < path_polygons.count; k++) {
+            Polygon* poly = path_polygons[k];
+            HierBox shape;
+            for (uint64_t p = 0; p < poly->point_array.count; p++) shape.add(poly->point_array[p]);
+            box.add(spread_repetition(shape, poly->repetition));
+            poly->clear();
+            free_allocation(poly);
+        }
+        path_polygons.count = 0;
+    };
+    for (uint64_t i = 0; i < cell->flexpath_array.count; i++) {
+        cell->flexpath_array[i]->to_polygons(false, 0, path_polygons);
+        measure_path_polygons();
+    }
+    for (uint64_t i = 0; i < cell->robustpath_array.count; i++) {
+        cell->robustpath_array[i]->to_polygons(false, 0, path_polygons);
+        measure_path_polygons();
+    }
+    path_polygons.clear();
+
+    return box;
+}
+
+// Where one reference puts its target, in the *parent's* frame, covering every
+// copy of an arrayed reference. Mapping the target's box (rather than its real
+// outline) through a non-90° rotation over-estimates, which is harmless for
+// framing a camera on it.
+HierBox placed_box(const Reference* ref, const HierBox& target) {
+    if (!target.valid()) return HierBox{};
+
+    // The linear part -- magnification, mirror, rotation -- is shared by every
+    // copy; the origin and the repetition only translate.
+    Affine2D linear = reference_linear_transform(ref);
+    HierBox mapped;
+    const Vec2 corners[4] = {{target.min_x, target.min_y},
+                             {target.max_x, target.min_y},
+                             {target.min_x, target.max_y},
+                             {target.max_x, target.max_y}};
+    for (const Vec2& corner : corners) mapped.add(linear.apply_linear(corner));
+
+    HierBox placed;
+    placed.add(Vec2{mapped.min_x + ref->origin.x, mapped.min_y + ref->origin.y});
+    placed.add(Vec2{mapped.max_x + ref->origin.x, mapped.max_y + ref->origin.y});
+    return spread_repetition(placed, ref->repetition);
+}
+
+// Full extent of a cell -- its own geometry plus everything it places,
+// recursively -- in its own frame. Memoized per cell, so a cell shared by a
+// thousand parents is measured once.
+HierBox cell_box(Cell* cell, std::unordered_map<Cell*, HierBox>& memo, std::unordered_map<Cell*, bool>& visiting,
+                 int depth) {
+    auto found = memo.find(cell);
+    if (found != memo.end()) return found->second;
+    if (depth >= kMaxHierarchyDepth || visiting[cell]) return HierBox{};
+
+    visiting[cell] = true;
+    HierBox box = own_geometry_box(cell);
+    for (uint64_t i = 0; i < cell->reference_array.count; i++) {
+        Reference* ref = cell->reference_array[i];
+        if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
+        box.add(placed_box(ref, cell_box(ref->cell, memo, visiting, depth + 1)));
+    }
+    visiting[cell] = false;
+
+    memo[cell] = box;
+    return box;
+}
+
+// One row of the tree's child list: every reference from a parent cell to the
+// same target collapsed into a single entry. That's what keeps this a *cell*
+// tree -- a memory cell placed 40k times is one row saying "×40000", not 40k
+// rows -- and it means the entry needs two boxes' worth of information: `box`
+// spans all those placements (what clicking the row frames), while `first` is
+// the transform of the first one alone (what a deeper node composes onto, so
+// expanding a repeated cell follows one copy of it).
+struct HierChild {
+    double count = 0;
+    HierBox box;
+    Affine2D first;
+    bool have_first = false;
+};
+
+val hier_xform_to_val(const Affine2D& t) {
+    val out = val::array();
+    out.call<void>("push", t.a);
+    out.call<void>("push", t.b);
+    out.call<void>("push", t.c);
+    out.call<void>("push", t.d);
+    out.call<void>("push", t.tx);
+    out.call<void>("push", t.ty);
+    return out;
+}
+
+// Builds the whole tree payload: a flat cells[] array (children reference each
+// other by index into it, so a shared cell is described once however many
+// parents place it) plus the indices of the cells rendered at top level.
+val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
+    val out = val::object();
+    out.set("cellCount", (double)lib.cell_array.count);
+    out.set("cells", val::array());
+    out.set("roots", val::array());
+
+    if (lib.cell_array.count > kMaxHierarchyCells) {
+        out.set("omitted", true);
+        return out;
+    }
+    out.set("omitted", false);
+
+    std::unordered_map<Cell*, int> cell_index;
+    cell_index.reserve(lib.cell_array.count * 2);
+    for (uint64_t i = 0; i < lib.cell_array.count; i++) cell_index[lib.cell_array[i]] = (int)i;
+
+    // Every cell's extent, bottom-up over the shared memo -- one pass over the
+    // library's own (unflattened) geometry, so this costs a fraction of the
+    // flatten that follows. Progress is reported in ~100 steps rather than per
+    // cell: each report is a postMessage, and 50k of them cost more than the
+    // work they describe.
+    std::unordered_map<Cell*, HierBox> boxes;
+    std::unordered_map<Cell*, bool> visiting;
+    uint64_t report_every = lib.cell_array.count / 100 + 1;
+    for (uint64_t i = 0; i < lib.cell_array.count; i++) {
+        cell_box(lib.cell_array[i], boxes, visiting, 0);
+        if ((i + 1) % report_every == 0) report_progress("hierarchy", i + 1, lib.cell_array.count);
+    }
+    report_progress("hierarchy", lib.cell_array.count, lib.cell_array.count);
+
+    val cells = val::array();
+    for (uint64_t i = 0; i < lib.cell_array.count; i++) {
+        Cell* cell = lib.cell_array[i];
+
+        // Collapse this cell's references per target, keeping first-encounter
+        // order so the tree reads in the order the file placed things.
+        std::vector<Cell*> child_order;
+        std::unordered_map<Cell*, HierChild> children;
+        for (uint64_t r = 0; r < cell->reference_array.count; r++) {
+            Reference* ref = cell->reference_array[r];
+            if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
+            if (cell_index.find(ref->cell) == cell_index.end()) continue;
+            // get_count() is 0 for a plain reference, which still places one
+            // copy (and 0 for a degenerate 0-column array, which places none
+            // -- the flatten skips those too, so skip them here).
+            uint64_t rep_count = ref->repetition.get_count();
+            if (rep_count == 0 && ref->repetition.type != RepetitionType::None) continue;
+
+            auto found = children.find(ref->cell);
+            if (found == children.end()) {
+                child_order.push_back(ref->cell);
+                found = children.emplace(ref->cell, HierChild{}).first;
+            }
+            HierChild& child = found->second;
+            child.count += rep_count > 0 ? (double)rep_count : 1.0;
+            child.box.add(placed_box(ref, boxes[ref->cell]));
+            if (!child.have_first) {
+                // A repetition's first copy is always its (0,0) offset (see
+                // get_offsets), so the first placement is the reference's own
+                // transform.
+                child.first = reference_placement(ref, Vec2{0, 0});
+                child.have_first = true;
+            }
+        }
+
+        val refs = val::array();
+        for (Cell* child_cell : child_order) {
+            const HierChild& child = children[child_cell];
+            val entry = val::object();
+            entry.set("cell", cell_index[child_cell]);
+            entry.set("count", child.count);
+            entry.set("bbox", hier_box_to_val(child.box));
+            entry.set("xform", hier_xform_to_val(child.first));
+            refs.call<void>("push", entry);
+        }
+
+        val cell_entry = val::object();
+        cell_entry.set("name", std::string(cell->name ? cell->name : ""));
+        // Own elements only -- the tree shows what each cell contributes
+        // itself, with its children listed right below it.
+        cell_entry.set("polygons", (double)(cell->polygon_array.count + cell->flexpath_array.count +
+                                            cell->robustpath_array.count));
+        cell_entry.set("labels", (double)cell->label_array.count);
+        cell_entry.set("bbox", hier_box_to_val(boxes[cell]));
+        cell_entry.set("refs", refs);
+        cells.call<void>("push", cell_entry);
+    }
+
+    val root_indices = val::array();
+    for (Cell* root : roots) {
+        auto found = cell_index.find(root);
+        if (found != cell_index.end()) root_indices.call<void>("push", found->second);
+    }
+
+    out.set("cells", cells);
+    out.set("roots", root_indices);
+    return out;
+}
+
 // Locates the next opening <tag> or <tag attr="...">, tolerating attributes,
 // at or after `from`. Returns the position of the '<' (npos if absent) and
 // sets content_start to just past the tag's closing '>'. Self-closing tags
@@ -2797,13 +3099,42 @@ bool on_mouseup(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*us
     return true;
 }
 
+// How much one wheel notch -- one detent of a stepped mouse wheel -- zooms.
+constexpr double kZoomPerNotch = 1.10;
+
+// What one notch is worth in each of the units a wheel event can report in.
+// 100 pixels and 3 lines per notch are the de facto conventions browsers
+// follow; a page is taken as a notch on its own.
+constexpr double kPixelsPerNotch = 100.0;
+constexpr double kLinesPerNotch = 3.0;
+
+// Ceiling on one event's worth of notches. Free-spinning wheels and momentum
+// scrolling can deliver a single delta worth many of them, and without a cap
+// one stray event crosses decades of zoom in a frame.
+constexpr double kMaxNotchesPerEvent = 4.0;
+
 // Zooms around the cursor rather than the view center: the world point
 // currently under the mouse (computed from the vertex shader's inverse --
 // see kVertexShaderSrc) is held fixed on screen across the zoom change by
 // solving for the new pan that keeps it there.
+//
+// The zoom step is proportional to how far the event says the wheel turned,
+// not one fixed step per event. A stepped mouse wheel sends one event per
+// notch, so those are unaffected; a trackpad (or any smooth-scrolling wheel)
+// sends a stream of small deltas instead, and charging each of them a full
+// notch made one two-finger swipe zoom by orders of magnitude.
 bool on_wheel(int /*eventType*/, const EmscriptenWheelEvent* e, void* /*userData*/) {
+    double notches = 0.0;
+    switch (e->deltaMode) {
+        case DOM_DELTA_LINE: notches = e->deltaY / kLinesPerNotch; break;
+        case DOM_DELTA_PAGE: notches = e->deltaY; break;
+        default: notches = e->deltaY / kPixelsPerNotch; break;  // DOM_DELTA_PIXEL
+    }
+    notches = std::max(-kMaxNotchesPerEvent, std::min(kMaxNotchesPerEvent, notches));
+
     float old_zoom = g_zoom;
-    float factor = (e->deltaY < 0) ? 1.15f : (1.0f / 1.15f);
+    // deltaY > 0 is a scroll away from the viewer, which zooms out.
+    float factor = (float)std::pow(kZoomPerNotch, -notches);
     float new_zoom = clamp_zoom_value(old_zoom * factor);
     if (new_zoom != old_zoom) {
         float px = (float)e->mouse.targetX - (float)g_canvas_width * 0.5f;
@@ -3211,6 +3542,11 @@ val parseGdsToLayers(const std::string& path) {
     std::unordered_map<Cell*, double> base_counts;
     for (Cell* root : roots) base_counts[root] += 1.0;
 
+    // The cell tree for the viewer's hierarchy panel. Built here, before the
+    // flatten allocates the design's worth of polygons, because it needs the
+    // Library's own reference arrays and only holds a box per cell.
+    val hierarchy = build_hierarchy(lib, roots);
+
     // Decide which cells are reused enough to GPU-instance, then split the
     // design into static geometry + one instance group per instanced cell.
     std::unordered_map<Cell*, bool> instanced = choose_instanced_cells(lib, base_counts);
@@ -3421,6 +3757,7 @@ val parseGdsToLayers(const std::string& path) {
     result.set("format", std::string(gds_common::format_name(format)));
     result.set("layers", layers);
     result.set("instanceGroups", instance_groups_js);
+    result.set("hierarchy", hierarchy);
     result.set("bbox", bbox);
     result.set("totalPolygons", total_polygons);
     result.set("totalLabels", labels.count);
