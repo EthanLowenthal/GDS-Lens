@@ -5,25 +5,137 @@
     <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; style-src 'unsafe-inline'; script-src {{cspSource}} 'wasm-unsafe-eval'; worker-src blob:;">
     <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0c0c0d; user-select: none; }
+        /* ---- Theme tokens ----
+           Every color in this file comes from here, because the viewer follows
+           VS Code's light/dark theme and each one needs a counterpart.
+           Dark is the default: it's what the page paints as before any script
+           runs, and it's the far more common editor theme.
+
+           The light values ride on VS Code's own body class -- the host stamps
+           vscode-light / vscode-dark / vscode-high-contrast[-light] onto <body>
+           and rewrites it live when the theme changes, so the chrome follows
+           along with no script involved. .theme-light is what viewer.js's theme
+           block sets: the same decision, plus an OS-preference fallback for
+           when this page runs outside a webview (see applyTheme there). The
+           canvas is not covered by any of this -- what the renderer draws is
+           themed in renderer.cpp (see setTheme). */
+        :root {
+            --bg: #0c0c0d;
+            --fg: #ffffff;            /* ink over the canvas: scale bar, ruler readout */
+            --fg-dim: #a5a5a5;
+            --fg-faint: #808080;
+            --surface: #2a2a2c;       /* small chrome fills: bar tracks, buttons */
+            --surface-fg: #dddddd;
+            --scrim: rgba(0, 0, 0, 0.88);         /* debug panel, over the canvas */
+            --label-scrim: rgba(0, 0, 0, 0.75);   /* ruler readout, over geometry */
+            --chip-scrim: rgba(12, 12, 13, 0.85); /* reload chip, over geometry */
+            --border: #333333;
+            --border-strong: #555555;
+            --accent: #4a9eff;
+            --accent-fg: #06121f;     /* text on an --accent fill */
+            --accent-text: #cfe6ff;   /* --accent as text, on --chip-scrim */
+            --accent-border: #2a3f57;
+            --danger: #ff4d4d;
+            --danger-dim: #ff9a9a;
+            --select-bg: #5a1f1f;     /* selected marker's row */
+            --select-fg: #ffd9d9;
+            --error-bg: #2a1416;
+            --error-border: #7a2b2b;
+            --error-fg: #ffd9d9;
+            --warn-bg: #4a3410;       /* "newer version on disk" banner */
+            --warn-border: #7a5a1c;
+            --warn-border-strong: #a37a26;
+            --warn-fg: #ffe9c2;
+            --warn-fg-dim: #e5cfa4;
+            --warn-btn-fg: #fff6e5;
+            --log-fg: #7fff7f;
+            --log-err: #ff7f7f;
+            /* lil-gui's own palette (mapped onto its variable names below). */
+            --panel-bg: #1f1f1f;
+            --panel-fg: #ebebeb;
+            --panel-title-bg: #111111;
+            --panel-widget: #424242;
+            --panel-widget-hover: #4f4f4f;
+            --panel-widget-focus: #595959;
+        }
+        body.vscode-light, body.vscode-high-contrast-light, body.theme-light {
+            --bg: #fafafb;
+            --fg: #17171a;
+            --fg-dim: #56565c;
+            --fg-faint: #6b6b73;      /* matches the dark side's contrast, not its lightness */
+            --surface: #e4e4e8;
+            --surface-fg: #2c2c2e;
+            --scrim: rgba(250, 250, 251, 0.93);
+            --label-scrim: rgba(255, 255, 255, 0.85);
+            --chip-scrim: rgba(255, 255, 255, 0.9);
+            --border: #d2d2d8;
+            --border-strong: #b4b4bc;
+            --accent: #1f6fd0;
+            --accent-fg: #ffffff;
+            --accent-text: #14538f;
+            --accent-border: #a8c8e8;
+            --danger: #b3261e;
+            --danger-dim: #d0574e;
+            --select-bg: #ffdcdc;
+            --select-fg: #7a1f1f;
+            --error-bg: #fdeceb;
+            --error-border: #dda3a0;
+            --error-fg: #7d201c;
+            --warn-bg: #fdf3d8;
+            --warn-border: #e0c07a;
+            --warn-border-strong: #c9a153;
+            --warn-fg: #5c431a;
+            --warn-fg-dim: #7d6231;
+            --warn-btn-fg: #3f2d0e;
+            --log-fg: #157f2a;
+            --log-err: #b3261e;
+            --panel-bg: #f4f4f6;
+            --panel-fg: #2c2c2e;
+            --panel-title-bg: #e4e4e8;
+            --panel-widget: #d8d8de;
+            --panel-widget-hover: #c8c8d0;
+            --panel-widget-focus: #babac2;
+        }
+        /* lil-gui's palette is its own set of custom properties, so the panel
+           themes by re-pointing those at the --panel-* tokens above rather
+           than by restyling any of its rows. Mapped here on .lil-gui rather
+           than on :root because lil-gui's own .lil-gui rule sets them, and a
+           rule matching the element itself beats an inherited value. (Source
+           order settles the tie: lil-gui inserts its stylesheet *before* the
+           first <style> already in <head> -- i.e. this one -- specifically so
+           page styles outrank its defaults.) */
+        .lil-gui {
+            --background-color: var(--panel-bg);
+            --text-color: var(--panel-fg);
+            --title-background-color: var(--panel-title-bg);
+            --title-text-color: var(--panel-fg);
+            --widget-color: var(--panel-widget);
+            --hover-color: var(--panel-widget-hover);
+            --focus-color: var(--panel-widget-focus);
+            --number-color: var(--accent);
+        }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: var(--bg); user-select: none; }
         canvas { width: 100%; height: 100%; display: block; }
         /* The engine readout (polygon/label counts + the per-frame #renderStats
            span, both written from renderer.cpp). It lives inside #debugPanel
            rather than floating over the canvas on its own: it's debug-only
            either way, and two separate debug surfaces meant the same command
            lit up two different corners of the screen. */
-        #ui { width: 320px; flex: none; overflow-y: auto; padding: 6px 8px; border-right: 1px solid #333;
-              color: #a5a5a5; font-family: monospace; font-size: 11px; line-height: 1.5; user-select: text; }
+        #ui { width: 320px; flex: none; overflow-y: auto; padding: 6px 8px; border-right: 1px solid var(--border);
+              color: var(--fg-dim); font-family: monospace; font-size: 11px; line-height: 1.5; user-select: text; }
         /* The debug entry point is hidden until the "GDSLens: Toggle Debug
            Tools" command adds .debug to <body>. */
         #debugToggleBtn { display: none; }
         body.debug #debugToggleBtn { display: block; }
-        #scaleContainer { position: absolute; bottom: 20px; right: 20px; font-family: monospace; font-size: 11px; color: #ffffff; text-align: center; z-index: 10; pointer-events: none; }
-        #scaleBar { height: 4px; background: #ffffff; border: 1px solid #000; margin-top: 4px; }
+        #scaleContainer { position: absolute; bottom: 20px; right: 20px; font-family: monospace; font-size: 11px; color: var(--fg); text-align: center; z-index: 10; pointer-events: none; }
+        /* The bar is drawn in the ink color over an outline of the background,
+           so it stays readable whichever of the two it happens to sit on top of
+           (it floats over the geometry, not over a panel). */
+        #scaleBar { height: 4px; background: var(--fg); border: 1px solid var(--bg); margin-top: 4px; }
         /* Ruler readout: repositioned to the measurement's midpoint on every
            redraw by update_measure_label (renderer.cpp). The translate lifts
            it just above the line so it doesn't cover what's being measured. */
-        #measureLabel { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: #ffffff; background: rgba(0,0,0,0.75); border: 1px solid #555; border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
+        #measureLabel { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: var(--fg); background: var(--label-scrim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
         #measureLabel.hidden { display: none; }
         /* lil-gui's autoPlace default (1001) would float the panel above the
            loading overlay (z 30) and debug panel (z 40) -- keep it below both. */
@@ -49,19 +161,19 @@
            mode as soon as the pointer crossed it. */
         .lil-gui .lil-controller.mode-row .mode-widget button.mode-active,
         .lil-gui .lil-controller.mode-row .mode-widget button.mode-active:hover,
-        .lil-gui .lil-controller.mode-row .mode-widget button.mode-active:active { background: #4a9eff; color: #06121f; font-weight: bold; }
+        .lil-gui .lil-controller.mode-row .mode-widget button.mode-active:active { background: var(--accent); color: var(--accent-fg); font-weight: bold; }
         /* Loaded-.lyp chip: the row shows the filename with an ✕ on the right
            (injected by setLypChip in viewer.js) to unload it. */
         .lil-gui .lil-controller.lyp-loaded { position: relative; }
         .lil-gui .lil-controller.lyp-loaded .lil-name { padding-right: 22px; }
-        .lil-gui .lil-controller.lyp-loaded .lyp-unload { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: #ff9a9a; cursor: pointer; font-size: 12px; z-index: 5; }
-        .lil-gui .lil-controller.lyp-loaded .lyp-unload:hover { color: #ff4d4d; }
+        .lil-gui .lil-controller.lyp-loaded .lyp-unload { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: var(--danger-dim); cursor: pointer; font-size: 12px; z-index: 5; }
+        .lil-gui .lil-controller.lyp-loaded .lyp-unload:hover { color: var(--danger); }
         /* Marker browser (see renderMarkerBrowser in viewer.js): the selected
            violation's row, and the disabled "… N more" overflow row. The row
            is a full-width <button> in lil-gui, so tint the button itself
            (!important also beats lil-gui's :hover/:active backgrounds). */
-        .lil-gui .lil-controller.marker-selected button { background: #5a1f1f !important; }
-        .lil-gui .lil-controller.marker-selected .lil-name { color: #ffd9d9; }
+        .lil-gui .lil-controller.marker-selected button { background: var(--select-bg) !important; }
+        .lil-gui .lil-controller.marker-selected .lil-name { color: var(--select-fg); }
         .lil-gui .lil-controller.marker-more-row { opacity: 0.55; pointer-events: none; }
         /* "Newer version on disk" header (see the fileChanged handler in
            viewer.js). Sits above the lil-gui panel (z 20) but below the
@@ -71,26 +183,26 @@
            (260px wide, top-right) that it outranks on z-index. */
         #staleBanner { position: absolute; top: 0; left: 0; right: 276px; box-sizing: border-box; z-index: 25;
                        display: flex; align-items: center; gap: 12px; padding: 7px 12px;
-                       font-family: monospace; font-size: 12px; color: #ffe9c2;
-                       background: #4a3410; border-bottom: 1px solid #7a5a1c; }
+                       font-family: monospace; font-size: 12px; color: var(--warn-fg);
+                       background: var(--warn-bg); border-bottom: 1px solid var(--warn-border); }
         #staleBanner.hidden { display: none; }
         #staleText { flex: 1; }
-        #staleBanner button { font-family: monospace; font-size: 11px; background: #7a5a1c; color: #fff6e5;
-                              border: 1px solid #a37a26; border-radius: 3px; padding: 3px 12px; cursor: pointer; }
-        #staleBanner button:hover { background: #a37a26; }
+        #staleBanner button { font-family: monospace; font-size: 11px; background: var(--warn-border); color: var(--warn-btn-fg);
+                              border: 1px solid var(--warn-border-strong); border-radius: 3px; padding: 3px 12px; cursor: pointer; }
+        #staleBanner button:hover { background: var(--warn-border-strong); }
         /* Secondary next to Reload: same action plus a persisted setting, so it
            reads as the quieter of the two. */
         #staleBanner button.secondary { background: transparent; border-color: transparent;
-                                        color: #e5cfa4; padding: 3px 6px; }
-        #staleBanner button.secondary:hover { background: transparent; color: #fff6e5; text-decoration: underline; }
+                                        color: var(--warn-fg-dim); padding: 3px 6px; }
+        #staleBanner button.secondary:hover { background: transparent; color: var(--warn-btn-fg); text-decoration: underline; }
         #staleDismiss { cursor: pointer; opacity: 0.7; padding: 0 2px; }
         #staleDismiss:hover { opacity: 1; }
-        #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: #d0d0d0; background: #0c0c0d; z-index: 30; }
+        #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: var(--fg-dim); background: var(--bg); z-index: 30; }
         #loadingOverlay.hidden { display: none; }
-        #loadingBarTrack { width: 320px; height: 8px; background: #2a2a2c; border-radius: 4px; overflow: hidden; }
-        #loadingBarFill { width: 0%; height: 100%; background: #4a9eff; transition: width 0.15s ease-out; }
+        #loadingBarTrack { width: 320px; height: 8px; background: var(--surface); border-radius: 4px; overflow: hidden; }
+        #loadingBarFill { width: 0%; height: 100%; background: var(--accent); transition: width 0.15s ease-out; }
         #loadingPhase { font-size: 12px; }
-        #loadingPercent { font-size: 11px; color: #808080; }
+        #loadingPercent { font-size: 11px; color: var(--fg-faint); }
         /* The reload flavour of the same progress (see beginProgress in
            viewer.js): a hairline bar along the top edge plus a small chip,
            over a viewport that keeps showing the geometry already loaded.
@@ -99,28 +211,28 @@
            that starts under the chip still pans the canvas. */
         #reloadProgress { position: absolute; top: 0; left: 0; right: 0; z-index: 26; pointer-events: none; }
         #reloadProgress.hidden { display: none; }
-        #reloadBarTrack { height: 2px; background: #2a2a2c; }
-        #reloadBarFill { width: 0%; height: 100%; background: #4a9eff; transition: width 0.15s ease-out; }
+        #reloadBarTrack { height: 2px; background: var(--surface); }
+        #reloadBarFill { width: 0%; height: 100%; background: var(--accent); transition: width 0.15s ease-out; }
         #reloadLabel { display: inline-block; margin: 6px 0 0 10px; padding: 3px 8px; font-family: monospace;
-                       font-size: 11px; color: #cfe6ff; background: rgba(12, 12, 13, 0.85);
-                       border: 1px solid #2a3f57; border-radius: 3px; }
+                       font-size: 11px; color: var(--accent-text); background: var(--chip-scrim);
+                       border: 1px solid var(--accent-border); border-radius: 3px; }
         /* Load failures. This is deliberately NOT part of the debug tools:
            #ui above is display:none unless the debug command is run, so an
            error written only there is invisible to a normal user. Empty means
            no error, so setting/clearing the text is all it takes to show or
            hide the panel. */
-        #loadError { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-width: 520px; z-index: 35; padding: 16px 20px; background: #2a1416; border: 1px solid #7a2b2b; border-radius: 5px; font-family: monospace; font-size: 12px; line-height: 1.55; color: #ffd9d9; white-space: pre-line; user-select: text; }
+        #loadError { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-width: 520px; z-index: 35; padding: 16px 20px; background: var(--error-bg); border: 1px solid var(--error-border); border-radius: 5px; font-family: monospace; font-size: 12px; line-height: 1.55; color: var(--error-fg); white-space: pre-line; user-select: text; }
         #loadError:empty { display: none; }
-        #debugPanel { position: absolute; bottom: 0; left: 0; width: 100%; max-height: 240px; z-index: 40; background: rgba(0,0,0,0.88); border-top: 1px solid #333; display: flex; flex-direction: column; }
+        #debugPanel { position: absolute; bottom: 0; left: 0; width: 100%; max-height: 240px; z-index: 40; background: var(--scrim); border-top: 1px solid var(--border); display: flex; flex-direction: column; }
         #debugPanel.hidden { display: none; }
-        #debugPanelHeader { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; font-family: monospace; font-size: 11px; color: #999; border-bottom: 1px solid #333; }
-        #debugPanelHeader button { font-family: monospace; font-size: 10px; background: #2a2a2c; color: #ddd; border: 1px solid #444; border-radius: 3px; padding: 2px 8px; cursor: pointer; }
+        #debugPanelHeader { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; font-family: monospace; font-size: 11px; color: var(--fg-dim); border-bottom: 1px solid var(--border); }
+        #debugPanelHeader button { font-family: monospace; font-size: 10px; background: var(--surface); color: var(--surface-fg); border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 8px; cursor: pointer; }
         /* Readout beside the log rather than above it: the panel is capped at
            240px tall, and stacking them would leave the log a few lines. */
         #debugBody { display: flex; flex: 1; min-height: 0; }
-        #debugLog { flex: 1; overflow-y: auto; padding: 6px 8px; font-family: monospace; font-size: 10px; color: #7fff7f; white-space: pre-wrap; word-break: break-all; user-select: text; }
-        #debugLog .err { color: #ff7f7f; }
-        #debugToggleBtn { position: absolute; bottom: 8px; left: 8px; z-index: 41; font-family: monospace; font-size: 10px; background: #2a2a2c; color: #999; border: 1px solid #444; border-radius: 3px; padding: 2px 8px; cursor: pointer; opacity: 0.6; }
+        #debugLog { flex: 1; overflow-y: auto; padding: 6px 8px; font-family: monospace; font-size: 10px; color: var(--log-fg); white-space: pre-wrap; word-break: break-all; user-select: text; }
+        #debugLog .err { color: var(--log-err); }
+        #debugToggleBtn { position: absolute; bottom: 8px; left: 8px; z-index: 41; font-family: monospace; font-size: 10px; background: var(--surface); color: var(--fg-dim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 8px; cursor: pointer; opacity: 0.6; }
         #debugToggleBtn:hover { opacity: 1; }
     </style>
 </head>
