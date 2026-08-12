@@ -1,6 +1,6 @@
 # Change Log
 
-## [Unreleased]
+## [1.5.0] - 2026-08-11
 
 - The measure tool is now a mouse mode instead of a checkbox: the panel shows a
   Pan | Measure pair, with the active mode filled in. A checkbox implied
