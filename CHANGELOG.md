@@ -37,6 +37,27 @@
   also means a tab switch no longer costs a re-parse on a large design. The
   trade-off is that a hidden viewer keeps its wasm heap and GL context
   resident.
+- The viewer follows VS Code's light and dark themes instead of always being
+  dark. Switching themes re-themes an open viewer immediately; nothing has to
+  be reopened, and there is no setting to keep in sync. Both halves of the
+  viewer move: the panel, banners, overlays and readouts (which now take every
+  color from one token block), and the canvas itself — the background, the
+  ruler and the selected marker's highlight, all of which assumed white-on-
+  near-black. Layers with no `.lyp` entry get their generated fallback color
+  darkened on a light background, since roughly half of that palette was
+  bright enough to disappear against white; hue and saturation are preserved,
+  so layers stay as distinguishable from each other as they were. Colors that
+  came from a `.lyp` are left exactly as authored in either theme. The drawing
+  buffer is also kept fully opaque now: its alpha channel was being blended
+  down by every semi-transparent draw, which let the page background back in
+  through the compositor and washed low-alpha ink out on a light background.
+- A background reference grid, on by default, with a "Grid" toggle in the
+  panel. Its pitch is a round nm/µm/mm step that follows the zoom, so it
+  agrees with the scale bar rather than being an arbitrary fraction of the
+  viewport, and it crosses between decades without the lines ever popping in
+  or out: two decade levels draw at once and the finer one fades out as it
+  approaches too dense to read. It costs one fullscreen pass regardless of
+  design size.
 
 ## [1.4.1] - 2026-08-05
 

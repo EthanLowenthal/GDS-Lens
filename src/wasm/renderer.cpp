@@ -248,6 +248,59 @@ const char* kCompositeFragmentShaderSrc =
     "    fragColor = vec4(rgb, finalAlpha);\n"
     "}";
 
+// Background reference grid (see draw_grid), drawn as a fullscreen pass over
+// the cleared canvas before any geometry. Reuses kCompositeVertexShaderSrc's
+// attribute-free fullscreen triangle.
+//
+// Two decade levels are drawn at once so the grid can level-of-detail with
+// zoom without the pitch ever popping: level 0 is the finer decade (its
+// on-screen pitch runs from kGridTargetPx down to a tenth of that as you zoom
+// out) and level 1 is ten times coarser. Level 0's alpha fades to zero exactly
+// as its pitch approaches the too-dense end, so at the moment the CPU-side
+// decade counter ticks over -- level 0 becoming what level 1 was -- nothing
+// visible changes: the level that leaves the pair had already faded out, and
+// the new coarse level's lines are a subset of the existing ones at the same
+// alpha. Both levels therefore use one alpha ceiling; a brighter "major" level
+// would make that new level pop into view on every decade crossing.
+//
+// Lines are positioned in world space (unlike the layer hatch patterns, which
+// are deliberately screen-space) -- the whole point is for a grid square to
+// mean a fixed distance on the layout. Coordinates come in pre-reduced modulo
+// each level's pitch (u_panMod) because a full-chip pan offset divided by a
+// nanometre-scale pitch overflows highp float's 24-bit mantissa and the grid
+// visibly tears; the reduction happens on the CPU in double precision. Line
+// width and anti-aliasing are exact in pixels -- the distance to the nearest
+// line is linear in gl_FragCoord, so no fwidth() is needed.
+const char* kGridFragmentShaderSrc =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "uniform vec2 u_resolution;\n"
+    "uniform float u_zoom;\n"
+    "uniform vec2 u_panMod[2];\n"
+    "uniform float u_spacing[2];\n"
+    "uniform float u_levelAlpha[2];\n"
+    "uniform vec4 u_color;\n"
+    "uniform float u_halfWidthPx;\n"
+    "out vec4 fragColor;\n"
+    // Pixel distance from this fragment to the nearest line of a grid with the
+    // given world-space pitch, turned into an anti-aliased 1-pixel-ish line.
+    "float gridMask(vec2 rel, float spacing) {\n"
+    "    vec2 t = abs(fract(rel / spacing + 0.5) - 0.5) * (spacing * u_zoom);\n"
+    "    float d = min(t.x, t.y);\n"
+    "    return 1.0 - smoothstep(u_halfWidthPx, u_halfWidthPx + 1.0, d);\n"
+    "}\n"
+    "void main() {\n"
+    // Pixels from the canvas center; gl_FragCoord.y is bottom-up, matching
+    // world +y (see screen_to_world's inverse of the same transform).
+    "    vec2 p = gl_FragCoord.xy - u_resolution * 0.5;\n"
+    "    float a = 0.0;\n"
+    "    for (int i = 0; i < 2; i++) {\n"
+    "        a = max(a, gridMask(u_panMod[i] + p / u_zoom, u_spacing[i]) * u_levelAlpha[i]);\n"
+    "    }\n"
+    "    if (a <= 0.0) discard;\n"
+    "    fragColor = vec4(u_color.rgb, u_color.a * a);\n"
+    "}";
+
 // Label ("text") rendering: GDSII TEXT / OASIS TEXT elements draw as stroked
 // glyphs at a constant on-screen size (see kGlyphStrokes / rebuild_text_buffer),
 // so a_position is the label's world-space origin and a_offset is the glyph
@@ -488,6 +541,38 @@ GLuint g_mask_tex = 0;
 // GL_MAX_TEXTURE_SIZE (AA off, but never blank).
 int g_mask_scale = 2;
 
+// Background-grid program state (see kGridFragmentShaderSrc/draw_grid).
+GLuint g_grid_program = 0;
+GLint g_grid_loc_resolution = -1;
+GLint g_grid_loc_zoom = -1;
+GLint g_grid_loc_pan_mod = -1;
+GLint g_grid_loc_spacing = -1;
+GLint g_grid_loc_level_alpha = -1;
+GLint g_grid_loc_color = -1;
+GLint g_grid_loc_half_width = -1;
+
+// On-screen pitch (px) the coarser of the grid's two decade levels is kept at
+// or above, i.e. the pitch the finer level reaches just before the decade
+// counter ticks over. The finer level rides a decade below this, fading out
+// between kGridFadeMinPx and kGridFadeFullPx so it never gets dense enough to
+// read as a wash -- the fade-out has to complete by kGridTargetPx / 10 for the
+// decade crossing to be invisible (see kGridFragmentShaderSrc).
+constexpr float kGridTargetPx = 110.0f;
+constexpr float kGridFadeMinPx = 13.0f;
+constexpr float kGridFadeFullPx = 55.0f;
+// Half-width of a grid line before its 1px anti-aliasing ramp; the grid is
+// meant to sit under the geometry, so it stays hairline-thin.
+constexpr float kGridHalfWidthPx = 0.15f;
+// Alpha ceiling for grid lines, drawn in the theme's ink color. Higher on light
+// backgrounds, which is the opposite of what it looks like it should be: alpha
+// blends in the framebuffer's sRGB-encoded values, and equal steps in those are
+// worth far less perceived lightness near white than near black. Matching the
+// dark theme's ~10 points of L* against a 0.98 background takes about 0.11
+// alpha, so an alpha that reads as a faint grid on near-black vanishes outright
+// on near-white -- these two are perceptual siblings, not a typo.
+constexpr float kGridAlphaDark = 0.09f;
+constexpr float kGridAlphaLight = 0.13f;
+
 // Constant pixel pitch for every layer's pattern -- only the angle and
 // pattern kind vary per layer (see pattern_for_layer) so stacked layers
 // stay visually distinguishable from each other.
@@ -563,6 +648,29 @@ bool g_merge_mode = false;
 // Off by default, like the other render-mode toggles: on a full chip the
 // labels are dense enough to bury the geometry, so drawing them is opt-in.
 bool g_show_text = false;
+
+// Background reference grid on/off (the panel's "Grid" checkbox -- see
+// setShowGrid/draw_grid). On by default, unlike the other render-mode toggles:
+// it costs one fullscreen pass regardless of design size, and it is drawn
+// faintly enough underneath everything else that it reads as part of the
+// canvas rather than as something overlaid on the layout.
+bool g_show_grid = true;
+
+// Light/dark theme, pushed in by setTheme() from the viewer's theme block
+// (viewer.js) once it has read VS Code's active theme, and again whenever the
+// user switches themes. Dark is the default because that's what the panel and
+// the page background are styled as before any JS runs (viewer.html).
+//
+// Everything the renderer draws that is background-dependent keys off these
+// two: the color the canvas clears to, and the "ink" the ruler, the selected
+// marker and the background grid are stroked in (white on near-black;
+// near-black on white). The fallback layer palette reads g_light_theme
+// directly (see default_color -- nearly half of it is too light to read
+// against white). Colors that came from a .lyp are left exactly as authored
+// either way: that file is the user's own deck, not our palette.
+bool g_light_theme = false;
+std::array<float, 3> g_bg_color = {0.06f, 0.06f, 0.07f};
+std::array<float, 3> g_ink_color = {1.0f, 1.0f, 1.0f};
 
 // Text GL state. One VBO holds every on-screen label's glyph segments as
 // GL_LINES, grouped into one range per layer so each range can be drawn in the
@@ -993,6 +1101,18 @@ bool init_gl() {
     glUseProgram(g_comp_program);
     glUniform1i(glGetUniformLocation(g_comp_program, "u_mask"), 0);
 
+    // Background grid (see draw_grid) -- shares the composite pass's
+    // attribute-free fullscreen triangle. Array uniforms are queried by their
+    // first element, which is the location the whole array is set through.
+    g_grid_program = link_program(kCompositeVertexShaderSrc, kGridFragmentShaderSrc);
+    g_grid_loc_resolution = glGetUniformLocation(g_grid_program, "u_resolution");
+    g_grid_loc_zoom = glGetUniformLocation(g_grid_program, "u_zoom");
+    g_grid_loc_pan_mod = glGetUniformLocation(g_grid_program, "u_panMod[0]");
+    g_grid_loc_spacing = glGetUniformLocation(g_grid_program, "u_spacing[0]");
+    g_grid_loc_level_alpha = glGetUniformLocation(g_grid_program, "u_levelAlpha[0]");
+    g_grid_loc_color = glGetUniformLocation(g_grid_program, "u_color");
+    g_grid_loc_half_width = glGetUniformLocation(g_grid_program, "u_halfWidthPx");
+
     // The mask texture's storage is (re)allocated at the canvas size in
     // resize_canvas; only the texture object and its FBO attachment are
     // created here.
@@ -1011,7 +1131,24 @@ bool init_gl() {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Standard source-over for color, but the destination alpha is deliberately
+    // driven to stay saturated rather than being blended the same way.
+    //
+    // The canvas is created with the emscripten defaults, which include
+    // alpha=true and premultipliedAlpha=true, so the browser composites the
+    // drawing buffer over the page as premultiplied: what you see is
+    // fbColor + (1 - fbAlpha) * pageBackground. A plain
+    // glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) applies to the alpha
+    // channel too, so every semi-transparent draw pulls fbAlpha *below* the 1.0
+    // the clear wrote (alpha 0.13 over an opaque pixel leaves 0.887), and the
+    // compositor then adds 11% of the page background back on top of it. On a
+    // dark page that add-back is invisible; on a light one it is nearly as
+    // bright as the pixel it is diluting, so anything drawn in dark ink at low
+    // alpha -- the background grid especially -- washes back out to within a
+    // percent of the background and disappears. GL_ONE for the alpha source
+    // keeps fbAlpha at 1 everywhere, making the canvas fully opaque and the
+    // compositing step a no-op, so low-alpha ink reads the same in both themes.
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     return true;
 }
 
@@ -1025,6 +1162,18 @@ std::array<float, 4> default_color(uint32_t layer, uint32_t datatype) {
     float r = (float)((seed * 65) % 200 + 55) / 255.0f;
     float g = (float)((seed * 115) % 200 + 55) / 255.0f;
     float b = (float)((seed * 175) % 200 + 55) / 255.0f;
+    // The band above is 55..254 per channel -- picked to stand out against a
+    // near-black background, which puts about half of it (every layer whose
+    // hash lands high in the band) at a relative luminance over 0.6, i.e.
+    // invisible on white. Halving all three channels keeps each layer's hue
+    // and saturation exactly (it's a value-only change in HSV, so layers stay
+    // as distinguishable from each other as they were) and moves the band to
+    // 27..127, which reads on white the way the original reads on black.
+    if (g_light_theme) {
+        r *= 0.5f;
+        g *= 0.5f;
+        b *= 0.5f;
+    }
     return {r, g, b, 0.8f};
 }
 
@@ -1044,17 +1193,19 @@ void pattern_for_layer(uint32_t layer, uint32_t datatype, float& out_pattern_typ
     out_angle = (float)angle_index * (kPi / 6.0f);
 }
 
-// Resolves a layer's fill/frame color + visibility from g_lyp_info (falling
+// Resolves a layer's fill/frame color + hatch pattern from g_lyp_info (falling
 // back to the hash color above for layers with no .lyp entry, or for the
-// half of a fill/frame pair that's missing from the entry).
-void apply_layer_colors(LayerBuffer& layer) {
+// half of a fill/frame pair that's missing from the entry). Deliberately does
+// not touch layer.visible: a theme switch recolors through here (the fallback
+// palette depends on the theme), and resetting visibility would throw away
+// every layer checkbox the user had set.
+void resolve_layer_colors(LayerBuffer& layer) {
     pattern_for_layer(layer.layer, layer.datatype, layer.pattern_type, layer.hatch_angle);
     auto it = g_lyp_info.find(layer.tag());
     if (it == g_lyp_info.end()) {
         std::array<float, 4> base = default_color(layer.layer, layer.datatype);
         layer.fill_color = {base[0], base[1], base[2], 0.4f};
         layer.frame_color = {base[0], base[1], base[2], 0.9f};
-        layer.visible = true;
         return;
     }
     const LypEntry& e = it->second;
@@ -1073,7 +1224,14 @@ void apply_layer_colors(LayerBuffer& layer) {
     } else {
         layer.frame_color = {base[0], base[1], base[2], 0.9f};
     }
-    layer.visible = e.visible;
+}
+
+// Colors plus the visibility the .lyp asks for -- what a fresh load or a .lyp
+// (re)load applies, as opposed to the color-only pass a theme switch needs.
+void apply_layer_colors(LayerBuffer& layer) {
+    resolve_layer_colors(layer);
+    auto it = g_lyp_info.find(layer.tag());
+    layer.visible = it == g_lyp_info.end() ? true : it->second.visible;
 }
 
 void apply_lyp_to_layers() {
@@ -1326,7 +1484,7 @@ void draw_measure_line() {
                         GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(g_loc_position);
     glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-    glUniform4f(g_loc_color, 1.0f, 1.0f, 1.0f, 0.95f);
+    glUniform4f(g_loc_color, g_ink_color[0], g_ink_color[1], g_ink_color[2], 0.95f);
     glUniform1f(g_loc_use_hatch, 0.0f);
     glDrawArrays(GL_LINES, 0, count / 2);
 }
@@ -1550,8 +1708,10 @@ void draw_markers() {
     if (!g_marker_visible_edges.empty() && g_zoom != g_marker_tick_zoom) build_marker_ticks();
     draw(g_marker_tick_vbo, GL_LINES, g_marker_tick_vertex_count, 1.0f, 0.15f, 0.15f, 0.95f);
 
-    // Selected marker re-drawn on top in white.
-    draw(g_marker_sel_vbo, GL_LINES, g_marker_sel_vertex_count, 1.0f, 1.0f, 1.0f, 0.9f);
+    // Selected marker re-drawn on top in the theme's ink color -- the point is
+    // maximum contrast against both the background and the red overlay.
+    draw(g_marker_sel_vbo, GL_LINES, g_marker_sel_vertex_count, g_ink_color[0], g_ink_color[1],
+         g_ink_color[2], 0.9f);
 }
 
 struct ViewRect {
@@ -1766,6 +1926,62 @@ void disable_instance_attribs() {
     glDisableVertexAttribArray(g_loc_i_translate);
 }
 
+// Draws the background grid: one fullscreen triangle, no geometry, called
+// straight after the clear so everything else lands on top of it.
+//
+// This is where the level of detail is chosen. The two decade pitches the
+// shader draws are picked from the zoom alone: the finer one is the largest
+// power of ten whose on-screen pitch is still at or under kGridTargetPx, and
+// the coarser is ten times that. Since world units are microns (see
+// update_scale_bar), those pitches are always round nm/µm/mm values that agree
+// with the scale bar rather than arbitrary fractions of the viewport.
+//
+// The finer level's alpha ramps with its own on-screen pitch, not with the
+// decade fraction, which is what makes zooming continuous: as the zoom passes a
+// decade boundary the pitch each level is drawn at changes by a hair, so its
+// alpha changes by a hair too -- see kGridFragmentShaderSrc for why the pair
+// can be re-indexed mid-fade without anything visibly jumping. The pan offset
+// is reduced modulo each pitch here, in double precision, because the shader
+// cannot do it in float without tearing on a full-chip pan.
+void draw_grid() {
+    if (!g_show_grid || g_zoom <= 0.0f || !std::isfinite(g_zoom)) return;
+
+    const double zoom = (double)g_zoom;
+    const double decade = std::floor(std::log10((double)kGridTargetPx / zoom));
+    const double fine = std::pow(10.0, decade);
+    // Underflow guard: a pitch that rounds to zero (absurd zoom, or a design
+    // whose units make the fit zoom enormous) would divide by zero in the
+    // shader and fill the screen.
+    if (!(fine > 0.0) || !std::isfinite(fine)) return;
+    const double spacing[2] = {fine, fine * 10.0};
+
+    float spacing_f[2];
+    float pan_mod[4];
+    float level_alpha[2];
+    for (int i = 0; i < 2; i++) {
+        spacing_f[i] = (float)spacing[i];
+        pan_mod[i * 2] = (float)std::fmod((double)g_pan_x, spacing[i]);
+        pan_mod[i * 2 + 1] = (float)std::fmod((double)g_pan_y, spacing[i]);
+        // smoothstep(kGridFadeMinPx, kGridFadeFullPx, pitch in px)
+        double t = (spacing[i] * zoom - (double)kGridFadeMinPx) /
+                   ((double)kGridFadeFullPx - (double)kGridFadeMinPx);
+        t = std::min(1.0, std::max(0.0, t));
+        level_alpha[i] = (float)(t * t * (3.0 - 2.0 * t));
+    }
+    if (level_alpha[0] <= 0.0f && level_alpha[1] <= 0.0f) return;
+
+    glUseProgram(g_grid_program);
+    glUniform2f(g_grid_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform1f(g_grid_loc_zoom, g_zoom);
+    glUniform2fv(g_grid_loc_pan_mod, 2, pan_mod);
+    glUniform1fv(g_grid_loc_spacing, 2, spacing_f);
+    glUniform1fv(g_grid_loc_level_alpha, 2, level_alpha);
+    glUniform4f(g_grid_loc_color, g_ink_color[0], g_ink_color[1], g_ink_color[2],
+                g_light_theme ? kGridAlphaLight : kGridAlphaDark);
+    glUniform1f(g_grid_loc_half_width, kGridHalfWidthPx);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
 // Merge-mode path for one layer, two passes. Pass 1 rasterizes the layer's
 // fill triangles (static + instanced, same VBOs the normal path draws) into
 // the screen-sized R8 mask with blending off, collapsing any overlap into
@@ -1856,10 +2072,15 @@ bool draw_frame(double time, void* /*userData*/) {
     // (and everything else) even with no layers yet.
     if (g_layers.empty() && !markers_present()) return false;
 
-    glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
+    glClearColor(g_bg_color[0], g_bg_color[1], g_bg_color[2], 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(g_program);
     glBindVertexArray(g_vao);
+    // Under everything: the grid program has no attributes of its own, so it
+    // needs nothing from the VAO beyond it being bound (same as merge mode's
+    // composite pass), and it leaves the program switched, which the layer
+    // uniforms below immediately correct.
+    draw_grid();
+    glUseProgram(g_program);
 
     glUniform2f(g_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
     glUniform2f(g_loc_offset, g_pan_x, g_pan_y);
@@ -3653,6 +3874,27 @@ void setMergeMode(bool on) {
     request_redraw();
 }
 
+// The panel's "Grid" checkbox: the background reference grid (see draw_grid).
+void setShowGrid(bool show) {
+    g_show_grid = show;
+    request_redraw();
+}
+
+// VS Code's active theme, pushed in by viewer.js's theme block on startup and
+// on every theme change (see g_light_theme). Layers are recolored rather than
+// re-uploaded: only the fallback palette changes, and it's a function of the
+// layer/datatype pair, so no geometry is touched. Callers that render the
+// panel need to re-read getLayers() afterwards for the row color chips.
+void setTheme(bool light) {
+    g_light_theme = light;
+    g_bg_color = light ? std::array<float, 3>{0.98f, 0.98f, 0.985f}
+                       : std::array<float, 3>{0.06f, 0.06f, 0.07f};
+    g_ink_color = light ? std::array<float, 3>{0.08f, 0.08f, 0.10f}
+                        : std::array<float, 3>{1.0f, 1.0f, 1.0f};
+    for (LayerBuffer& layer : g_layers) resolve_layer_colors(layer);
+    request_redraw();
+}
+
 // Discards any in-progress or finalized measurement (the label hides on the
 // next draw_frame via update_measure_label). Called on measure-mode exit
 // (which is what Escape in viewer.js does, by switching back to pan mode) and
@@ -3806,6 +4048,8 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setShowInfill", &setShowInfill);
     function("setShowText", &setShowText);
     function("setMergeMode", &setMergeMode);
+    function("setShowGrid", &setShowGrid);
+    function("setTheme", &setTheme);
     function("setMeasureMode", &setMeasureMode);
     function("clearMeasurement", &clearMeasurement);
     function("setMarkers", &setMarkers);

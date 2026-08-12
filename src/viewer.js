@@ -100,7 +100,10 @@ const actions = {
     resetView: () => modulePromise.then((Module) => Module.resetView()),
     showInfill: false,
     showText: false,
-    mergeOverlaps: false
+    mergeOverlaps: false,
+    // On by default -- matches g_show_grid in renderer.cpp, which is the
+    // renderer's own initial state (nothing pushes this value down at startup).
+    showGrid: true
 };
 const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 const markerController = gui.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
@@ -117,6 +120,11 @@ textController.domElement.title = "Show layout text labels, drawn in their layer
 // internal edges) -- a pure render-mode toggle, no re-parse involved.
 const mergeController = gui.add(actions, "mergeOverlaps").name("Merge Overlaps")
     .onChange((on) => modulePromise.then((Module) => Module.setMergeMode(on)));
+// Background reference grid, pitched at a power-of-ten nm/µm/mm step that
+// follows the zoom (see draw_grid).
+const gridController = gui.add(actions, "showGrid").name("Grid")
+    .onChange((show) => modulePromise.then((Module) => Module.setShowGrid(show)));
+gridController.domElement.title = "Show the background grid, spaced at a round step that follows the zoom";
 
 // ---- Interaction mode (Pan / Measure) ----
 // The canvas can only do one thing with a click, so the two are exclusive
@@ -665,6 +673,57 @@ modulePromise.then(
         showFatalError(`WebAssembly module failed to load: ${describeLoadFailure(err)}`);
     }
 );
+
+// ---- Theme (follows VS Code's light/dark theme) ----
+// VS Code stamps the active theme kind onto <body> as vscode-light /
+// vscode-dark / vscode-high-contrast[-light] and rewrites it live when the
+// user switches themes, so the page chrome themes itself off that class in
+// CSS alone (see the token block in viewer.html). What's left for JS is the
+// half CSS can't reach: the canvas is drawn by renderer.cpp, which owns the
+// background it clears to, the ruler/selection ink, and the fallback layer
+// palette (all three assume a near-black background otherwise) -- plus the
+// fallback for running this page outside a webview, where there is no
+// vscode-* class and the OS preference is the only signal.
+const lightMediaQuery = window.matchMedia("(prefers-color-scheme: light)");
+
+function detectLightTheme() {
+    const kinds = document.body.classList;
+    // High-contrast light carries both vscode-high-contrast and
+    // vscode-high-contrast-light, so the light check has to come first.
+    if (kinds.contains("vscode-high-contrast-light") || kinds.contains("vscode-light")) return true;
+    if (kinds.contains("vscode-high-contrast") || kinds.contains("vscode-dark")) return false;
+    return lightMediaQuery.matches;
+}
+
+// Null until the first applyTheme(), so it can't match either decision and
+// the initial push to wasm always happens.
+let lightTheme = null;
+
+function applyTheme() {
+    const light = detectLightTheme();
+    if (light === lightTheme) return;
+    lightTheme = light;
+    // The same class VS Code's own vscode-light would have set, so the OS
+    // fallback lands on exactly the rules a webview gets for free. Toggling it
+    // re-triggers the observer below, which then no-ops on this early return.
+    document.body.classList.toggle("theme-light", light);
+    modulePromise.then((Module) => {
+        Module.setTheme(light);
+        // setTheme recolors the layers in place (the fallback palette is
+        // theme-dependent), so the panel's per-row color chips are stale.
+        // Only worth rebuilding once there's a layer list to rebuild -- before
+        // the first load renderLayerList would add an empty "Layers" folder.
+        const layers = Module.getLayers();
+        if (layers.length > 0) renderLayerList(layers);
+    });
+}
+
+// A theme switch rewrites <body>'s class list rather than posting a message,
+// so this is the only notification there is. (It also fires for the debug
+// command's own class toggle, which applyTheme ignores.)
+new MutationObserver(applyTheme).observe(document.body, { attributes: true, attributeFilter: ["class"] });
+lightMediaQuery.addEventListener("change", applyTheme);
+applyTheme();
 
 window.addEventListener("message", (event) => {
     const message = event.data;

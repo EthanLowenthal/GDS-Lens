@@ -22,6 +22,10 @@ colors.
 - Marker databases: load DRC/LVS violation markers (KLayout `.lyrdb` or
   Calibre DRC ASCII results) as a highlight overlay with a browsable
   category/item panel that zooms to each violation.
+- Follows your VS Code theme: light or dark, canvas and panel both, switching
+  live when you change themes.
+- A background reference grid, pitched at a round distance that follows the
+  zoom.
 
 ## Usage
 
@@ -36,6 +40,9 @@ with an unexpected extension still loads correctly):
   or off. Labels draw at a constant on-screen size in their layer's color and
   respect that layer's visibility checkbox. Off by default, since a dense
   design's labels can bury the geometry underneath them.
+- **Grid** — toggle the background reference grid. Its spacing is a round
+  nm/µm/mm step chosen from the zoom, so it agrees with the scale bar; on by
+  default.
 - **Reset View** — refit the layout to the window from the panel.
 - **Mode: Pan | Measure** — pick the mouse's mode in the panel (or press `M` to
   switch). In **Measure**, click two points to measure the distance between them
