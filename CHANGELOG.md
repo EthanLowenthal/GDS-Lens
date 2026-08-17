@@ -59,13 +59,15 @@
     bare `0` would read as empty when it isn't.
 - **A pointer coordinate readout** (`X: … Y: …`), below the scale bar in the
   bottom-right corner. There was a scale bar and a ruler, but nothing answering
-  "where am I?" — the one readout every layout viewer has. It follows the
-  background grid's unit and step rather than picking its own: the grid decides
-  what one square on screen means, so the readout shows that unit to a tenth of
-  that step and no further, because digits finer than the grid can separate are
-  noise. Both halves of the pair share one unit and one number of decimals, so
-  x and y stay comparable at a glance and the decimal point doesn't move as the
-  pointer crosses zero.
+  "where am I?" — the one readout every layout viewer has. It is always in
+  microns, unlike the scale bar and the ruler: those report one distance at a
+  time, where the unit is free to follow the magnitude, while this is a position
+  you watch as the pointer moves, and a unit that changes underneath it makes
+  two readings taken seconds apart incomparable without noticing the suffix
+  moved. Zoom still sets the precision, just not the unit — the decimals resolve
+  a tenth of the background grid's current step, so the digits on screen are the
+  ones the grid can distinguish and no more. Both halves of the pair share that
+  count, so the decimal point doesn't shift as the pointer crosses zero.
 - **A "Go to (x, y)" box** in the panel. Coordinates arrive from outside the
   viewer constantly — a DRC report, a generator's log, a message from someone
   else — and there was no way to type one in. Enter centers the view on it,

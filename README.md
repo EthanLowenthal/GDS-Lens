@@ -77,9 +77,11 @@ with an unexpected extension still loads correctly):
   nm/µm/mm step chosen from the zoom, so it agrees with the scale bar; on by
   default.
 - **Coordinates** — the world coordinate under the pointer is shown as
-  `X: … Y: …` below the scale bar in the bottom-right corner, in whichever of
-  nm/µm/mm the grid's current step falls in and to a tenth of that step, so the
-  digits on screen are the ones the grid can actually distinguish.
+  `X: … Y: …` below the scale bar in the bottom-right corner, always in microns
+  (the scale bar and ruler switch to nm/mm; a position you watch while moving
+  the pointer shouldn't). Zoom sets the precision instead: the decimals resolve
+  a tenth of the grid's current step, so the digits on screen are the ones the
+  grid can actually distinguish.
 - **Go to (x, y)** — type or paste a coordinate into the panel and press Enter to
   center the view on it. Microns unless a per-number unit says otherwise
   (`nm`/`um`/`µm`/`mm`), and the decorations coordinates arrive wrapped in —
