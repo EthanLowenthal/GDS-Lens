@@ -22,6 +22,7 @@
 
 #include <emscripten/bind.h>
 #include <emscripten/emscripten.h>
+#include <emscripten/eventloop.h>
 #include <emscripten/html5.h>
 #include <emscripten/val.h>
 
@@ -258,6 +259,27 @@ GLuint g_mask_tex = 0;
 // Recomputed per resize: drops to 1 if 2x the canvas would exceed
 // GL_MAX_TEXTURE_SIZE (AA off, but never blank).
 int g_mask_scale = 2;
+
+// ---- Pick pass (see run_pick_pass) -----------------------------------------
+// Nothing about the geometry survives on the CPU after uploadLayers -- only
+// VBOs -- so questions *about* that geometry are answered by rasterizing it
+// again. A small window of the scene around a screen point is drawn into an
+// integer framebuffer with the layer index (or a snap kind) and the fragment's
+// world position in it, and that window is read back. The target is tiny and
+// fixed rather than canvas-sized: the pass supplies its own u_resolution and
+// u_offset, so setting them to the window size and the world point under the
+// cursor makes the texture cover exactly kPickSize x kPickSize canvas pixels
+// centred there, at the camera's current zoom.
+constexpr int kPickSize = 33;  // odd, so the window has a centre pixel
+GLuint g_pick_program = 0;
+GLint g_pick_loc_resolution = -1;
+GLint g_pick_loc_offset = -1;
+GLint g_pick_loc_zoom = -1;
+GLint g_pick_loc_id = -1;
+GLuint g_pick_fbo = 0;
+GLuint g_pick_tex = 0;
+// Readback destination, RGBA per texel: (id, world x bits, world y bits, 1).
+std::vector<uint32_t> g_pick_buffer;
 
 // Background-grid program state (see kGridFragmentShaderSrc/draw_grid).
 GLuint g_grid_program = 0;
@@ -668,6 +690,40 @@ bool init_gl() {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_mask_tex, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+    // Pick target (see run_pick_pass). RGBA32UI rather than a float format
+    // because it's color-renderable in core WebGL2 while RGBA32F needs
+    // EXT_color_buffer_float; world positions ride through it as raw bits.
+    // Integer textures can only be sampled NEAREST, and this one is never
+    // sampled at all -- only glReadPixels'd -- but the filter still has to be
+    // set or the texture is incomplete.
+    g_pick_program = link_program(shaders::kPickVertexShaderSrc, shaders::kPickFragmentShaderSrc);
+    g_pick_loc_resolution = glGetUniformLocation(g_pick_program, "u_resolution");
+    g_pick_loc_offset = glGetUniformLocation(g_pick_program, "u_offset");
+    g_pick_loc_zoom = glGetUniformLocation(g_pick_program, "u_zoom");
+    g_pick_loc_id = glGetUniformLocation(g_pick_program, "u_pickId");
+    glGenTextures(1, &g_pick_tex);
+    glBindTexture(GL_TEXTURE_2D, g_pick_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, kPickSize, kPickSize, 0, GL_RGBA_INTEGER,
+                 GL_UNSIGNED_INT, nullptr);
+    glGenFramebuffers(1, &g_pick_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_pick_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_pick_tex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        // Everything the pick pass drives (hover identify, ruler snapping) is
+        // an addition to a viewer that works without it, so a driver that
+        // won't render to RGBA32UI loses those and nothing else.
+        EM_ASM({ console.warn('[GDS] pick FBO incomplete; hover identify and ruler snapping are off'); });
+        glDeleteFramebuffers(1, &g_pick_fbo);
+        g_pick_fbo = 0;
+    } else {
+        g_pick_buffer.assign((size_t)kPickSize * kPickSize * 4, 0u);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     glEnable(GL_BLEND);
     // Standard source-over for color, but the destination alpha is deliberately
     // driven to stay saturated rather than being blended the same way.
@@ -1024,7 +1080,9 @@ void update_coord_readout() {
     }
     float wx, wy;
     screen_to_world(g_cursor_x, g_cursor_y, wx, wy);
-    el.set("textContent", format_coord_pair(wx, wy));
+    // The box also holds #hoverLayer (see set_hover_text), so the number goes
+    // into its own child rather than replacing the box's contents.
+    set_inner_text("coordValue", format_coord_pair(wx, wy));
     el["classList"].call<void>("remove", std::string("hidden"));
 }
 
@@ -1531,6 +1589,201 @@ void disable_instance_attribs() {
     glDisableVertexAttribArray(g_loc_i_translate);
 }
 
+// ---- Pick pass --------------------------------------------------------------
+// See the g_pick_* declarations above for why this exists at all: the geometry
+// is gone from the CPU after upload, so anything that needs to know what is at
+// a point on screen asks the rasterizer.
+
+// Draws one layer's geometry -- fill triangles then outline edges, static then
+// instanced -- under whatever program is currently bound, with no per-layer
+// uniforms of its own. draw_frame's loop can't share this: it interleaves color
+// and hatch uniforms between the fill and the outline, which is exactly the
+// part a pick pass has no use for.
+//
+// The fill is drawn whether or not the Infill toggle is on. The question a pick
+// answers is which shape occupies a point, and a polygon occupies its interior
+// however it happens to be shaded; picking only what is literally painted would
+// make an unfilled layer answerable only along its 1px boundary.
+void draw_layer_geometry(const LayerBuffer& layer) {
+    if (layer.fill_vbo) {
+        glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
+    }
+    if (layer.outline_ebo) {
+        glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
+        glDrawElements(GL_LINES, layer.outline_index_count, GL_UNSIGNED_INT, 0);
+    }
+    for (const InstancedBatch& batch : layer.instanced_batches) {
+        enable_instance_attribs(batch.instance_vbo);
+        if (batch.fill_vbo) {
+            glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
+            glEnableVertexAttribArray(g_loc_position);
+            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
+        }
+        if (batch.outline_ebo) {
+            glBindBuffer(GL_ARRAY_BUFFER, batch.outline_vbo);
+            glEnableVertexAttribArray(g_loc_position);
+            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
+            glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
+                                    batch.instance_count);
+        }
+        disable_instance_attribs();
+    }
+}
+
+// Points the pick framebuffer at a screen point and clears it. The world point
+// under that pixel comes back through out_wx/out_wy: it is both the pass's
+// u_offset -- which is what centres the window on the cursor -- and the origin
+// every hit is measured from. False means there is nothing to pick against, and
+// nothing was bound, so end_pick_pass must not follow.
+bool begin_pick_pass(float screen_x, float screen_y, float& out_wx, float& out_wy) {
+    if (!g_gl_ready || !g_pick_fbo || g_layers.empty()) return false;
+    screen_to_world(screen_x, screen_y, out_wx, out_wy);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_pick_fbo);
+    glViewport(0, 0, kPickSize, kPickSize);
+    // Integer color attachments cannot be blended -- drawing to one with
+    // blending enabled is an error, not a silently ignored setting.
+    glDisable(GL_BLEND);
+    const GLuint zero[4] = {0u, 0u, 0u, 0u};
+    glClearBufferuiv(GL_COLOR, 0, zero);
+
+    glBindVertexArray(g_vao);
+    glUseProgram(g_pick_program);
+    glUniform2f(g_pick_loc_resolution, (float)kPickSize, (float)kPickSize);
+    glUniform2f(g_pick_loc_offset, out_wx, out_wy);
+    glUniform1f(g_pick_loc_zoom, g_zoom);
+    return true;
+}
+
+// Reads the window into g_pick_buffer and puts back the canvas framebuffer,
+// viewport and blending. The canvas itself is untouched by a pick -- nothing
+// was drawn to it -- so no redraw is owed afterwards.
+void end_pick_pass() {
+    glReadPixels(0, 0, kPickSize, kPickSize, GL_RGBA_INTEGER, GL_UNSIGNED_INT, g_pick_buffer.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g_canvas_width, g_canvas_height);
+    glEnable(GL_BLEND);
+}
+
+// The world rect the pick window covers, so the pass can do the same
+// layer-level bbox skip draw_frame does. At any zoom past "whole design in
+// view" this is what keeps a pick from touching most of the layout.
+ViewRect pick_view_rect(float wx, float wy) {
+    float half = (float)kPickSize * 0.5f / g_zoom;
+    return {wx - half, wx + half, wy - half, wy + half};
+}
+
+// The picked point maps to clip 0, i.e. exactly halfway across the viewport, so
+// this is where it lands in texel coordinates.
+constexpr float kPickCenter = (float)kPickSize * 0.5f;
+
+// Squared pixel distance from the picked point to texel (i, j)'s center. Purely
+// a function of the indices -- the window is centred on the cursor by
+// construction, so no world-space arithmetic is involved.
+float pick_texel_dist2(int i, int j) {
+    float dx = ((float)i + 0.5f) - kPickCenter;
+    float dy = ((float)j + 0.5f) - kPickCenter;
+    return dx * dx + dy * dy;
+}
+
+// How far from the pointer a hit still counts as "under" it. Deliberately
+// small: the answer wanted is the layer the pointer is on, and a generous
+// radius on a dense layout reports a neighbour instead.
+constexpr float kPickIdentifyRadiusPx = 3.0f;
+
+// Which layer is under a screen point: an index into g_layers, or -1. Layers
+// are drawn in g_layers order -- the order draw_frame uses -- with no depth
+// test, so the last write to a texel wins and the answer is the layer that is
+// visually on top, which is the one the question is about.
+int pick_layer_at(float screen_x, float screen_y) {
+    float wx, wy;
+    if (!begin_pick_pass(screen_x, screen_y, wx, wy)) return -1;
+    const ViewRect view = pick_view_rect(wx, wy);
+    for (size_t i = 0; i < g_layers.size(); i++) {
+        const LayerBuffer& layer = g_layers[i];
+        if (!layer.visible) continue;
+        if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
+        glUniform1ui(g_pick_loc_id, (GLuint)(i + 1));
+        draw_layer_geometry(layer);
+    }
+    end_pick_pass();
+
+    int best = -1;
+    float best_dist2 = kPickIdentifyRadiusPx * kPickIdentifyRadiusPx;
+    for (int j = 0; j < kPickSize; j++) {
+        for (int i = 0; i < kPickSize; i++) {
+            const uint32_t* texel = &g_pick_buffer[((size_t)j * kPickSize + i) * 4];
+            if (texel[3] == 0u || texel[0] == 0u) continue;
+            float dist2 = pick_texel_dist2(i, j);
+            if (dist2 > best_dist2) continue;
+            best_dist2 = dist2;
+            best = (int)texel[0] - 1;
+        }
+    }
+    return best >= 0 && (size_t)best < g_layers.size() ? best : -1;
+}
+
+// ---- Hover identify ---------------------------------------------------------
+// The layer under a resting pointer, written into #hoverLayer above the
+// coordinate readout. Deferred rather than run on every move for two reasons:
+// a pick costs a frame's worth of vertex work, and "what am I pointing at" is a
+// question asked by stopping, not while sweeping across the design.
+constexpr int kHoverDelayMs = 130;
+long g_hover_timeout = 0;
+bool g_hover_scheduled = false;
+
+void set_hover_text(const std::string& text) {
+    if (!g_gl_ready) return;
+    val el = val::global("document").call<val>("getElementById", std::string("hoverLayer"));
+    if (el.isNull() || el.isUndefined()) return;
+    el.set("textContent", text);
+    el["classList"].call<void>("toggle", std::string("hidden"), text.empty());
+}
+
+void run_hover_identify(void* /*userData*/) {
+    g_hover_scheduled = false;
+    if (!g_cursor_inside) return;
+    int index = pick_layer_at(g_cursor_x, g_cursor_y);
+    if (index < 0) {
+        set_hover_text("");
+        return;
+    }
+    const LayerBuffer& layer = g_layers[(size_t)index];
+    std::string text = std::to_string(layer.layer) + "/" + std::to_string(layer.datatype);
+    auto it = g_lyp_info.find(layer.tag());
+    if (it != g_lyp_info.end() && !it->second.name.empty()) {
+        text += " \xE2\x80\x93 " + it->second.name;  // en dash, matching the panel's rows
+    }
+    set_hover_text(text);
+}
+
+void schedule_hover_identify() {
+    if (!g_gl_ready || !g_pick_fbo) return;
+    if (g_hover_scheduled) emscripten_clear_timeout(g_hover_timeout);
+    // Whatever is on screen answers for where the pointer *was*. Clearing it up
+    // front is the honest option: a stale layer name is worse than none, and
+    // the gap is a tenth of a second.
+    set_hover_text("");
+    g_hover_timeout = emscripten_set_timeout(run_hover_identify, (double)kHoverDelayMs, nullptr);
+    g_hover_scheduled = true;
+}
+
+void cancel_hover_identify() {
+    if (g_hover_scheduled) {
+        emscripten_clear_timeout(g_hover_timeout);
+        g_hover_scheduled = false;
+    }
+    set_hover_text("");
+}
+
 // Draws the background grid: one fullscreen triangle, no geometry, called
 // straight after the clear so everything else lands on top of it.
 //
@@ -1988,6 +2241,9 @@ void clear_layers() {
     // back; dropping them here is what stops a *different* file inheriting
     // rectangles drawn around nothing.
     g_highlight_boxes.clear();
+    // Same for the hover readout: it names a layer of the file being replaced,
+    // and a pick already in flight would index a g_layers that no longer has it.
+    cancel_hover_identify();
     // The label ranges index into g_layers -- they can't outlive it.
     g_text_ranges.clear();
     g_total_labels = 0;
@@ -2746,6 +3002,7 @@ bool on_mousemove(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*user
     g_cursor_y = (float)e->targetY;
     g_cursor_inside = true;
     update_coord_readout();
+    schedule_hover_identify();
     if (g_measure_pending) {
         screen_to_world((float)e->targetX, (float)e->targetY, g_measure_x1, g_measure_y1);
         request_redraw();
@@ -2774,6 +3031,7 @@ bool on_mouseup(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*us
 bool on_mouseleave(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*userData*/) {
     g_cursor_inside = false;
     update_coord_readout();
+    cancel_hover_identify();
     return false;
 }
 

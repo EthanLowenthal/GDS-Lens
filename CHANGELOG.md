@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+- **Hover identify.** Rest the pointer on a shape and the layer/datatype it
+  belongs to — with its `.lyp` name, if one is loaded — appears above the
+  coordinate readout. Answering "which layer is that?" previously meant toggling
+  layers off one at a time until the shape disappeared.
+
+  Nothing about the geometry survives on the CPU after it's uploaded, so the
+  answer comes from the rasterizer rather than from a spatial index: a 33×33
+  pixel window around the pointer is redrawn into an offscreen `RGBA32UI`
+  framebuffer with each layer's index written in place of its color, and one
+  read-back names the layer. That target is tiny and fixed rather than
+  canvas-sized because the pass supplies its own camera uniforms — pointing them
+  at the world coordinate under the cursor makes a 33×33 texture cover exactly
+  the 33×33 canvas pixels around it. Layers are drawn in the same order and
+  skipped by the same bounding-box test the normal frame uses, so the reported
+  layer is the one visually on top, and at any real zoom most of the design is
+  never touched.
+
+  It waits for the pointer to stop (about a tenth of a second) rather than
+  running on every move: a pick costs one frame's worth of vertex work, and
+  "what am I pointing at" is a question you ask by stopping. A polygon's whole
+  interior answers, whether or not **Infill** is on — a shape occupies its area
+  regardless of how it happens to be shaded, and picking only what is literally
+  painted would leave an unfilled layer answerable along its 1px boundary alone.
 - **A layer panel that scales past a demo deck.** A flat checkbox list stops
   working somewhere around twenty layers and a real PDK has well over a hundred,
   so the panel now has the four things that make a long list usable:
