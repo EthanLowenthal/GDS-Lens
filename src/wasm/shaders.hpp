@@ -293,12 +293,12 @@ inline const char* const kTextVertexShaderSrc =
     "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
     "}";
 
-// ---- Pick pass (see run_pick_pass in renderer.cpp) --------------------------
-// Answers two questions the CPU has no data left to answer: which layer is
-// under the pointer, and where is the nearest vertex or edge to snap the ruler
-// to. Both are questions about geometry that only exists in VBOs -- nothing is
-// retained CPU-side after upload -- so both are answered by rasterizing a small
-// window of the scene into an integer framebuffer and reading it back.
+// ---- Pick pass (see pick_snap_at in renderer.cpp) ---------------------------
+// Answers a question the CPU has no data left to answer: where is the nearest
+// vertex or edge for the ruler to snap to. The geometry only exists in VBOs --
+// nothing is retained CPU-side after upload -- so the answer comes from
+// rasterizing a small window of the scene into an integer framebuffer and
+// reading it back.
 //
 // The vertex half is kVertexShaderSrc with the world position passed through to
 // the fragment stage, which is what makes snapping exact rather than
