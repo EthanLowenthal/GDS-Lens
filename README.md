@@ -4,15 +4,16 @@
 | [View GDS Lens on Open VSX](https://open-vsx.org/extension/ethml/GDS-Lens)
 
 A VS Code extension that adds a custom editor for `.gds` (GDSII) and `.oas` /
-`.oasis` (OASIS) layout files: open one and it's parsed and rendered in a
-WebGL2 canvas, with support for loading a KLayout `.lyp` file to drive layer
-colors.
+`.oasis` (OASIS) layout files, gzipped or not: open one and it's parsed and
+rendered in a WebGL2 canvas, with support for loading a KLayout `.lyp` file to
+drive layer colors.
 
 ![GDS Lens rendering a GDSII layout](images/example.png)
 
 ## Features
 
-- Parses and renders GDSII and OASIS layouts directly in a VS Code webview.
+- Parses and renders GDSII and OASIS layouts directly in a VS Code webview,
+  including gzipped ones (`.gds.gz` / `.oas.gz`).
 - Optional KLayout `.lyp` file loading for custom layer colors.
 - Handles SREF/AREF (including array references), rotation, mirroring, and
   magnification via gdstk's flattening.
@@ -37,9 +38,11 @@ colors.
 
 ## Usage
 
-Open any `.gds`, `.oas`, or `.oasis` file in VS Code and it opens in the GDS
-Lens viewer (the format is read from the file's own header, so a layout named
-with an unexpected extension still loads correctly):
+Open any `.gds`, `.oas`, or `.oasis` file in VS Code — or a gzipped one
+(`.gds.gz`, `.oas.gz`, `.oasis.gz`) — and it opens in the GDS Lens viewer.
+Neither gzip nor the layout format is decided by the filename: both are read
+from the file's own leading bytes, so a layout named with an unexpected
+extension still loads, and so does a `.gds` that turns out to be gzipped.
 
 - **Pan / zoom** — drag to pan, scroll to zoom.
 - **Hierarchy** — the panel down the left edge is the design's cell tree,

@@ -12,6 +12,7 @@
   "keywords": [
     "gdsii",
     "gds",
+    "gds.gz",
     "oasis",
     "klayout",
     "vlsi",
@@ -84,6 +85,15 @@
           },
           {
             "filenamePattern": "*.oasis"
+          },
+          {
+            "filenamePattern": "*.gds.gz"
+          },
+          {
+            "filenamePattern": "*.oas.gz"
+          },
+          {
+            "filenamePattern": "*.oasis.gz"
           }
         ],
         "priority": "default"

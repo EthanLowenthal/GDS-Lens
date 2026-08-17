@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- **Gzipped layouts open directly** — `.gds.gz`, `.oas.gz`, `.oasis.gz`. Layouts
+  are shipped and archived compressed all the time, and until now opening one
+  meant gunzipping it to a scratch file first.
+
+  Neither gzip nor the layout format is decided by the filename: both are read
+  from the file's own leading bytes, matching how GDSII and OASIS were already
+  told apart. So a `.gds` that turns out to be gzipped loads, and the format
+  sniffing still works afterwards because it happens *after* the expansion
+  rather than on a gzip header.
+
+  Expansion happens in the extension host, not in the webview or the wasm
+  module, and that's a memory decision rather than a convenience: the viewer's
+  entire size budget is the 32-bit wasm heap, where the file's bytes and the
+  flattened geometry built from them both have to fit in 4 GB, and expanding
+  there would put a second full copy of the file in the one address space that
+  can least afford it. Node's heap has no such limit. The 2 GB layout ceiling now
+  applies to what a `.gz` expands *to*, which is the size that actually has to
+  fit, and it's enforced as zlib produces output — so a 4 MB archive claiming to
+  expand to 40 GB is stopped as it overruns rather than after it has allocated.
+  A truncated or corrupt archive says so specifically, since half-written is the
+  normal state of a file a generator is still busy compressing.
 - **The measure tool got the four things that make it a real ruler.**
   - **Snapping to vertices and edges.** The ruler now lands on the nearest
     polygon vertex within about 12px of the pointer, or failing that on the

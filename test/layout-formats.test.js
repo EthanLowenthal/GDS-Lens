@@ -14,6 +14,8 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
+const { decodeLayoutBytes } = require("../src/layout-bytes.js");
 
 const wasmJsPath = path.join(__dirname, "..", "src", "wasm", "build", "gdstk_wasm.js");
 const wasmBuilt = fs.existsSync(wasmJsPath);
@@ -29,17 +31,20 @@ async function loadModule() {
     return scope.createGdstkModule({});
 }
 
-// Stages a fixture into MEMFS under an extension-less name (exactly like
+// Stages bytes into MEMFS under an extension-less name (exactly like
 // wasm-worker.js does) so nothing but the file's own header can decide the
-// format, and parses it.
-function parseFixture(Module, fixtureName) {
-    const bytes = fs.readFileSync(path.join(__dirname, "fixtures", fixtureName));
+// format, and parses them.
+function parseBytes(Module, bytes) {
     Module.FS.writeFile("/input.layout", new Uint8Array(bytes));
     try {
         return Module.parseGdsToLayers("/input.layout");
     } finally {
         Module.FS.unlink("/input.layout");
     }
+}
+
+function parseFixture(Module, fixtureName) {
+    return parseBytes(Module, fs.readFileSync(path.join(__dirname, "fixtures", fixtureName)));
 }
 
 // parseGdsToLayers splits a design into static per-layer geometry plus one
@@ -194,6 +199,35 @@ test("describes the cell hierarchy, collapsing an AREF into one child entry", { 
     const oas = parseFixture(Module, "sample_layout.oas");
     assert.strictEqual(oas.ok, true, oas.error);
     assert.deepStrictEqual(structure(oas.hierarchy), structure(hierarchy));
+});
+
+// The .gds.gz path end to end, minus VS Code: the extension host's
+// decodeLayoutBytes (src/layout-bytes.js) is what turns a compressed file into
+// the bytes the Worker stages into MEMFS, so the two halves are only correct
+// together. In particular the format sniffing happens *after* decompression --
+// the gzip header would otherwise be all either reader ever saw -- so this
+// covers both formats rather than just GDSII.
+test("parses a gzipped layout identically to the same file uncompressed", { skip }, async () => {
+    const Module = await loadModule();
+    const MAX = 2 * 1024 * 1024 * 1024;  // MAX_LAYOUT_BYTES in extension.cjs
+
+    for (const [fixture, expectedFormat] of [["sample_layout.gds", "GDSII"],
+                                             ["sample_layout.oas", "OASIS"]]) {
+        const plain = fs.readFileSync(path.join(__dirname, "fixtures", fixture));
+        const decodedPlain = decodeLayoutBytes(plain, MAX);
+        const decodedGz = decodeLayoutBytes(zlib.gzipSync(plain), MAX);
+
+        assert.strictEqual(decodedPlain.gzipped, false, fixture);
+        assert.strictEqual(decodedGz.gzipped, true, fixture);
+        assert.deepStrictEqual(Buffer.from(decodedGz.bytes), plain, `${fixture}: round trip`);
+
+        const fromPlain = parseBytes(Module, decodedPlain.bytes);
+        const fromGz = parseBytes(Module, decodedGz.bytes);
+        assert.strictEqual(fromGz.ok, true, fromGz.error);
+        // Still decided by the file's own header, not by the .gz wrapper.
+        assert.strictEqual(fromGz.format, expectedFormat);
+        assert.deepStrictEqual(summarize(fromGz), summarize(fromPlain), `${fixture}: geometry`);
+    }
 });
 
 test("rejects a file that is neither GDSII nor OASIS", { skip }, async () => {

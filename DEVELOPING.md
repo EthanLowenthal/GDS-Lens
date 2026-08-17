@@ -6,8 +6,13 @@ see [`README.md`](README.md).
 ## Project layout
 
 - `src/extension.cjs` — the extension host (Node). Opens the layout file
-  (`.gds` / `.oas` / `.oasis`), streams its raw bytes into the webview, and
-  relays the `.lyp` and marker file pickers.
+  (`.gds` / `.oas` / `.oasis`, optionally gzipped), streams its bytes into the
+  webview, and relays the `.lyp` and marker file pickers.
+- `src/layout-bytes.js` — gzip expansion for `.gds.gz` and friends, detected by
+  gzip's magic number rather than by extension. Deliberately runs in the
+  extension host: see "Layout size limits" below for why it can't be the wasm
+  module's job. Standalone (Node builtins only) and `require()`d directly by the
+  unit tests, same as `marker-parsers.js`.
 - `src/viewer.html` / `src/viewer.js` — the webview: bootstraps the wasm
   module and wires up `postMessage` from the extension host.
 - `src/marker-parsers.js` — standalone parsers for DRC/LVS marker databases
@@ -27,7 +32,7 @@ see [`README.md`](README.md).
   design history of this C++/WASM architecture.
 - `third_party/gdstk`, `third_party/qhull` — git submodules the wasm build
   links against.
-- `test/` — plain-Node tests (`npm test`): marker-parser unit tests plus
+- `test/` — plain-Node tests (`npm test`): marker-parser and gzip unit tests plus
   headless tests that eval the built wasm bundle in Node (skipped when
   `src/wasm/build/gdstk_wasm.js` hasn't been built) covering marker state and
   the GDSII/OASIS readers. `test/fixtures/sample_layout.{gds,oas}` are the
@@ -70,6 +75,16 @@ only 2 GB). What that buys, measured against generated stress layouts:
   placement instead of a full geometry copy. A hierarchy that flattens to
   115M polygons loads in ~2 GB; the same 4 GB budget is exhausted somewhere
   under 1G.
+
+A gzipped layout is expanded before any of this, in the extension host
+(`src/layout-bytes.js`), and the ceilings above apply to what it expands *to* —
+which is also what `MAX_LAYOUT_BYTES` is checked against for a `.gz`, rather
+than its size on disk. Expanding it in Node rather than inside the wasm module
+is the whole point: the module would have to hold the compressed bytes and the
+expanded bytes at once, in the one 4 GB address space that already has to fit
+the flattened geometry, whereas Node's heap has neither constraint. `zlib`'s
+`maxOutputLength` is what enforces the cap, so a small archive claiming to
+expand to 40 GB is stopped as it overruns rather than after it has allocated.
 
 Past that the module aborts. The abort is a JS throw, so it's caught in
 `wasm-worker.js`, run through `describeLoadFailure` (`src/load-errors.js`) to

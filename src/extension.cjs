@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
+const { decodeLayoutBytes } = require('./layout-bytes.js');
 
 const logger = vscode.window.createOutputChannel("GDSII Debugger");
 
@@ -16,12 +17,16 @@ const LAST_LYP_PATH_KEY = 'GDS-Lens.lastLypPath';
 // design B would be noise.
 const MARKER_PATHS_KEY = 'GDS-Lens.markerPathByGds';
 
-// Hard ceiling on the raw file. The bytes have to be copied into the wasm
+// Hard ceiling on the layout bytes. They have to be copied into the wasm
 // module's 32-bit heap (4 GB, see src/wasm/CMakeLists.txt) and the flattened
 // geometry built from them is always larger again, so a file this size cannot
 // load however patient you are -- better to say so up front than to spend
 // minutes copying it around first. Anything under this is attempted, and the
 // viewer reports an out-of-memory error if it doesn't fit after all.
+//
+// For a gzipped layout this bounds what it *expands* to, which is the size that
+// actually has to fit; the compressed file on disk is checked against it too,
+// since one that big is certainly not going to expand to something smaller.
 const MAX_LAYOUT_BYTES = 2 * 1024 * 1024 * 1024;
 
 // How long the layout file has to hold a steady size+mtime before a reload
@@ -308,6 +313,46 @@ class GdsEditorProvider {
                     vscode.window.showErrorMessage('GDS Lens: could not read layout file: ' + err.message);
                     return false;
                 }
+
+                // A gzipped layout (.gds.gz and friends) is expanded here, so
+                // everything past this point -- the webview, the parse Worker,
+                // the wasm module's own GDSII/OASIS header sniffing -- sees
+                // exactly the bytes an uncompressed file would have produced.
+                // Detected by gzip's magic number rather than by the name, so a
+                // compressed layout called ".gds" works too.
+                const decoded = decodeLayoutBytes(fileData, MAX_LAYOUT_BYTES);
+                if (!decoded.ok) {
+                    const name = path.basename(document.uri.fsPath);
+                    let message;
+                    if (decoded.reason === 'too-large') {
+                        // storedSize is gzip's own claim about the expanded size
+                        // and can be wrong (see gzipStoredSize) -- hence "about",
+                        // and hence it only ever softens the wording rather than
+                        // being what refused the file.
+                        const expands = decoded.storedSize
+                            ? `expands to about ${formatBytes(decoded.storedSize)}`
+                            : 'expands past';
+                        message =
+                            `${name} ${expands}, past the ${formatBytes(MAX_LAYOUT_BYTES)} limit ` +
+                            `GDS Lens can load.\n\nThe viewer parses layouts in a 32-bit WebAssembly ` +
+                            `module, which has to hold the file and the geometry built from it in ` +
+                            `4 GB of memory.`;
+                    } else {
+                        message =
+                            `Could not decompress ${name}.\n\nIt starts with a gzip header, but the ` +
+                            `compressed data can't be read -- the file may be truncated, or still ` +
+                            `being written.\n\n(${decoded.detail})`;
+                    }
+                    logger.appendLine('>>> Gzip decode failed (' + decoded.reason + '): ' + decoded.detail);
+                    post({ type: 'loadError', message: message });
+                    vscode.window.showErrorMessage(`GDS Lens: could not open ${name}.`);
+                    return false;
+                }
+                if (decoded.gzipped) {
+                    logger.appendLine('    gunzipped: ' + formatBytes(fileData.byteLength) + ' -> ' +
+                                      formatBytes(decoded.bytes.byteLength));
+                }
+                fileData = decoded.bytes;
 
                 // Stamped from the pre-read stat: if the file changes again
                 // between the stat and the read, the watcher fires once more
