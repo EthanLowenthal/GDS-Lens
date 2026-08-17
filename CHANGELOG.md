@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- **A pointer coordinate readout**, above the scale bar in the bottom-right
+  corner. There was a scale bar and a ruler, but nothing answering "where am
+  I?" — the one readout every layout viewer has. It follows the background
+  grid's unit and step rather than picking its own: the grid already decides
+  what one square on screen means, so the readout shows that unit to a tenth of
+  that step and no further, because digits finer than the grid can separate are
+  noise. Both halves of the pair share one unit and one number of decimals, so
+  x and y stay comparable at a glance and the decimal point doesn't move as the
+  pointer crosses zero.
+- **A "Go to (x, y)" box** in the panel. Coordinates arrive from outside the
+  viewer constantly — a DRC report, a generator's log, a message from someone
+  else — and there was no way to type one in. Enter centers the view on it,
+  leaving the zoom alone: the coordinate says where to look, not how much
+  around it you want to see, so re-framing would throw away a zoom level you had
+  already chosen. Microns unless a number carries its own `nm`/`um`/`µm`/`mm`,
+  and the decorations these coordinates come wrapped in — parentheses, `x=`/`y=`
+  labels, commas or bare whitespace — are accepted, so a pair pasted straight out
+  of a report works without editing. A coordinate that can't be read as a pair,
+  or that lies outside this layout, turns the row red and says which rather than
+  silently parking the camera at the nearest edge of the design.
+
 - Wheel zoom is no longer wildly over-sensitive on a trackpad. Every wheel
   event applied one fixed 1.15× step regardless of how far the event said the
   wheel had turned, which is right for a stepped mouse wheel (one event per

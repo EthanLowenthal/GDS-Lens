@@ -21,6 +21,8 @@ colors.
 - Per-layer visibility toggles, an infill (fill pattern) toggle, and a text
   toggle for the layout's own labels.
 - Measure tool: click two points to read out the distance between them.
+- A pointer coordinate readout, and a "Go to (x, y)" box for driving the view
+  from a coordinate out of a DRC report or a colleague's message.
 - Marker databases: load DRC/LVS violation markers (KLayout `.lyrdb` or
   Calibre DRC ASCII results) as a highlight overlay with a browsable
   category/item panel that zooms to each violation.
@@ -61,6 +63,17 @@ with an unexpected extension still loads correctly):
 - **Grid** — toggle the background reference grid. Its spacing is a round
   nm/µm/mm step chosen from the zoom, so it agrees with the scale bar; on by
   default.
+- **Coordinates** — the world coordinate under the pointer is shown above the
+  scale bar in the bottom-right corner, in whichever of nm/µm/mm the grid's
+  current step falls in and to a tenth of that step, so the digits on screen are
+  the ones the grid can actually distinguish.
+- **Go to (x, y)** — type or paste a coordinate into the panel and press Enter to
+  center the view on it. Microns unless a per-number unit says otherwise
+  (`nm`/`um`/`µm`/`mm`), and the decorations coordinates arrive wrapped in —
+  parentheses, `x=`/`y=`, commas or bare spaces — are all accepted, so a pair
+  copied straight out of a DRC report or a Slack message works as-is. The zoom is
+  left alone (the coordinate doesn't say how much around it you want to see); if
+  the point isn't inside this layout the row turns red and says so.
 - **Reset View** — refit the layout to the window from the panel.
 - **Mode: Pan | Measure** — pick the mouse's mode in the panel (or press `M` to
   switch). In **Measure**, click two points to measure the distance between them

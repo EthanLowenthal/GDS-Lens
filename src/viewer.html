@@ -127,7 +127,22 @@
            Tools" command adds .debug to <body>. */
         #debugToggleBtn { display: none; }
         body.debug #debugToggleBtn { display: block; }
-        #scaleContainer { position: absolute; bottom: 20px; right: 20px; font-family: monospace; font-size: 11px; color: var(--fg); text-align: center; z-index: 10; pointer-events: none; }
+        /* Bottom-right stack of view readouts: the pointer's world coordinate
+           over the scale bar. One anchored column rather than two separately
+           positioned boxes, so the coordinate row (whose width varies with the
+           number) can't drift into or away from the bar below it. */
+        #viewReadout { position: absolute; bottom: 20px; right: 20px; z-index: 10; pointer-events: none;
+                       display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+        #scaleContainer { font-family: monospace; font-size: 11px; color: var(--fg); text-align: center; }
+        /* Pointer coordinate, rewritten by update_coord_readout (renderer.cpp)
+           on every move and every camera change; .hidden while the pointer is
+           off the canvas. Unlike the scale bar it's a run of text over
+           arbitrary geometry, so it carries the same scrim the ruler label
+           does rather than relying on an outline. */
+        #coordReadout { font-family: monospace; font-size: 11px; color: var(--fg); background: var(--label-scrim);
+                        border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 6px;
+                        white-space: nowrap; }
+        #coordReadout.hidden { display: none; }
         /* The bar is drawn in the ink color over an outline of the background,
            so it stays readable whichever of the two it happens to sit on top of
            (it floats over the geometry, not over a panel). */
@@ -162,6 +177,11 @@
         .lil-gui .lil-controller.mode-row .mode-widget button.mode-active,
         .lil-gui .lil-controller.mode-row .mode-widget button.mode-active:hover,
         .lil-gui .lil-controller.mode-row .mode-widget button.mode-active:active { background: var(--accent); color: var(--accent-fg); font-weight: bold; }
+        /* "Go to (x, y)" row (viewer.js) after an unusable entry -- an
+           unreadable pair, or one outside this layout. The row's title carries
+           the reason; this is what makes it worth hovering. */
+        .lil-gui .lil-controller.goto-bad input { color: var(--danger); }
+        .lil-gui .lil-controller.goto-bad .lil-name { color: var(--danger-dim); }
         /* Loaded-.lyp chip: the row shows the filename with an ✕ on the right
            (injected by setLypChip in viewer.js) to unload it. */
         .lil-gui .lil-controller.lyp-loaded { position: relative; }
@@ -342,9 +362,12 @@
     </div>
     <button id="debugToggleBtn" type="button">Debug tools</button>
 
-    <div id="scaleContainer">
-        <div id="scaleLabel">0 μm</div>
-        <div id="scaleBar" style="width: 100px;"></div>
+    <div id="viewReadout">
+        <div id="coordReadout" class="hidden"></div>
+        <div id="scaleContainer">
+            <div id="scaleLabel">0 μm</div>
+            <div id="scaleBar" style="width: 100px;"></div>
+        </div>
     </div>
 
     <div id="measureLabel" class="hidden"></div>
