@@ -336,6 +336,15 @@ bool g_dragging = false;
 int g_last_mouse_x = 0;
 int g_last_mouse_y = 0;
 
+// Last known pointer position over the canvas, in canvas-relative pixels, and
+// whether the pointer is over the canvas at all. Kept because the world point
+// under the cursor is a function of both the pointer *and* the camera: zooming
+// with the mouse held still moves the layout under it, so the readout has to be
+// recomputable from a stored screen position rather than only on a move event.
+float g_cursor_x = 0.0f;
+float g_cursor_y = 0.0f;
+bool g_cursor_inside = false;
+
 // Ruler ("measure") tool state -- see setMeasureMode/on_mousedown. While the
 // mode is active, clicks measure instead of pan: the first click anchors the
 // ruler's start point, the line then tracks the cursor (g_measure_pending),
@@ -952,6 +961,73 @@ std::string format_distance_um(double microns) {
     return buf;
 }
 
+// The finer of the background grid's two decade pitches, in microns -- i.e.
+// what one grid square currently means (see draw_grid, which draws this pitch
+// and ten times it). Pulled out of draw_grid because the pointer readout
+// formats itself against the same number: the digits worth showing are exactly
+// the ones the grid on screen can distinguish. 0 for a degenerate zoom.
+double grid_fine_spacing() {
+    const double zoom = (double)g_zoom;
+    if (!(zoom > 0.0) || !std::isfinite(zoom)) return 0.0;
+    const double fine = std::pow(10.0, std::floor(std::log10((double)kGridTargetPx / zoom)));
+    if (!(fine > 0.0) || !std::isfinite(fine)) return 0.0;
+    return fine;
+}
+
+// An (x, y) pair for the pointer readout, in whichever of nm/µm/mm the grid's
+// current step falls in, with one shared unit suffix -- a coordinate pair is
+// read as a pair, and letting each half pick its own unit (as format_distance_um
+// does, where there is only one number) makes the two incomparable at a glance.
+// Sign and magnitude are the point here, so unlike the ruler's %.4g this is a
+// fixed number of decimals: digits below a tenth of a grid step are noise, and
+// a column of numbers whose decimal point moves as the pointer crosses zero is
+// unreadable.
+std::string format_coord_pair(double x_um, double y_um) {
+    double step = grid_fine_spacing();
+    if (!(step > 0.0)) step = 1.0;
+    // Exact: step is a power of ten by construction.
+    const int decade = (int)std::lround(std::log10(step));
+    const char* unit;
+    double scale;
+    int decade_in_unit;
+    if (decade >= 3) {
+        unit = "mm";
+        scale = 1e-3;
+        decade_in_unit = decade - 3;
+    } else if (decade >= 0) {
+        unit = "\xC2\xB5m";  // µm, UTF-8
+        scale = 1.0;
+        decade_in_unit = decade;
+    } else {
+        unit = "nm";
+        scale = 1e3;
+        decade_in_unit = decade + 3;
+    }
+    // Enough decimals to resolve a tenth of a grid step in the chosen unit.
+    const int decimals = std::clamp(1 - decade_in_unit, 0, 6);
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%.*f, %.*f %s", decimals, x_um * scale, decimals, y_um * scale, unit);
+    return buf;
+}
+
+// Rewrites #coordReadout (viewer.html) with the world coordinate under the
+// pointer, or hides it when the pointer isn't over the canvas. Called from
+// every event that can move the world under the cursor -- the pointer moving,
+// and the camera moving beneath a stationary pointer (wheel zoom, "go to").
+void update_coord_readout() {
+    if (!g_gl_ready) return;
+    val el = val::global("document").call<val>("getElementById", std::string("coordReadout"));
+    if (el.isNull() || el.isUndefined()) return;
+    if (!g_cursor_inside) {
+        el["classList"].call<void>("add", std::string("hidden"));
+        return;
+    }
+    float wx, wy;
+    screen_to_world(g_cursor_x, g_cursor_y, wx, wy);
+    el.set("textContent", format_coord_pair(wx, wy));
+    el["classList"].call<void>("remove", std::string("hidden"));
+}
+
 // Repositions/re-fills #measureLabel (viewer.html) at the ruler's midpoint,
 // or hides it when there's no measurement. Called from draw_frame so the
 // label follows the world-space ruler across pan/zoom without its own event
@@ -1476,12 +1552,11 @@ void draw_grid() {
     if (!g_show_grid || g_zoom <= 0.0f || !std::isfinite(g_zoom)) return;
 
     const double zoom = (double)g_zoom;
-    const double decade = std::floor(std::log10((double)kGridTargetPx / zoom));
-    const double fine = std::pow(10.0, decade);
     // Underflow guard: a pitch that rounds to zero (absurd zoom, or a design
     // whose units make the fit zoom enormous) would divide by zero in the
-    // shader and fill the screen.
-    if (!(fine > 0.0) || !std::isfinite(fine)) return;
+    // shader and fill the screen -- grid_fine_spacing returns 0 for those.
+    const double fine = grid_fine_spacing();
+    if (!(fine > 0.0)) return;
     const double spacing[2] = {fine, fine * 10.0};
 
     float spacing_f[2];
@@ -1831,6 +1906,12 @@ bool draw_frame(double time, void* /*userData*/) {
     draw_cell_highlight();
     draw_measure_line();
     update_measure_label();
+    // Here rather than at each camera-moving entry point: the world coordinate
+    // under a stationary pointer changes with every one of them (wheel zoom,
+    // Reset View, a marker/cell row framing the view, a resize), and they all
+    // end in a redraw. Pointer *moves* that leave the camera alone are the one
+    // case this misses, so on_mousemove calls it directly as well.
+    update_coord_readout();
     update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size());
     return false;
 }
@@ -2661,6 +2742,10 @@ bool on_mousedown(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*user
 }
 
 bool on_mousemove(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*userData*/) {
+    g_cursor_x = (float)e->targetX;
+    g_cursor_y = (float)e->targetY;
+    g_cursor_inside = true;
+    update_coord_readout();
     if (g_measure_pending) {
         screen_to_world((float)e->targetX, (float)e->targetY, g_measure_x1, g_measure_y1);
         request_redraw();
@@ -2681,6 +2766,15 @@ bool on_mousemove(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*user
 bool on_mouseup(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*userData*/) {
     g_dragging = false;
     return true;
+}
+
+// The pointer readout is only true while the pointer is over the canvas --
+// leaving it would otherwise freeze the last coordinate on screen as if it were
+// still live.
+bool on_mouseleave(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*userData*/) {
+    g_cursor_inside = false;
+    update_coord_readout();
+    return false;
 }
 
 // How much one wheel notch -- one detent of a stepped mouse wheel -- zooms.
@@ -2731,6 +2825,12 @@ bool on_wheel(int /*eventType*/, const EmscriptenWheelEvent* e, void* /*userData
         clamp_pan();
     }
     update_scale_bar();
+    // The pointer hasn't moved, but the world under it has. The readout itself
+    // is refreshed by the redraw below (see draw_frame), which is what covers
+    // every other camera move too -- this only keeps the anchor current.
+    g_cursor_x = (float)e->mouse.targetX;
+    g_cursor_y = (float)e->mouse.targetY;
+    g_cursor_inside = true;
     request_redraw();
     return true;
 }
@@ -3929,6 +4029,31 @@ void zoomToBox(double min_x, double min_y, double max_x, double max_y) {
     request_redraw();
 }
 
+// Centers the view on a world coordinate without changing the zoom -- the
+// panel's "Go to (x, y)" box, whose whole purpose is pasting a coordinate out
+// of a DRC report or a Slack message. Zoom is deliberately left alone: the
+// caller knows the coordinate, not how much around it they want to see, and
+// re-framing would throw away a zoom level they had already chosen.
+//
+// Returns whether the point actually ended up on screen. clamp_pan keeps the
+// camera within reach of the design's bbox, so a coordinate from a different
+// file (or a typo with an extra digit) silently parks the view at the nearest
+// edge of the layout; saying so is the difference between "that point isn't in
+// this design" and an unexplained jump to a corner.
+bool goToPoint(double x, double y) {
+    if (!g_gl_ready) return false;
+    if (!std::isfinite(x) || !std::isfinite(y)) return false;
+    g_pan_x = (float)x;
+    g_pan_y = (float)y;
+    clamp_pan();
+    update_scale_bar();
+    request_redraw();
+    float half_w = (float)g_canvas_width * 0.5f / g_zoom;
+    float half_h = (float)g_canvas_height * 0.5f / g_zoom;
+    return std::fabs((double)g_pan_x - x) <= (double)half_w &&
+           std::fabs((double)g_pan_y - y) <= (double)half_h;
+}
+
 // Outlines world-space boxes on the canvas -- one per placement of the cell the
 // hierarchy panel has selected (see syncCellHighlight in viewer.js), as a flat
 // [minX, minY, maxX, maxY, ...] array. The selected row supplies them: a row
@@ -3986,6 +4111,7 @@ int main() {
     emscripten_set_mousedown_callback("#glCanvas", nullptr, false, on_mousedown);
     emscripten_set_mousemove_callback("#glCanvas", nullptr, false, on_mousemove);
     emscripten_set_mouseup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, on_mouseup);
+    emscripten_set_mouseleave_callback("#glCanvas", nullptr, false, on_mouseleave);
     emscripten_set_wheel_callback("#glCanvas", nullptr, false, on_wheel);
     emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, on_resize);
     resize_canvas();
@@ -4016,6 +4142,7 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setSelectedMarker", &setSelectedMarker);
     function("setMarkerOpacity", &setMarkerOpacity);
     function("zoomToBox", &zoomToBox);
+    function("goToPoint", &goToPoint);
     function("setCellHighlight", &setCellHighlight);
     function("clearCellHighlight", &clearCellHighlight);
     function("getMarkerStats", &getMarkerStats);

@@ -98,6 +98,9 @@ const actions = {
     loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
     loadMarkerFile: () => vscode.postMessage({ command: "loadMarkerFile" }),
     resetView: () => modulePromise.then((Module) => Module.resetView()),
+    // Bound to the "Go to (x, y)" text box below; lil-gui writes the typed
+    // string back into this property.
+    gotoCoord: "",
     showInfill: false,
     showText: false,
     mergeOverlaps: false,
@@ -108,6 +111,79 @@ const actions = {
 const lypController = gui.add(actions, "loadLypFile").name("Load KLayout .lyp File");
 const markerController = gui.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
 gui.add(actions, "resetView").name("Reset View");
+
+// ---- Go to coordinate ----
+// Coordinates arrive from outside the viewer all day -- a DRC report, a
+// colleague's message, a generator's log -- and until now there was nowhere to
+// put one. Panning is all this does: the zoom you already chose is information
+// the pasted coordinate doesn't carry (see goToPoint in renderer.cpp).
+//
+// The accepted forms are whatever those sources actually produce, which is
+// "x, y" with any of the usual decorations: parentheses, a semicolon or bare
+// whitespace as the separator, and an optional per-number unit. Microns are the
+// default because that's what the readout, the ruler and the .lyrdb files all
+// speak.
+const COORD_UNITS = {
+    nm: 1e-3,
+    um: 1,
+    "µm": 1,  // MICRO SIGN
+    "μm": 1,  // GREEK SMALL LETTER MU -- both are in the wild
+    mm: 1e3
+};
+// One number plus an optional unit; the parse takes the first two matches and
+// requires the rest of the string to be separators, so "1 2 3" is rejected
+// rather than silently read as "1 2".
+const COORD_TOKEN = /(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(nm|um|µm|μm|mm)?/gi;
+// What may surround the two numbers -- punctuation, plus a bare x/y label,
+// since "x=12.5, y=40" is a shape real reports print. Anything else means the
+// string wasn't a coordinate pair, so it's rejected rather than half-read.
+const COORD_FILLER = /^[\s(),;:=xy]*$/i;
+
+function parseCoordinatePair(text) {
+    const numbers = [];
+    let start = 0;
+    let end = 0;
+    COORD_TOKEN.lastIndex = 0;
+    for (let match = COORD_TOKEN.exec(text); match; match = COORD_TOKEN.exec(text)) {
+        numbers.push(parseFloat(match[1]) * (match[2] ? COORD_UNITS[match[2].toLowerCase()] : 1));
+        if (numbers.length === 1) start = match.index;
+        end = COORD_TOKEN.lastIndex;
+        if (numbers.length === 2) break;
+    }
+    if (numbers.length !== 2 || !numbers.every(Number.isFinite)) return null;
+    if (!COORD_FILLER.test(text.slice(0, start)) || !COORD_FILLER.test(text.slice(end))) return null;
+    return { x: numbers[0], y: numbers[1] };
+}
+
+const gotoController = gui.add(actions, "gotoCoord").name("Go to (x, y)");
+const GOTO_IDLE_TITLE = "Center the view on a coordinate in µm — \"12.5, -40\", \"(1.2mm, 300nm)\"";
+gotoController.domElement.title = GOTO_IDLE_TITLE;
+
+// Reports back through the row itself: lil-gui has no validation affordance,
+// and a coordinate that silently does nothing is worse than no box at all.
+function setGotoStatus(message) {
+    gotoController.domElement.classList.toggle("goto-bad", !!message);
+    gotoController.domElement.title = message ? `${message}\n\n${GOTO_IDLE_TITLE}` : GOTO_IDLE_TITLE;
+}
+
+// onFinishChange, not onChange: this fires on Enter/blur, so a half-typed
+// "12" doesn't fly the view to x=12 on its way to "12.5".
+gotoController.onFinishChange((text) => {
+    if (!text.trim()) {
+        setGotoStatus(null);
+        return;
+    }
+    const point = parseCoordinatePair(text);
+    if (!point) {
+        setGotoStatus(`Could not read "${text}" as an x, y pair`);
+        return;
+    }
+    modulePromise.then((Module) => {
+        const onScreen = Module.goToPoint(point.x, point.y);
+        setGotoStatus(onScreen ? null : `(${point.x}, ${point.y}) µm is outside this layout`);
+    });
+});
+
 gui.add(actions, "showInfill").name("Infill")
     .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
 // Draw the layout's own labels (GDSII/OASIS TEXT elements) at a fixed
