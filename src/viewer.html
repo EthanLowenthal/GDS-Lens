@@ -161,6 +161,32 @@
            label (the checkbox needs nowhere near half the row) and cut it
            character-level with an ellipsis. */
         .lil-gui .lil-controller.lil-boolean > .lil-name { min-width: 78%; width: 78%; overflow: hidden; text-overflow: ellipsis; }
+        /* ---- Layer rows (see addLayerRow in viewer.js) ----
+           A layer row carries two more things than the plain boolean above: its
+           shape count and a solo button, both appended after lil-gui's own
+           name/widget pair. .lil-controller is already a flex row, so they only
+           need flex:none to sit at the right edge; the name gives up the width
+           they take (this rule follows the 78% one above deliberately -- same
+           specificity, so source order decides). */
+        .lil-gui .lil-controller.layer-row > .lil-name { min-width: 58%; width: 58%; }
+        .lil-gui .lil-controller.layer-row .layer-count { flex: none; padding-left: 4px;
+                                                          color: var(--fg-faint); font-size: 10px; }
+        .lil-gui .lil-controller.layer-row .layer-solo { flex: none; width: 16px; text-align: center;
+                                                         margin-left: 4px; border-radius: 2px;
+                                                         color: var(--fg-faint); font-size: 10px; cursor: pointer; }
+        .lil-gui .lil-controller.layer-row .layer-solo:hover { color: var(--fg); background: var(--panel-widget-hover); }
+        /* The soloed layer's own row, so it's clear which of the hidden
+           hundred is the one still on screen. */
+        .lil-gui .lil-controller.layer-row.layer-soloed .layer-solo { color: var(--accent-fg); background: var(--accent); }
+        /* Filter box at the top of the Layers folder. lil-gui styles the inputs
+           belonging to its own controllers; this one is hand-built, so it
+           borrows the same widget fill. */
+        .lil-gui .lil-controller.layer-filter-row input { width: 100%; box-sizing: border-box;
+                                                          font-family: inherit; font-size: var(--input-font-size);
+                                                          background: var(--panel-widget); color: var(--panel-fg);
+                                                          border: none; border-radius: var(--widget-border-radius);
+                                                          height: var(--widget-height); padding: 0 6px; }
+        .lil-gui .lil-controller.layer-filter-row input:focus { background: var(--panel-widget-focus); outline: none; }
         /* Interaction-mode row (Pan | Measure), hand-built in viewer.js since
            lil-gui has no segmented-control type. Because the row carries
            lil-gui's own classes, its button theming (widget color, radius,

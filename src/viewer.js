@@ -323,6 +323,39 @@ setLypChip(null);
 setMarkerChip(null);
 
 let layersFolder = null;
+// Every checkbox row and category folder currently in the panel. Kept because
+// a flat checkbox list stops working somewhere around 20 layers and a real PDK
+// has well over 100, so the panel needs to filter, solo and bulk-toggle -- and
+// all four of those act on rows that already exist. Filtering in particular
+// has to show and hide rows in place: destroying and re-adding a hundred
+// lil-gui controllers on every keystroke is far too slow to type against.
+let layerRows = [];
+let layerCategories = [];
+// Whether a filter query is currently narrowing the list, and each category's
+// open/closed state from before it was -- typing opens every folder with a hit
+// (the point of typing is to see the matches, not to then click nine folders
+// open), and clearing the box has to put them back rather than leaving the
+// whole list expanded.
+let layerFilterActive = false;
+
+// Which layer is soloed, plus the visibility of every layer at the moment it
+// was. Solo is only reversible because of that snapshot: "show everything
+// again" is a different and usually wrong answer, since most of a PDK's layer
+// list is layers you had already turned off on purpose.
+let soloTag = null;
+let soloRestore = null;
+
+function layerTag(item) {
+    return `${item.layer}/${item.datatype}`;
+}
+
+// Compact count for a row ("1.2k", "3M") -- the exact number goes in the
+// tooltip. A 260px panel has no room for seven digits per row.
+function fmtCount(n) {
+    if (n < 1000) return String(n);
+    if (n < 1e6) return `${(n / 1e3).toFixed(n < 1e4 ? 1 : 0)}k`;
+    return `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0)}M`;
+}
 
 // Tints a lil-gui row/folder's 4px left border with a layer's frame color --
 // lil-gui has no built-in color swatch for booleans, so the border is the cue.
@@ -330,23 +363,201 @@ function tintBorder(el, color) {
     if (el) el.style.borderLeft = `4px solid ${color}`;
 }
 
-// Adds one visibility checkbox for a single (layer, datatype) item to `parent`.
-// onSync (optional) refreshes the enclosing category's "all" checkbox after a
-// toggle. Returns {controller, state} so the category toggle can drive it.
+// Writes a row's visibility everywhere it's held: the checkbox's own state
+// object, the checkbox on screen, and wasm. Deliberately not via the
+// controller's setValue, which fires onChange -- that path is reserved for the
+// user actually clicking the checkbox, which is what drops the solo snapshot.
+function setRowVisible(Module, row, visible) {
+    if (row.state.visible === visible) return;
+    row.state.visible = visible;
+    row.controller.updateDisplay();
+    Module.setLayerVisible(row.item.layer, row.item.datatype, visible);
+}
+
+// Re-derives every category's "all" checkbox from the rows under it.
+function syncCategoryChecks() {
+    for (const category of layerCategories) {
+        const all = category.rows.every((row) => row.state.visible);
+        if (category.allState.visible !== all) {
+            category.allState.visible = all;
+            category.allController.updateDisplay();
+        }
+    }
+}
+
+// Drops the solo snapshot: any hand-set visibility makes it describe a state
+// that no longer exists, and restoring to it would undo the change just made.
+function forgetSolo() {
+    if (soloTag === null) return;
+    soloTag = null;
+    soloRestore = null;
+    markSoloRow();
+}
+
+function markSoloRow() {
+    for (const row of layerRows) {
+        row.controller.domElement.classList.toggle("layer-soloed", layerTag(row.item) === soloTag);
+    }
+}
+
+// Show only this layer; clicking the same layer's S again puts back the
+// visibility set the first click captured.
+function toggleSolo(item) {
+    const tag = layerTag(item);
+    const restore = soloTag === tag ? soloRestore : null;
+    if (restore) {
+        soloTag = null;
+        soloRestore = null;
+    } else {
+        soloRestore = new Map(layerRows.map((row) => [layerTag(row.item), row.state.visible]));
+        soloTag = tag;
+    }
+    markSoloRow();
+    modulePromise.then((Module) => {
+        for (const row of layerRows) {
+            const rowTag = layerTag(row.item);
+            setRowVisible(Module, row, restore ? restore.get(rowTag) !== false : rowTag === tag);
+        }
+        syncCategoryChecks();
+    });
+}
+
+// The All / None / Invert row. Scoped to whatever the filter is currently
+// showing, which is what makes the pair worth having: filter to "metal", click
+// None, and you've hidden one family without touching the other ninety layers.
+function applyBulkVisibility(kind) {
+    forgetSolo();
+    const rows = layerRows.filter((row) => row.matches);
+    modulePromise.then((Module) => {
+        for (const row of rows) {
+            setRowVisible(Module, row, kind === "invert" ? !row.state.visible : kind === "all");
+        }
+        syncCategoryChecks();
+    });
+}
+
+// Narrows the list to rows whose number, datatype, name or category contains
+// the query. Rows are hidden, not removed, so the visibility state behind them
+// is untouched -- a filter is a view of the list, not an edit to it.
+function applyLayerFilter(text) {
+    const query = text.trim().toLowerCase();
+    if (query && !layerFilterActive) {
+        for (const category of layerCategories) {
+            category.wasOpen = !category.folder.domElement.classList.contains("lil-closed");
+        }
+    }
+    layerFilterActive = !!query;
+
+    for (const row of layerRows) {
+        row.matches = !query || row.haystack.includes(query);
+        row.controller.domElement.style.display = row.matches ? "" : "none";
+    }
+    for (const category of layerCategories) {
+        const matched = category.rows.reduce((n, row) => n + (row.matches ? 1 : 0), 0);
+        category.folder.domElement.style.display = matched > 0 ? "" : "none";
+        category.folder.title(query
+            ? `${category.name}  (${matched} of ${category.rows.length})`
+            : `${category.name}  (${category.rows.length})`);
+        if (query) category.folder.open();
+        else if (!category.wasOpen) category.folder.close();
+    }
+}
+
+// Adds one visibility checkbox for a single (layer, datatype) item to `parent`,
+// with its shape count and a solo button on the right. onSync (optional)
+// refreshes the enclosing category's "all" checkbox after a toggle. Returns the
+// row record the filter/solo/bulk paths above operate on.
 function addLayerRow(parent, item, onSync) {
     const label = item.name
         ? `${item.layer}/${item.datatype} – ${item.name}`
         : `${item.layer}/${item.datatype}`;
+    const shapes = item.polygonCount || 0;
+    const labels = item.labelCount || 0;
     const state = { visible: item.visible };
     const controller = parent.add(state, "visible")
         .name(label)
         .onChange((visible) => {
+            forgetSolo();
             modulePromise.then((Module) => Module.setLayerVisible(item.layer, item.datatype, visible));
             if (onSync) onSync();
         });
     tintBorder(controller.domElement, item.frameColor);
-    controller.domElement.title = label;
-    return { controller, state };
+    controller.domElement.classList.add("layer-row");
+    controller.domElement.title = [
+        label,
+        `${shapes.toLocaleString()} shape${shapes === 1 ? "" : "s"}, ` +
+        `${labels.toLocaleString()} label${labels === 1 ? "" : "s"}`
+    ].join("\n");
+
+    const count = document.createElement("span");
+    count.className = "layer-count";
+    // A layer with no polygons at all but labels on it -- which real decks do
+    // have -- would read as empty behind a bare "0", so those count their text
+    // instead and say so with the same T the panel's text toggle uses.
+    count.textContent = shapes > 0 ? fmtCount(shapes) : (labels > 0 ? `T${fmtCount(labels)}` : "0");
+
+    const solo = document.createElement("span");
+    solo.className = "layer-solo";
+    solo.textContent = "S";
+    solo.title = "Solo — hide every other layer (click again to restore them)";
+    solo.addEventListener("click", (event) => {
+        // lil-gui builds a boolean row as a <label> wrapping its checkbox, so
+        // without this a click anywhere inside it -- here included -- would also
+        // toggle the layer it's meant to solo.
+        event.preventDefault();
+        event.stopPropagation();
+        toggleSolo(item);
+    });
+    controller.domElement.append(count, solo);
+
+    return { controller, state, item, matches: true, haystack: `${label} ${item.group || ""}`.toLowerCase() };
+}
+
+// The two hand-built rows at the top of the Layers folder: a live filter box
+// and All | None | Invert. Both are built by hand for the same reason the
+// Pan | Measure row is -- lil-gui has neither a live-updating text field (its
+// string controller only reports on Enter/blur, which is useless for a filter)
+// nor a segmented control -- and both reuse its row classes so they pick up the
+// panel's metrics and theme for free.
+function addLayerListControls(folder) {
+    const filterRow = document.createElement("div");
+    filterRow.className = "lil-controller layer-filter-row";
+    const filterName = document.createElement("div");
+    filterName.className = "lil-name";
+    filterName.textContent = "Filter";
+    const filterWidget = document.createElement("div");
+    filterWidget.className = "lil-widget";
+    const filterInput = document.createElement("input");
+    filterInput.type = "text";
+    filterInput.placeholder = "number, name or group";
+    filterInput.addEventListener("input", () => applyLayerFilter(filterInput.value));
+    filterWidget.appendChild(filterInput);
+    filterRow.append(filterName, filterWidget);
+    filterRow.title = "Show only layers whose number, datatype, name or group contains this";
+
+    const bulkRow = document.createElement("div");
+    bulkRow.className = "lil-controller mode-row layer-bulk-row";
+    const bulkName = document.createElement("div");
+    bulkName.className = "lil-name";
+    bulkName.textContent = "Show";
+    const bulkWidget = document.createElement("div");
+    bulkWidget.className = "lil-widget mode-widget";
+    const BULK = [
+        { id: "all", label: "All", title: "Show every layer the filter is showing" },
+        { id: "none", label: "None", title: "Hide every layer the filter is showing" },
+        { id: "invert", label: "Invert", title: "Flip every filtered layer's visibility" }
+    ];
+    for (const action of BULK) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = action.label;
+        btn.title = action.title;
+        btn.addEventListener("click", () => applyBulkVisibility(action.id));
+        bulkWidget.appendChild(btn);
+    }
+    bulkRow.append(bulkName, bulkWidget);
+
+    folder.$children.append(filterRow, bulkRow);
 }
 
 // Rebuilds the layer folder from Module.getLayers() -- {layer, datatype, name,
@@ -363,10 +574,19 @@ function renderLayerList(layers) {
     if (layersFolder) {
         layersFolder.destroy();
     }
+    layerRows = [];
+    layerCategories = [];
+    layerFilterActive = false;
+    // The snapshot describes the layer set that's being thrown away, so it
+    // can't survive into the next one.
+    soloTag = null;
+    soloRestore = null;
+
     // lil-gui folders open by default (dat.gui's were closed) -- keep the
     // panel compact until the user asks for the layer list.
     layersFolder = gui.addFolder("Layers");
     layersFolder.close();
+    addLayerListControls(layersFolder);
 
     // Group by category, preserving getLayers()'s ordering (lyp order first).
     // Ungrouped layers collect under a single trailing "Other layers" bucket.
@@ -397,21 +617,22 @@ function renderLayerList(layers) {
         const allController = folder.add(allState, "visible")
             .name("◼ all")
             .onChange((visible) => {
+                forgetSolo();
                 modulePromise.then((Module) => {
-                    for (const c of children) {
-                        c.state.visible = visible;
-                        c.controller.updateDisplay();
-                        Module.setLayerVisible(c.item.layer, c.item.datatype, visible);
-                    }
+                    for (const c of children) setRowVisible(Module, c, visible);
                 });
             });
         allController.domElement.title = `Toggle all ${items.length} layers in ${category}`;
 
+        const shapeTotal = items.reduce((n, it) => n + (it.polygonCount || 0), 0);
+        folder.$title.title = `${category}: ${items.length} layer${items.length === 1 ? "" : "s"}, ` +
+                              `${shapeTotal.toLocaleString()} shape${shapeTotal === 1 ? "" : "s"}`;
+
         for (const item of items) {
-            const row = addLayerRow(folder, item, syncCategory);
-            row.item = item;
-            children.push(row);
+            children.push(addLayerRow(folder, item, syncCategory));
         }
+        layerRows.push(...children);
+        layerCategories.push({ name: category, folder, rows: children, allState, allController, wasOpen: false });
     }
 }
 
