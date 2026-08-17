@@ -64,6 +64,10 @@
   "contributes": {
     "commands": [
       {
+        "command": "GDS-Lens.goToCoordinate",
+        "title": "GDSLens: Go to Coordinate"
+      },
+      {
         "command": "GDS-Lens.showDebugTools",
         "title": "GDSLens: Toggle Debug Tools"
       },
@@ -72,6 +76,14 @@
         "title": "GDSLens: Toggle Auto-Reload on Change"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "GDS-Lens.goToCoordinate",
+          "when": "activeCustomEditorId == 'GDS-Lens.editor'"
+        }
+      ]
+    },
     "customEditors": [
       {
         "viewType": "GDS-Lens.editor",

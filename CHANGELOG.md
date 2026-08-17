@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+- **A quieter control panel.** The panel opened with nine rows of chrome stacked
+  above a collapsed **Layers** folder — which is the one thing anyone opens a
+  layout to use. The four render toggles (**Infill**, **Text**, **Merge
+  Overlaps**, **Grid**), both file loaders (**Load KLayout .lyp File**, **Load
+  Marker File**) and **Reset View** now live in a single collapsed **Display**
+  folder. Grouped by how often they're touched rather than by what they act on:
+  the toggles are a preference set once, and the two loaded files are remembered
+  across reopens by the extension host, so most sessions never open this folder
+  at all.
+
+  **Mode: Pan | Measure** stays at the top of the panel, above the folder. It's
+  the only control there that changes what a click on the canvas does, which
+  makes it the one that shouldn't need a folder opened to find.
+
+- **"Go to (x, y)" is now the "GDSLens: Go to Coordinate" command** rather than a
+  permanent text box in the panel. A coordinate arrives from outside the viewer
+  with the clipboard already loaded, so it's an occasional action, not a control
+  worth standing screen space — and the command palette's input box can reject an
+  unreadable pair *as you type it*, which lil-gui's string row had no way to do
+  (the old row could only turn red after the fact and explain itself in a
+  tooltip). Everything it accepts is unchanged — microns unless a per-number unit
+  says otherwise, wrapped in whatever parentheses, `x=`/`y=` labels or bare
+  spaces the report it came from used — and the parser moved to
+  `src/coord-parse.js` so the host can validate with the same code the viewer
+  used to, now under unit tests. A coordinate outside the layout reports in the
+  status bar instead of tinting a row. The command only appears in the palette
+  while a layout is the active editor.
+
 - **Gzipped layouts open directly** — `.gds.gz`, `.oas.gz`, `.oasis.gz`. Layouts
   are shipped and archived compressed all the time, and until now opening one
   meant gunzipping it to a scratch file first.

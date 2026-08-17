@@ -26,8 +26,8 @@ drive layer colors.
 - Measure tool: click two points for the distance, Δx/Δy and angle between
   them, snapping to nearby vertices and edges. Rulers stay on the canvas, so
   several measurements can be compared at once.
-- A pointer coordinate readout, and a "Go to (x, y)" box for driving the view
-  from a coordinate out of a DRC report or a colleague's message.
+- A pointer coordinate readout, and a "Go to Coordinate" command for driving the
+  view from a coordinate out of a DRC report or a colleague's message.
 - Marker databases: load DRC/LVS violation markers (KLayout `.lyrdb` or
   Calibre DRC ASCII results) as a highlight overlay with a browsable
   category/item panel that zooms to each violation.
@@ -71,32 +71,37 @@ extension still loads, and so does a `.gds` that turns out to be gzipped.
   showing, so filtering to one family and hiding it takes two clicks. The **S**
   on each row solos that layer (hides every other one); clicking it again puts
   back exactly the layers that were on before, rather than turning everything on.
-- **Infill** — toggle the hatched layer fill on or off from the panel.
+- **Display** — a collapsed folder holding everything that isn't per-layer: the
+  render toggles below, plus **Load KLayout .lyp File**, **Load Marker File** and
+  **Reset View**. These are set once and forgotten (or reached for occasionally),
+  so they stay out of the way of the layer list, which is what the panel is for.
+- **Infill** — toggle the hatched layer fill on or off (**Display** folder).
 - **Text** — toggle the layout's text labels (GDSII/OASIS `TEXT` elements) on
-  or off. Labels draw at a constant on-screen size in their layer's color and
-  respect that layer's visibility checkbox. Off by default, since a dense
-  design's labels can bury the geometry underneath them.
-- **Grid** — toggle the background reference grid. Its spacing is a round
-  nm/µm/mm step chosen from the zoom, so it agrees with the scale bar; on by
-  default.
+  or off (**Display** folder). Labels draw at a constant on-screen size in their
+  layer's color and respect that layer's visibility checkbox. Off by default,
+  since a dense design's labels can bury the geometry underneath them.
+- **Grid** — toggle the background reference grid (**Display** folder). Its
+  spacing is a round nm/µm/mm step chosen from the zoom, so it agrees with the
+  scale bar; on by default.
 - **Coordinates** — the world coordinate under the pointer is shown as
   `X: … Y: …` below the scale bar in the bottom-right corner, always in microns
   (the scale bar and ruler switch to nm/mm; a position you watch while moving
   the pointer shouldn't). Zoom sets the precision instead: the decimals resolve
   a tenth of the grid's current step, so the digits on screen are the ones the
   grid can actually distinguish.
-- **Go to (x, y)** — type or paste a coordinate into the panel and press Enter to
-  center the view on it. Microns unless a per-number unit says otherwise
-  (`nm`/`um`/`µm`/`mm`), and the decorations coordinates arrive wrapped in —
-  parentheses, `x=`/`y=`, commas or bare spaces — are all accepted, so a pair
-  copied straight out of a DRC report or a Slack message works as-is. The zoom is
-  left alone (the coordinate doesn't say how much around it you want to see); if
-  the point isn't inside this layout the row turns red and says so.
-- **Reset View** — refit the layout to the window from the panel.
-- **Mode: Pan | Measure** — pick the mouse's mode in the panel (or press `M` to
-  switch). In **Measure**, click two points to measure between them (total, Δx,
-  Δy and the angle); the cursor turns into a crosshair, and wheel zoom keeps
-  working.
+- **GDSLens: Go to Coordinate** — command palette entry (available while a layout
+  is the active editor) that centers the view on a pasted coordinate. Microns
+  unless a per-number unit says otherwise (`nm`/`um`/`µm`/`mm`), and the
+  decorations coordinates arrive wrapped in — parentheses, `x=`/`y=`, commas or
+  bare spaces — are all accepted, so a pair copied straight out of a DRC report
+  or a Slack message works as-is; anything that isn't a pair is refused as you
+  type it. The zoom is left alone (the coordinate doesn't say how much around it
+  you want to see); if the point isn't inside this layout the status bar says so.
+- **Reset View** — refit the layout to the window (**Display** folder).
+- **Mode: Pan | Measure** — pick the mouse's mode at the top of the panel (or
+  press `M` to switch). In **Measure**, click two points to measure between them
+  (total, Δx, Δy and the angle); the cursor turns into a crosshair, and wheel zoom
+  keeps working.
   - **Snapping** — the ruler snaps to the nearest polygon vertex or edge within
     about 12px, marked by a small square under the cursor before you click, so
     a measurement between two shapes lands on them exactly rather than near
@@ -116,8 +121,9 @@ extension still loads, and so does a `.gds` that turns out to be gzipped.
   file while keeping the camera and per-layer visibility, so the new geometry
   lands in place. **Always** reloads from then on without asking; the
   "GDSLens: Toggle Auto-Reload on Change" command turns that back off.
-- **Load KLayout .lyp File** — apply custom layer colors from a `.lyp` file.
-- **Load Marker File** — load a DRC/LVS marker database (KLayout `.lyrdb`
+- **Load KLayout .lyp File** — apply custom layer colors from a `.lyp` file
+  (**Display** folder).
+- **Load Marker File** (**Display** folder) — load a DRC/LVS marker database (KLayout `.lyrdb`
   report database or Calibre DRC ASCII results database; the format is
   detected from the file's content, not its extension). Violations draw as a
   red overlay above all layers, and a "Markers" panel lists each category

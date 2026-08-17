@@ -18,6 +18,10 @@ see [`README.md`](README.md).
 - `src/marker-parsers.js` — standalone parsers for DRC/LVS marker databases
   (KLayout `.lyrdb`, Calibre DRC ASCII); loaded in the webview via a
   `<script>` tag and `require()`d directly by the unit tests.
+- `src/coord-parse.js` — reads an `x, y` pair out of pasted text (the units and
+  decorations real DRC reports print). Standalone for the same reason
+  `marker-parsers.js` is: the "Go to Coordinate" command validates the input box
+  with it in the extension host, and the unit tests `require()` it directly.
 - `src/wasm/` — C++ source compiled with Emscripten into
   `src/wasm/build/gdstk_wasm.js`, which does GDSII/OASIS parsing and WebGL
   rendering. `renderer.cpp` holds the renderer proper (GL state, camera,

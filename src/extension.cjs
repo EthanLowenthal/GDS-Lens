@@ -2,6 +2,7 @@ const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const { decodeLayoutBytes } = require('./layout-bytes.js');
+const { parseCoordinatePair } = require('./coord-parse.js');
 
 const logger = vscode.window.createOutputChannel("GDSII Debugger");
 
@@ -85,6 +86,18 @@ function activate(context) {
         })
     );
 
+    // "GDSLens: Go to Coordinate" -- centers the active viewer on a pasted
+    // coordinate. A command rather than a permanent row in the viewer's panel:
+    // coordinates arrive from outside the viewer (a DRC report, a colleague's
+    // message, a generator's log), so this is reached for occasionally and with
+    // a clipboard already loaded -- and the command palette's input box can
+    // reject an unreadable pair as you type it, which lil-gui has no way to do.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('GDS-Lens.goToCoordinate', () => {
+            return provider.goToCoordinate();
+        })
+    );
+
     // The only in-editor way back out of auto-reload: with it on, the viewer's
     // "newer version on disk" banner (which is where you turn it on) never
     // appears, so without this the Settings UI would be the sole off switch.
@@ -114,6 +127,46 @@ class GdsEditorProvider {
         for (const panel of this.panels) {
             panel.webview.postMessage({ type: 'toggleDebugTools' });
         }
+    }
+
+    // Asks for a coordinate and pans one viewer to it. Unlike toggleDebugTools
+    // this targets a single panel: panning every open layout to the same point
+    // would be nonsense. `active` is the focused tab; falling back to a lone
+    // open viewer covers the case where focus sits somewhere else entirely
+    // (the palette can be opened from anywhere).
+    async goToCoordinate() {
+        const target = [...this.panels].find((panel) => panel.active) ||
+                       (this.panels.size === 1 ? [...this.panels][0] : null);
+        if (!target) {
+            vscode.window.showInformationMessage(
+                this.panels.size === 0
+                    ? 'GDS Lens: open a layout first.'
+                    : 'GDS Lens: click the layout you want to move, then run this again.');
+            return;
+        }
+
+        // Microns unless a per-number unit says otherwise, and the decorations
+        // coordinates arrive wrapped in are all accepted -- see coord-parse.js.
+        // Validation runs as you type, so a pair that can't be read says so
+        // before you commit to it rather than silently doing nothing.
+        const text = await vscode.window.showInputBox({
+            title: 'Go to Coordinate',
+            prompt: 'Center the view on a coordinate, in µm unless a unit says otherwise',
+            placeHolder: '12.5, -40    (1.2mm, 300nm)    x=8 y=2',
+            validateInput: (value) => {
+                if (!value.trim()) return null;  // nothing typed yet, not an error
+                return parseCoordinatePair(value)
+                    ? null
+                    : 'Not an x, y pair — try "12.5, -40" or "(1.2mm, 300nm)"';
+            }
+        });
+        if (!text || !text.trim()) return;
+
+        const point = parseCoordinatePair(text);
+        if (!point) return;  // validateInput already refused it
+        // Whether the point is inside this layout is something only the viewer
+        // knows, so it reports back (see the 'gotoResult' handler).
+        target.webview.postMessage({ type: 'goToPoint', x: point.x, y: point.y });
     }
 
     // Reads a .lyp from disk and pushes it to one viewer, tagged with its
@@ -457,6 +510,17 @@ class GdsEditorProvider {
             webviewPanel.webview.onDidReceiveMessage(async (message) => {
                 if (message.command === 'reloadFile') {
                     await sendLayout(true);
+                    return;
+                }
+                if (message.command === 'gotoResult') {
+                    // The pan happened either way (the camera can leave the
+                    // layout's own extent), but a coordinate that isn't in this
+                    // design is almost always a coordinate from another one --
+                    // worth saying, and quietly, in the status bar.
+                    if (!message.ok) {
+                        vscode.window.setStatusBarMessage(
+                            `GDS Lens: (${message.x}, ${message.y}) µm is outside this layout`, 5000);
+                    }
                     return;
                 }
                 if (message.command === 'setAutoReload') {
