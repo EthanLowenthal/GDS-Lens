@@ -364,6 +364,10 @@ let hierarchyModel = null;
 const hierarchyExpanded = new Set();
 let hierarchySelectedPath = null;
 let hierarchySelectedRow = null;
+// The selected row's world-space boxes, one per placement it stands for (empty
+// for a cell with no geometry), kept so the canvas outlines can be re-pushed
+// whenever the panel opens or closes -- see syncCellHighlight.
+let hierarchySelectedBoxes = [];
 // Which design the state above belongs to, so opening a different file starts
 // from a clean tree instead of inheriting another design's open branches.
 let hierarchyRootKey = null;
@@ -409,6 +413,33 @@ function transformBox(m, box) {
     return { minX, maxX, minY, maxY };
 }
 
+// The boxes to outline for one tree node: one per placement the row stands for.
+// A row is a cell *as one parent places it*, so a cell placed 40 times is 40
+// separate rectangles where the copies actually sit -- the box spanning all 40
+// (which is what the row frames the camera on) mostly encloses other cells'
+// geometry, and drawing that instead says the selected cell is everything in it.
+//
+// Each placement transform maps the child's own frame into the parent's, so its
+// world box is the child cell's own box carried through the placement and then
+// through the parent's transform. Rows over the tree's placement cap (see
+// kMaxRowPlacements in renderer.cpp) carry no transforms; those fall back to the
+// spanning box, since a partial set of copies is worse than an honest envelope.
+function hierarchyBoxes(node, cell, parentXform, spanningBox) {
+    const placements = node.placements;
+    if (!placements || placements.length < 6 || !cell.bbox) {
+        return spanningBox ? [spanningBox] : [];
+    }
+    const boxes = [];
+    for (let i = 0; i + 5 < placements.length; i += 6) {
+        const xform = composeXform(parentXform, [
+            placements[i], placements[i + 1], placements[i + 2],
+            placements[i + 3], placements[i + 4], placements[i + 5]
+        ]);
+        boxes.push(transformBox(xform, cell.bbox));
+    }
+    return boxes;
+}
+
 // Shows/hides the panel. byUser marks the entry points the user drives (the
 // header's ✕, the reopen button, the H key), which is what makes the choice
 // stick across loads.
@@ -416,28 +447,77 @@ function setHierarchyOpen(open, byUser) {
     if (byUser) hierarchyUserChoice = open;
     if (hierarchyPanel) hierarchyPanel.classList.toggle("hidden", !open);
     document.body.classList.toggle("hierarchy-open", open);
+    // The outline belongs to the panel: it's the tree pointing at the layout,
+    // so with the tree away it would be a dashed rectangle with nothing on
+    // screen to explain it. Putting the panel away takes it down, and bringing
+    // the panel back puts it up again for whatever row is still selected.
+    syncCellHighlight();
 }
 
-function hierarchySelect(row, path) {
+// Pushes the canvas outlines the current state calls for: the selected row's
+// boxes while the panel is open, nothing otherwise. Every change to either half
+// of that -- the selection, the panel's visibility -- goes through here rather
+// than calling into wasm directly, so the two can't disagree.
+function syncCellHighlight() {
+    const open = hierarchyPanel && !hierarchyPanel.classList.contains("hidden");
+    const boxes = open ? hierarchySelectedBoxes : null;
+    modulePromise.then((Module) => {
+        if (!boxes || boxes.length === 0) {
+            Module.clearCellHighlight();
+            return;
+        }
+        // Flat [minX, minY, maxX, maxY, ...] -- one bulk conversion in wasm
+        // rather than a call (and a JS object read) per placement.
+        const flat = [];
+        for (const box of boxes) flat.push(box.minX, box.minY, box.maxX, box.maxY);
+        Module.setCellHighlight(flat);
+    });
+}
+
+// Marks a row selected: the row itself in the panel, and -- via `boxes`, the
+// placements the row stands for (see hierarchyBoxes) -- an outline around each
+// copy of that cell on the canvas. The outlines are the half that survives
+// navigating away: framing a cell says which shapes it is only until the view
+// moves, whereas the boxes stay glued to the geometry, so zooming out to see
+// where the cell sits in the design keeps the answer instead of losing it. Cells
+// with no geometry pass no boxes and draw nothing -- there's no region to point
+// at.
+function hierarchySelect(row, path, boxes) {
     if (hierarchySelectedRow) hierarchySelectedRow.classList.remove("hier-selected");
     hierarchySelectedRow = row;
     hierarchySelectedPath = path;
+    hierarchySelectedBoxes = boxes || [];
     row.classList.add("hier-selected");
+    syncCellHighlight();
 }
 
-function hierarchyTooltip(cell, node, box) {
+// Drops the selection entirely (Escape, and every path that replaces the tree).
+// hierarchySelectedPath is cleared too, so a rebuild doesn't re-select it.
+function hierarchyDeselect() {
+    if (hierarchySelectedRow) hierarchySelectedRow.classList.remove("hier-selected");
+    hierarchySelectedRow = null;
+    hierarchySelectedPath = null;
+    hierarchySelectedBoxes = [];
+    syncCellHighlight();
+}
+
+function hierarchyTooltip(cell, node, box, boxes) {
     const lines = [cell.name];
     if (node.count > 1) {
         // Only the first copy is walked into, so say so on the row rather than
-        // leaving "expand" and "×64" to look like a contradiction.
-        lines.push(`${node.count} placements here (expanding follows the first)`);
+        // leaving "expand" and "×64" to look like a contradiction. Whether the
+        // copies are outlined one by one or covered by a single box is a visible
+        // difference on screen, so the row says which it is.
+        const each = boxes.length > 1 ? "each outlined" : "outlined as one box, too many to mark separately";
+        lines.push(`${node.count} placements here, ${each} (expanding follows the first)`);
     }
     lines.push(`${cell.polygons} own shape${cell.polygons === 1 ? "" : "s"}, ` +
                `${cell.labels} label${cell.labels === 1 ? "" : "s"}, ` +
                `${cell.refs.length} child cell${cell.refs.length === 1 ? "" : "s"}`);
     if (box) {
         lines.push(`${fmtCoord(box.maxX - box.minX)} × ${fmtCoord(box.maxY - box.minY)} µm ` +
-                   `at (${fmtCoord((box.minX + box.maxX) / 2)}, ${fmtCoord((box.minY + box.maxY) / 2)}) — click to zoom`);
+                   `at (${fmtCoord((box.minX + box.maxX) / 2)}, ${fmtCoord((box.minY + box.maxY) / 2)}) — ` +
+                   `click to zoom to it and outline it (Esc clears)`);
     } else {
         lines.push("empty — no geometry to zoom to");
     }
@@ -452,7 +532,9 @@ function hierarchyTooltip(cell, node, box) {
 // every placement the entry stands for -- mapped through it. Descending
 // instead composes the entry's own xform, the *first* placement's: a cell
 // placed 64 times is one row that frames all 64, and opening it walks into one
-// of them, because there is no single deeper coordinate frame to offer.
+// of them, because there is no single deeper coordinate frame to offer. The
+// per-placement boxes (what selecting the row outlines) are the other side of
+// that same collapse -- see hierarchyBoxes.
 function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
     for (const node of nodes) {
         const cell = hierarchyModel.cells[node.cell];
@@ -460,6 +542,7 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
 
         const path = parentPath ? `${parentPath}/${cell.name}` : cell.name;
         const box = node.bbox ? transformBox(parentXform, node.bbox) : null;
+        const boxes = hierarchyBoxes(node, cell, parentXform, box);
         const childXform = composeXform(parentXform, node.xform);
         const expandable = cell.refs.length > 0 && depth + 1 < HIERARCHY_MAX_DEPTH;
 
@@ -478,7 +561,7 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
         count.className = "hier-count";
         if (node.count > 1) count.textContent = `×${node.count}`;
         row.append(twisty, name, count);
-        row.title = hierarchyTooltip(cell, node, box);
+        row.title = hierarchyTooltip(cell, node, box, boxes);
 
         const children = document.createElement("div");
         children.className = "hier-children hidden";
@@ -504,12 +587,17 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
             setExpanded(children.classList.contains("hidden"));
         });
         row.addEventListener("click", () => {
-            hierarchySelect(row, path);
+            // Selection outlines every placement; the camera still frames all of
+            // them at once, since that's the one view that shows the row's whole
+            // meaning.
+            hierarchySelect(row, path, boxes);
             if (!box) return;
             modulePromise.then((Module) => Module.zoomToBox(box.minX, box.minY, box.maxX, box.maxY));
         });
 
-        if (path === hierarchySelectedPath) hierarchySelect(row, path);
+        // Re-selecting after a rebuild (a reload, or reopening a branch) puts
+        // the outlines back without moving the camera -- only a click moves it.
+        if (path === hierarchySelectedPath) hierarchySelect(row, path, boxes);
         if (hierarchyExpanded.has(path)) setExpanded(true);
     }
 }
@@ -519,7 +607,13 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
 function renderHierarchy(model) {
     if (!hierarchyTree) return;
     hierarchyModel = model;
+    // Every row is about to be thrown away. The selected *path* is kept -- the
+    // rows rebuilt below re-select it, which puts the canvas outlines back at
+    // the reloaded file's coordinates -- but the boxes themselves are dropped
+    // first: if this design has no cell on that path, nothing else would.
     hierarchySelectedRow = null;
+    hierarchySelectedBoxes = [];
+    syncCellHighlight();
     hierarchyTree.textContent = "";
 
     const cells = (model && model.cells) || [];
@@ -759,7 +853,13 @@ window.addEventListener("keydown", (event) => {
     // (click, click, then back to panning): M enters measure mode, Escape
     // always lands back in pan mode and drops the ruler.
     else if (event.key === "m" || event.key === "M") setMode(currentMode === "measure" ? "pan" : "measure");
-    else if (event.key === "Escape") setMode("pan");
+    // Escape is the "put the canvas back" key: it drops the ruler (by leaving
+    // measure mode) and the selected cell's outline, the two things the viewer
+    // draws on top of the layout at the user's request.
+    else if (event.key === "Escape") {
+        setMode("pan");
+        hierarchyDeselect();
+    }
     // H shows/hides the hierarchy tree -- it's the one panel that takes a
     // slice of the viewport, so getting it out of the way is worth a key.
     else if (event.key === "h" || event.key === "H") toggleHierarchy();

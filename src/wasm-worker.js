@@ -115,8 +115,16 @@ self.onmessage = (event) => {
             }
         }
         // hierarchy (see build_hierarchy in renderer.cpp) is plain objects and
-        // numbers -- no typed arrays to transfer, and small next to the
-        // geometry above: one entry per cell in the file, not per placement.
+        // numbers -- one entry per cell in the file -- except for each row's
+        // per-placement transforms, which are Float64Arrays and so worth
+        // transferring rather than cloning. They're capped library-wide
+        // (kMaxHierarchyPlacements), so this walk is bounded and most rows
+        // (single placements) carry none at all.
+        for (const cell of result.hierarchy.cells) {
+            for (const ref of cell.refs) {
+                if (ref.placements) transferList.push(ref.placements.buffer);
+            }
+        }
         postMessage(
             {type: "gdsResult", ok: true, layers: result.layers, instanceGroups: result.instanceGroups,
              hierarchy: result.hierarchy, bbox: result.bbox},

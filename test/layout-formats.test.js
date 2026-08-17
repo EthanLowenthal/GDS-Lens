@@ -95,10 +95,23 @@ test("parses GDSII and OASIS, detecting the format from the header", { skip }, a
 test("describes the cell hierarchy, collapsing an AREF into one child entry", { skip }, async () => {
     const Module = await loadModule();
 
+    // The placements of one child entry (6 doubles each, laid out like
+    // Affine2D), as a sorted set of strings: the two fixtures are two writes of
+    // one design and list TOP's three references to CHILD in different orders,
+    // so the placements are the same eight in either file but not necessarily in
+    // the same order.
+    const placementSet = (ref) => {
+        if (!ref.placements) return null;
+        const out = [];
+        for (let i = 0; i < ref.placements.length; i += 6) {
+            out.push(Array.from(ref.placements.slice(i, i + 6)).join(","));
+        }
+        return out.sort();
+    };
+
     // Everything except each child entry's xform, which is the *first*
-    // placement's transform: the two fixtures are two writes of one design and
-    // list TOP's three references to CHILD in different orders, so which copy
-    // comes first legitimately differs between them.
+    // placement's transform -- and which of the eight copies that is
+    // legitimately differs between the two files, for the reason above.
     const structure = (hierarchy) => ({
         cellCount: hierarchy.cellCount,
         omitted: hierarchy.omitted,
@@ -108,7 +121,9 @@ test("describes the cell hierarchy, collapsing an AREF into one child entry", { 
             polygons: cell.polygons,
             labels: cell.labels,
             bbox: cell.bbox,
-            refs: cell.refs.map((ref) => ({ cell: ref.cell, count: ref.count, bbox: ref.bbox })),
+            refs: cell.refs.map((ref) => ({
+                cell: ref.cell, count: ref.count, bbox: ref.bbox, placements: placementSet(ref),
+            })),
         })),
     });
 
@@ -146,6 +161,35 @@ test("describes the cell hierarchy, collapsing an AREF into one child entry", { 
     // In CHILD's own frame, which is what makes the same entry reusable for
     // every parent that places it.
     assert.deepStrictEqual(leaf.bbox, {minX: 0, maxX: 2, minY: 0, maxY: 1});
+
+    // The entry also carries all 8 placements individually, which is what lets
+    // the viewer outline each copy of CHILD where it actually sits instead of
+    // drawing one rectangle around the lot (see hierarchyBoxes in viewer.js).
+    assert.strictEqual(child.placements.constructor, Float64Array);
+    assert.strictEqual(child.placements.length, 8 * 6);
+
+    // Mapping CHILD's own box through each of them and unioning the results
+    // gives back exactly the entry's spanning box -- so the copies account for
+    // the whole of it, including the one placed with a 90 degree rotation, whose
+    // 2x1um box lands 1x2um.
+    const union = {minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity};
+    for (let i = 0; i < child.placements.length; i += 6) {
+        const [a, b, c, d, tx, ty] = Array.from(child.placements.slice(i, i + 6));
+        for (const [x, y] of [[leaf.bbox.minX, leaf.bbox.minY], [leaf.bbox.maxX, leaf.bbox.minY],
+                              [leaf.bbox.minX, leaf.bbox.maxY], [leaf.bbox.maxX, leaf.bbox.maxY]]) {
+            const wx = a * x + b * y + tx;
+            const wy = c * x + d * y + ty;
+            union.minX = Math.min(union.minX, wx);
+            union.maxX = Math.max(union.maxX, wx);
+            union.minY = Math.min(union.minY, wy);
+            union.maxY = Math.max(union.maxY, wy);
+        }
+    }
+    for (const key of ["minX", "maxX", "minY", "maxY"]) {
+        // Not exact: the rotated copy's corners go through sin/cos.
+        assert.ok(Math.abs(union[key] - child.bbox[key]) < 1e-9,
+                  `placement union ${key}: ${union[key]} vs ${child.bbox[key]}`);
+    }
 
     const oas = parseFixture(Module, "sample_layout.oas");
     assert.strictEqual(oas.ok, true, oas.error);
