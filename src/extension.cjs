@@ -30,6 +30,12 @@ const MARKER_PATHS_KEY = 'GDS-Lens.markerPathByGds';
 // since one that big is certainly not going to expand to something smaller.
 const MAX_LAYOUT_BYTES = 2 * 1024 * 1024 * 1024;
 
+// The same ceiling for a marker database, set far lower: its text crosses to
+// the webview as a JS string and is then parsed into per-item objects, so it
+// costs several times its own size in the renderer process. A results database
+// this large is a full-chip dump nobody can page through anyway.
+const MAX_MARKER_BYTES = 512 * 1024 * 1024;
+
 // How long the layout file has to hold a steady size+mtime before a reload
 // reads it. Layout writers rarely produce one clean change event: generator
 // scripts and KLayout write in chunks, and some tools write a temp file and
@@ -190,11 +196,29 @@ class GdsEditorProvider {
 
     // Marker-database twin of postLyp: reads a .lyrdb / Calibre results file
     // and pushes its text to one viewer (format sniffing happens in the
-    // webview -- see marker-parsers.js). Returns false if unreadable so
-    // callers can drop a stale remembered path.
+    // webview -- see marker-parsers.js). Gzipped databases are expanded here:
+    // full-chip results run to hundreds of MB and are routinely stored
+    // compressed, and the marker text crosses to the webview as a string, so
+    // this is the last place that can deal in bytes. Returns false if
+    // unreadable so callers can drop a stale remembered path.
     postMarkers(webviewPanel, fsPath) {
         try {
-            const text = fs.readFileSync(fsPath, 'utf8');
+            const raw = fs.readFileSync(fsPath);
+            const decoded = decodeLayoutBytes(raw, MAX_MARKER_BYTES);
+            if (!decoded.ok) {
+                logger.appendLine('>>> Could not decompress marker file at ' + fsPath + ': ' + decoded.detail);
+                vscode.window.showErrorMessage(
+                    decoded.reason === 'too-large'
+                        ? `${path.basename(fsPath)} expands past the ${formatBytes(MAX_MARKER_BYTES)} marker limit.`
+                        : `Could not decompress ${path.basename(fsPath)} — the file looks gzipped but is corrupt.`
+                );
+                return false;
+            }
+            if (decoded.gzipped) {
+                logger.appendLine('    gunzipped markers: ' + formatBytes(raw.byteLength) + ' -> ' +
+                    formatBytes(decoded.bytes.byteLength));
+            }
+            const text = decoded.bytes.toString('utf8');
             webviewPanel.webview.postMessage({
                 type: 'markersLoaded',
                 text: text,
@@ -550,7 +574,7 @@ class GdsEditorProvider {
                         // Content-sniffed in the webview, so the filter is loose:
                         // Calibre ASCII results get named all sorts of things.
                         filters: {
-                            'Marker databases': ['lyrdb', 'rdb', 'results', 'db', 'ascii', 'txt'],
+                            'Marker databases': ['lyrdb', 'rdb', 'rve', 'results', 'db', 'ascii', 'txt', 'gz'],
                             'All files': ['*']
                         }
                     };

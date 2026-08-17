@@ -24,6 +24,7 @@
 //         polygons: [Float64Array(x,y,...), ...],  // one array per ring
 //         edges: Float64Array(x0,y0,x1,y1,...),    // packed segments
 //         bbox: {minX,minY,maxX,maxY} | null,      // null = no geometry
+//         waived: false,                     // true = Calibre WE<n> waiver
 //       }],
 //     }],
 //   }
@@ -33,10 +34,11 @@
 
 "use strict";
 
-// Decides the format by content, not extension: KLayout writes XML with a
-// <report-database> root; a Calibre ASCII results database starts with a
-// "<top-cell-name> <precision>" header line. Returns 'lyrdb' | 'calibre' |
-// null (unrecognized).
+// Decides the format by content, not extension (marker files are named all
+// sorts of things): KLayout writes XML with a <report-database> root; a Calibre
+// ASCII results database starts with a "<top-cell-name> <resolution>" header
+// line, optionally preceded by '//' comment lines. Returns 'lyrdb' | 'calibre'
+// | null (unrecognized).
 function sniffMarkerFormat(text) {
     if (typeof text !== "string" || text.length === 0) return null;
     let t = text;
@@ -45,10 +47,24 @@ function sniffMarkerFormat(text) {
     if (t.startsWith("<")) {
         return t.slice(0, 2048).includes("<report-database") ? "lyrdb" : null;
     }
-    const nl = t.indexOf("\n");
-    const firstLine = (nl < 0 ? t : t.slice(0, nl)).replace(/\r$/, "").trim();
-    if (/^\S+\s+\d+$/.test(firstLine)) return "calibre";
-    return null;
+    // "<top cell> <resolution>", then a check name, then that check's counts
+    // line -- three lines is what it takes to tell a results database from a
+    // text file whose first line happens to be a word and a number.
+    const head = [];
+    for (const raw of t.slice(0, 8192).split("\n")) {
+        const line = raw.replace(/\r$/, "").trim();
+        if (line === "" || line.startsWith("//")) continue;
+        head.push(line);
+        if (head.length === 3) break;
+    }
+    const header = /^(\S+)\s+(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$/.exec(head[0] || "");
+    if (!header) return null;
+    // Resolution is database units per µm; KLayout's sanity range.
+    const resolution = parseFloat(header[2]);
+    if (!(resolution >= 0.001 && resolution <= 1e6)) return null;
+    // A file that stops after the header is an empty (clean) database.
+    if (head.length < 3) return "calibre";
+    return /^\d+\s+\d+\s+\d+(\s|$)/.test(head[2]) ? "calibre" : null;
 }
 
 // "(0,0;1.5,0;1.5,0.2)" (parens optional, whitespace/newlines tolerated) ->
@@ -263,143 +279,309 @@ function parseLyrdb(text, domParserCtor) {
     return finalizeModel(model);
 }
 
-// Calibre DRC ASCII results database (DRC RESULTS DATABASE <file> ASCII).
-// Header line: "<top-cell> <precision>", precision = database units per µm;
-// all coordinates are integers scaled here by 1/precision. Then repeating
-// rulecheck blocks: name line, counts+timestamp line, optional metadata /
-// "quoted description" lines, and `p <ordinal> <vcount>` / `e <ordinal>
-// <vcount>` results each followed by vcount "x y" vertex lines. Never throws
-// on malformed interior lines -- skips and records a warning instead.
+// Calibre DRC ASCII results database, a.k.a. an RVE database (SVRF's "DRC
+// RESULTS DATABASE <file> ASCII"). Line-oriented, and rigidly counted -- the
+// counts line says how many description lines and how many results follow, and
+// those counts, not the shape of later lines, are what delimit a block:
+//
+//   <top-cell> <resolution>          resolution = database units per µm
+//   <check name>                     one block per rulecheck, repeating:
+//   <results> <original> <desc lines> <timestamp>
+//     <desc line> ...               exactly <desc lines> of them: rule text,
+//                                   prose, or WE<n> waiver records
+//     <p|e> <ordinal> <count>       exactly <results> of these records:
+//       [CN <cell> [c] <m11 m21 m12 m22 x y>]   cell + placement (hierarchical)
+//       [<PropertyName> <number>]    per-result value (density, area, ...)
+//       <x> <y> ...                 'p': <count> vertex lines -> one polygon
+//       <x1> <y1> <x2> <y2> ...     'e': <count> edge lines (2 = an edge pair)
+//
+// Note the asymmetry in the record count: for 'p' it counts vertices, for 'e'
+// it counts *edges*, each edge being four numbers on one line. '//' comment
+// lines may appear anywhere.
+//
+// Grammar and semantics follow Calibre's writer as decoded by KLayout's reader
+// (src/rdb/rdb/rdbRVEReader.cc), including the trailing-'.' strip on check
+// names and the CN 'c' flag. Never throws on malformed interior lines -- skips
+// and records a warning instead. Not handled: the sibling "<file>.waived"
+// database KLayout looks for alongside the results file (the webview only ever
+// receives one file's text).
 function parseCalibreAscii(text) {
     if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
     const lines = text.split(/\r?\n/);
     const warnings = [];
     const model = { topCell: "", warnings, categories: [] };
 
+    // A line cursor that hides '//' comments and blank lines: at every point in
+    // this grammar where a line is expected, both are noise. peek() returns the
+    // raw line (indentation intact, for rule text) or null at end of input.
     let i = 0;
-    while (i < lines.length && lines[i].trim() === "") i++;
-    const header = /^(\S+)\s+(\d+)$/.exec(i < lines.length ? lines[i].trim() : "");
+    const peek = () => {
+        while (i < lines.length) {
+            const t = lines[i].trim();
+            if (t !== "" && !t.startsWith("//")) return lines[i];
+            i++;
+        }
+        return null;
+    };
+    const take = () => {
+        const line = peek();
+        if (line !== null) i++;
+        return line;
+    };
+
+    const headerLine = peek();
+    const header = /^(\S+)\s+(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$/.exec((headerLine || "").trim());
     if (!header) throw new Error("not a Calibre ASCII results database (bad header line)");
     model.topCell = header[1];
-    const precision = parseInt(header[2], 10);
-    if (!(precision > 0)) throw new Error("bad precision in Calibre header");
+    // Resolution is database units per µm, and is a float in the grammar even
+    // though every real file writes an integer. KLayout's sanity range.
+    const resolution = parseFloat(header[2]);
+    if (!(resolution >= 0.001 && resolution <= 1e6)) throw new Error("bad precision in Calibre header");
     i++;
 
-    const resultRe = /^([pe])\s+(\S+)\s+(\d+)$/;
-    const vertexRe = /^(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)$/;
-    // Counts line: 2+ integers then a timestamp tail ("2 2 2 Jul 10 ...").
-    const countsRe = /^\d+(\s+\d+)+\s+\S/;
+    // "<results> <original> <desc lines> <timestamp>". The third count is
+    // optional only to tolerate hand-made files; the timestamp tail is ignored.
+    const countsRe = /^(\d+)\s+(\d+)(?:\s+(\d+))?(?:\s+\S.*)?$/;
+    const recordRe = /^([pePE])\s+(\d+)\s+(\d+)\s*(\S.*)?$/;
+    const numberRe = /^-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?$/;
+    const waiverRe = /^WE(\d+)\s*(.*)$/;
+    // CN <cell> [c|C] [m11 m21 m12 m22 x y] -- cell names may contain _.$-
+    const cnRe = /^CN\s+(\S+)((?:\s+[cC])?)((?:\s+-?\d+){6})?\s*$/;
+    const propRe = /^([A-Za-z_]\w*)\s+(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*$/;
 
-    let currentCat = null;
-    let hierCount = 0;
+    // Numbers on a pure-numeric line, or null if the line is something else
+    // (the next record, a property, the next check's name).
+    const lineNumbers = (line) => {
+        const parts = line.trim().split(/\s+/);
+        for (const p of parts) if (!numberRe.test(p)) return null;
+        return parts;
+    };
 
-    while (i < lines.length) {
-        const line = lines[i].trim();
-        if (line === "") {
-            i++;
+    let unsupportedProps = 0;
+    let cellRefCount = 0;
+    let strayCoords = 0;
+    let pendingName = null; // check name already read while ending a block
+
+    while (true) {
+        let name = pendingName;
+        pendingName = null;
+        if (name === null) {
+            const line = take();
+            if (line === null) break;
+            name = line;
+        }
+        // Leftover coordinates from a record that wrote more points than it
+        // declared land here too, once its count has already been satisfied.
+        if (lineNumbers(name.trim())) {
+            strayCoords++;
             continue;
         }
+        // Calibre writes some check names with a trailing period; one is
+        // stripped so the name matches the rule as written in the deck.
+        name = name.trim().replace(/\.$/, "");
+        const cat = { name, description: "", items: [] };
+        model.categories.push(cat);
 
-        const res = resultRe.exec(line);
-        if (res) {
-            const kind = res[1];
-            const ordinal = res[2];
-            const vcount = parseInt(res[3], 10);
+        // Counts line. If what follows is already a result record, this file
+        // omits the counts line: fall back to reading records until something
+        // that isn't one (resultCount === null means "unbounded").
+        let resultCount = null;
+        let descCount = 0;
+        const next = peek();
+        const counts = next !== null && !recordRe.test(next.trim()) ? countsRe.exec(next.trim()) : null;
+        if (counts) {
             i++;
-            if (!currentCat) {
-                // Results before any rulecheck header: malformed; skip the
-                // record (and its vertices) rather than inventing a category.
-                warnings.push(`result record before any rulecheck header at line ${i}; skipped`);
-                let taken = 0;
-                while (taken < vcount && i < lines.length && vertexRe.test(lines[i].trim())) {
-                    taken++;
-                    i++;
-                }
+            resultCount = parseInt(counts[1], 10);
+            descCount = counts[3] === undefined ? 0 : parseInt(counts[3], 10);
+        } else if (next !== null && !recordRe.test(next.trim())) {
+            warnings.push(`${name}: no counts line after the check name`);
+        }
+
+        // Description block: exactly descCount lines. WE<n> lines are waiver
+        // records for result n rather than description text -- the first line
+        // of each is the waiver's author/timestamp and is dropped, the rest
+        // become that result's comment (see rdbRVEReader.cc).
+        const waivers = new Map();
+        const descParts = [];
+        for (let d = 0; d < descCount; d++) {
+            const line = take();
+            if (line === null) {
+                warnings.push(`${name}: file ended inside the description block`);
+                break;
+            }
+            const trimmed = line.trim();
+            // A result record here means the count is too high; don't eat
+            // geometry with it.
+            if (recordRe.test(trimmed)) {
+                i--;
+                warnings.push(`${name}: description count ${descCount} overruns the results`);
+                break;
+            }
+            const we = waiverRe.exec(trimmed);
+            if (we) {
+                const n = parseInt(we[1], 10);
+                if (!waivers.has(n)) waivers.set(n, []);
+                else waivers.get(n).push(we[2]);
                 continue;
             }
+            descParts.push(trimmed.startsWith('"') ? trimmed.replace(/^"/, "").replace(/"$/, "") : line.replace(/\s+$/, ""));
+        }
+        cat.description = descParts.join("\n");
 
-            const verts = [];
-            while (verts.length < vcount * 2 && i < lines.length) {
-                const vline = lines[i].trim();
-                if (vline === "") {
-                    i++;
+        // Results. Coordinates are top-cell space unless a CN record says
+        // otherwise; the state persists across the records of a check (Calibre
+        // writes one CN per cell, not per result) and resets at the next check.
+        let cellName = "";
+        let xf = null; // {m11,m21,m12,m22,tx,ty} in DB units, or null = identity
+        let shape = 0;
+        while (resultCount === null || shape < resultCount) {
+            const line = take();
+            if (line === null) {
+                if (resultCount !== null && shape < resultCount) {
+                    warnings.push(`${name}: file ended after ${shape} of ${resultCount} result(s)`);
+                }
+                break;
+            }
+            const rec = recordRe.exec(line.trim());
+            if (!rec) {
+                // A bare coordinate line here is a record that declared fewer
+                // points than it wrote. Dropping it keeps the block on the
+                // rails; treating it as a name would invent a check called
+                // "123 456" and then read the strays after it as its counts.
+                if (lineNumbers(line.trim())) {
+                    strayCoords++;
                     continue;
                 }
-                const vm = vertexRe.exec(vline);
-                if (vm) {
-                    verts.push(parseFloat(vm[1]) / precision, parseFloat(vm[2]) / precision);
-                    i++;
-                    continue;
+                // Anything else is the next check's name. Calibre's counts are
+                // trustworthy, so reaching this early means the file is
+                // truncated or the count is wrong.
+                if (resultCount !== null && shape < resultCount) {
+                    warnings.push(`${name}: results ended after ${shape} of ${resultCount}; continuing with the next check`);
                 }
-                if (/^CN\b/.test(vline)) {
-                    // Hierarchical cell-name/placement record interleaved with
-                    // the vertices (hierarchical output) -- skip, count, warn once.
-                    hierCount++;
-                    i++;
-                    continue;
-                }
-                // Anything else is malformed: stop this record without
-                // consuming the line so it can be re-examined as a header.
-                warnings.push(`malformed line ${i + 1} inside ${currentCat.name} ${kind} ${ordinal}: "${vline}"`);
+                pendingName = line;
                 break;
             }
 
-            const item = { id: -1, label: `${kind} ${ordinal}`, note: "", polygons: [], edges: [], bbox: null };
+            const kind = rec[1].toLowerCase();
+            const ordinal = rec[2];
+            const count = parseInt(rec[3], 10);
+            const item = {
+                id: -1,
+                label: `${kind} ${ordinal}`,
+                note: "",
+                polygons: [],
+                edges: [],
+                bbox: null,
+                waived: false,
+            };
+            const notes = [];
+            if (rec[4]) notes.push(rec[4].trim());
+
+            // Optional property records, between the record line and its
+            // coordinates.
+            while (true) {
+                const propLine = peek();
+                if (propLine === null) break;
+                const trimmed = propLine.trim();
+                if (lineNumbers(trimmed) || recordRe.test(trimmed)) break;
+                const cn = cnRe.exec(trimmed);
+                if (cn) {
+                    i++;
+                    cellName = cn[1];
+                    const m = cn[3] ? cn[3].trim().split(/\s+/).map(Number) : [1, 0, 0, 1, 0, 0];
+                    // Without the 'c' flag the coordinates are already in
+                    // top-cell space and the matrix only says where the cell
+                    // sits; with it they are cell-local and the matrix places
+                    // them (KLayout: shape_trans vs. its inverse).
+                    xf = cn[2].trim() === "" ? null
+                        : { m11: m[0], m21: m[1], m12: m[2], m22: m[3], tx: m[4], ty: m[5] };
+                    continue;
+                }
+                const prop = propRe.exec(trimmed);
+                if (prop) {
+                    i++;
+                    notes.push(`${prop[1]}=${prop[2]}`);
+                    continue;
+                }
+                // Any other word-leading line is a property record in a format
+                // we don't read (Calibre has several); consumed so it can't be
+                // mistaken for the next check name, counted for one warning.
+                if (/^[A-Za-z_]/.test(trimmed)) {
+                    i++;
+                    unsupportedProps++;
+                    continue;
+                }
+                break;
+            }
+            if (cellName && cellName !== model.topCell) {
+                cellRefCount++;
+                notes.push("cell " + cellName);
+            }
+
+            // Coordinates: 2 numbers per vertex for 'p', 4 per edge for 'e'.
+            // Read them by number rather than by line so a writer that wraps
+            // differently still parses.
+            const wanted = kind === "p" ? count * 2 : count * 4;
+            const nums = [];
+            while (nums.length < wanted) {
+                const vline = peek();
+                if (vline === null) break;
+                const parts = lineNumbers(vline.trim());
+                if (!parts) break;
+                i++;
+                for (const p of parts) nums.push(parseFloat(p));
+            }
+            if (nums.length < wanted) {
+                warnings.push(
+                    `${name} ${kind} ${ordinal}: ${nums.length / 2} of ${kind === "p" ? count : count * 2} point(s) present`
+                );
+            }
+
+            // Divide rather than multiply by a reciprocal: 700/2000 is exactly
+            // 0.35, 700*(1/2000) is not.
+            const mapX = xf
+                ? (x, y) => (xf.m11 * x + xf.m12 * y + xf.tx) / resolution
+                : (x) => x / resolution;
+            const mapY = xf
+                ? (x, y) => (xf.m21 * x + xf.m22 * y + xf.ty) / resolution
+                : (x, y) => y / resolution;
             if (kind === "p") {
-                if (verts.length >= 6) item.polygons.push(Float64Array.from(verts));
-            } else if (vcount % 2 === 0) {
-                // Even cluster: vertices pairwise form independent edges.
-                const usable = Math.floor(verts.length / 4) * 4;
-                item.edges = verts.slice(0, usable);
+                const usable = Math.floor(nums.length / 2) * 2;
+                if (usable >= 6) {
+                    const ring = new Float64Array(usable);
+                    for (let k = 0; k < usable; k += 2) {
+                        ring[k] = mapX(nums[k], nums[k + 1]);
+                        ring[k + 1] = mapY(nums[k], nums[k + 1]);
+                    }
+                    item.polygons.push(ring);
+                }
             } else {
-                // Odd cluster: treat as a polyline (consecutive vertices form
-                // edges) and log it.
-                warnings.push(`${currentCat.name} e ${ordinal}: odd vertex count ${vcount}; treated as polyline`);
-                for (let k = 0; k + 3 < verts.length; k += 2) {
-                    item.edges.push(verts[k], verts[k + 1], verts[k + 2], verts[k + 3]);
+                const usable = Math.floor(nums.length / 4) * 4;
+                for (let k = 0; k < usable; k += 2) {
+                    item.edges.push(mapX(nums[k], nums[k + 1]), mapY(nums[k], nums[k + 1]));
                 }
             }
-            item.bbox = computeItemBBox(item);
-            currentCat.items.push(item);
-            continue;
-        }
 
-        if (line.startsWith('"')) {
-            if (currentCat) {
-                const desc = line.replace(/^"/, "").replace(/"$/, "");
-                currentCat.description = currentCat.description ? currentCat.description + " " + desc : desc;
+            const waiver = waivers.get(shape);
+            if (waiver) {
+                item.waived = true;
+                notes.push(waiver.length ? "waived: " + waiver.join(" ") : "waived");
             }
-            i++;
-            continue;
-        }
-        if (/^Rule File Pathname\s*:/.test(line)) {
-            i++;
-            continue;
-        }
-        if (/^CN\b/.test(line)) {
-            hierCount++;
-            i++;
-            continue;
-        }
-
-        // Anything else starts a new rulecheck block. Category = rulecheck
-        // name, flat (no nesting).
-        currentCat = { name: line, description: "", items: [] };
-        model.categories.push(currentCat);
-        i++;
-        // The next non-blank line should be the counts/timestamp line (only a
-        // sanity marker -- results are read until the next header). Tolerate
-        // it being absent: don't consume a line that's already a result record.
-        let j = i;
-        while (j < lines.length && lines[j].trim() === "") j++;
-        if (j < lines.length) {
-            const next = lines[j].trim();
-            if (!resultRe.test(next) && countsRe.test(next)) i = j + 1;
+            item.note = notes.join(" · ");
+            item.bbox = computeItemBBox(item);
+            cat.items.push(item);
+            shape++;
         }
     }
 
-    if (hierCount > 0) {
-        warnings.push(hierCount + " hierarchical record(s) (CN/placements) skipped; positions may be wrong");
+    if (cellRefCount > 0) {
+        warnings.push(cellRefCount + " marker(s) placed in cells other than " + model.topCell);
+    }
+    if (unsupportedProps > 0) {
+        warnings.push(unsupportedProps + " unsupported per-result property record(s) ignored");
+    }
+    if (strayCoords > 0) {
+        warnings.push(strayCoords + " coordinate line(s) past the declared point counts ignored");
     }
     return finalizeModel(model);
 }
