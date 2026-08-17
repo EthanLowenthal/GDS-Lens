@@ -141,8 +141,14 @@
            does rather than relying on an outline. */
         #coordReadout { font-family: monospace; font-size: 11px; color: var(--fg); background: var(--label-scrim);
                         border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 6px;
-                        white-space: nowrap; }
+                        white-space: nowrap; text-align: right; }
         #coordReadout.hidden { display: none; }
+        /* Hover identify (set_hover_text in renderer.cpp): the layer under a
+           resting pointer. Above the coordinate rather than below it so that
+           appearing and disappearing grows the box upwards -- the column is
+           anchored to the bottom, so the coordinate line itself never moves. */
+        #hoverLayer { color: var(--accent-text); margin-bottom: 1px; }
+        #hoverLayer.hidden { display: none; }
         /* The bar is drawn in the ink color over an outline of the background,
            so it stays readable whichever of the two it happens to sit on top of
            (it floats over the geometry, not over a panel). */
@@ -389,7 +395,10 @@
     <button id="debugToggleBtn" type="button">Debug tools</button>
 
     <div id="viewReadout">
-        <div id="coordReadout" class="hidden"></div>
+        <div id="coordReadout" class="hidden">
+            <div id="hoverLayer" class="hidden"></div>
+            <div id="coordValue"></div>
+        </div>
         <div id="scaleContainer">
             <div id="scaleLabel">0 μm</div>
             <div id="scaleBar" style="width: 100px;"></div>

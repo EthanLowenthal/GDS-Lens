@@ -293,6 +293,57 @@ inline const char* const kTextVertexShaderSrc =
     "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
     "}";
 
+// ---- Pick pass (see run_pick_pass in renderer.cpp) --------------------------
+// Answers two questions the CPU has no data left to answer: which layer is
+// under the pointer, and where is the nearest vertex or edge to snap the ruler
+// to. Both are questions about geometry that only exists in VBOs -- nothing is
+// retained CPU-side after upload -- so both are answered by rasterizing a small
+// window of the scene into an integer framebuffer and reading it back.
+//
+// The vertex half is kVertexShaderSrc with the world position passed through to
+// the fragment stage, which is what makes snapping exact rather than
+// pixel-quantized: for a GL_POINTS draw the varying is constant across the
+// point, so a hit texel carries the vertex's own coordinates, and for GL_LINES
+// it interpolates to a point that lies on the edge. gl_PointSize is written
+// unconditionally (it's ignored for every other primitive) because GLES leaves
+// it undefined otherwise, and the points pass depends on it.
+inline const char* const kPickVertexShaderSrc =
+    "#version 300 es\n"
+    "in vec2 a_position;\n"
+    "in vec2 a_iCol0;\n"
+    "in vec2 a_iCol1;\n"
+    "in vec2 a_iTranslate;\n"
+    "uniform vec2 u_resolution;\n"
+    "uniform vec2 u_offset;\n"
+    "uniform float u_zoom;\n"
+    "out vec2 v_world;\n"
+    "void main() {\n"
+    "    vec2 worldPos = vec2(\n"
+    "        a_iCol0.x * a_position.x + a_iCol1.x * a_position.y + a_iTranslate.x,\n"
+    "        a_iCol0.y * a_position.x + a_iCol1.y * a_position.y + a_iTranslate.y);\n"
+    "    v_world = worldPos;\n"
+    "    vec2 clipSpace = ((worldPos - u_offset) * u_zoom / u_resolution) * 2.0;\n"
+    "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
+    "    gl_PointSize = 1.0;\n"
+    "}";
+
+// Writes the caller's id plus the fragment's world position into an RGBA32UI
+// target. The position goes through floatBitsToUint rather than into a float
+// target because RGBA32UI is color-renderable in core WebGL2 while RGBA32F
+// needs EXT_color_buffer_float; the bits survive the round trip untouched and
+// the reader casts them back. Alpha marks the texel as written, since 0 is a
+// legitimate value for all three of the others.
+inline const char* const kPickFragmentShaderSrc =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "in vec2 v_world;\n"
+    "uniform uint u_pickId;\n"
+    "out uvec4 fragId;\n"
+    "void main() {\n"
+    "    fragId = uvec4(u_pickId, floatBitsToUint(v_world.x), floatBitsToUint(v_world.y), 1u);\n"
+    "}";
+
 inline const char* const kTextFragmentShaderSrc =
     "#version 300 es\n"
     "precision mediump float;\n"
