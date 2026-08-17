@@ -1,6 +1,6 @@
 # Change Log
 
-## [Unreleased]
+## [1.6.0] - 2026-08-17
 
 - **A quieter control panel.** The panel opened with nine rows of chrome stacked
   above a collapsed **Layers** folder — which is the one thing anyone opens a
@@ -15,20 +15,6 @@
   **Mode: Pan | Measure** stays at the top of the panel, above the folder. It's
   the only control there that changes what a click on the canvas does, which
   makes it the one that shouldn't need a folder opened to find.
-
-- **"Go to (x, y)" is now the "GDSLens: Go to Coordinate" command** rather than a
-  permanent text box in the panel. A coordinate arrives from outside the viewer
-  with the clipboard already loaded, so it's an occasional action, not a control
-  worth standing screen space — and the command palette's input box can reject an
-  unreadable pair *as you type it*, which lil-gui's string row had no way to do
-  (the old row could only turn red after the fact and explain itself in a
-  tooltip). Everything it accepts is unchanged — microns unless a per-number unit
-  says otherwise, wrapped in whatever parentheses, `x=`/`y=` labels or bare
-  spaces the report it came from used — and the parser moved to
-  `src/coord-parse.js` so the host can validate with the same code the viewer
-  used to, now under unit tests. A coordinate outside the layout reports in the
-  status bar instead of tinting a row. The command only appears in the palette
-  while a layout is the active editor.
 
 - **Gzipped layouts open directly** — `.gds.gz`, `.oas.gz`, `.oasis.gz`. Layouts
   are shipped and archived compressed all the time, and until now opening one
@@ -117,17 +103,18 @@
   a tenth of the background grid's current step, so the digits on screen are the
   ones the grid can distinguish and no more. Both halves of the pair share that
   count, so the decimal point doesn't shift as the pointer crosses zero.
-- **A "Go to (x, y)" box** in the panel. Coordinates arrive from outside the
+- **A "GDSLens: Go to Coordinate" command.** Coordinates arrive from outside the
   viewer constantly — a DRC report, a generator's log, a message from someone
-  else — and there was no way to type one in. Enter centers the view on it,
-  leaving the zoom alone: the coordinate says where to look, not how much
-  around it you want to see, so re-framing would throw away a zoom level you had
-  already chosen. Microns unless a number carries its own `nm`/`um`/`µm`/`mm`,
-  and the decorations these coordinates come wrapped in — parentheses, `x=`/`y=`
-  labels, commas or bare whitespace — are accepted, so a pair pasted straight out
-  of a report works without editing. A coordinate that can't be read as a pair,
-  or that lies outside this layout, turns the row red and says which rather than
-  silently parking the camera at the nearest edge of the design.
+  else — and there was no way to type one in. The palette entry (offered while a
+  layout is the active editor) centers the view on the pair you paste, leaving
+  the zoom alone: the coordinate says where to look, not how much around it you
+  want to see, so re-framing would throw away a zoom level you had already
+  chosen. Microns unless a number carries its own `nm`/`um`/`µm`/`mm`, and the
+  decorations these coordinates come wrapped in — parentheses, `x=`/`y=` labels,
+  commas or bare whitespace — are accepted, so a pair pasted straight out of a
+  report works without editing. Anything that can't be read as a pair is refused
+  as you type it, and a coordinate outside this layout says so in the status bar,
+  rather than silently parking the camera at the nearest edge of the design.
 - Wheel zoom is no longer wildly over-sensitive on a trackpad. Every wheel
   event applied one fixed 1.15× step regardless of how far the event said the
   wheel had turned, which is right for a stepped mouse wheel (one event per
