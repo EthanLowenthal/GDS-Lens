@@ -18,8 +18,10 @@ colors.
   magnification via gdstk's flattening.
 - A cell hierarchy tree down the left edge: browse the design's cells and
   click one to frame it and outline each of its placements.
-- Per-layer visibility toggles, an infill (fill pattern) toggle, and a text
-  toggle for the layout's own labels.
+- A layer panel built for a real PDK: per-layer visibility with shape counts,
+  a filter box, per-layer solo, and show-all/hide-all/invert over whatever the
+  filter is showing. Plus an infill (fill pattern) toggle and a text toggle for
+  the layout's own labels.
 - Measure tool: click two points to read out the distance between them.
 - A pointer coordinate readout, and a "Go to (x, y)" box for driving the view
   from a coordinate out of a DRC report or a colleague's message.
@@ -54,7 +56,16 @@ with an unexpected extension still loads correctly):
   the ✕ in its header puts it away again. Once opened it stays open for the rest
   of the session, and open branches and the selected cell survive a reload, so
   re-running a generator leaves the tree where you had it.
-- **Layers** — toggle individual layer visibility from the panel.
+- **Layers** — toggle individual layer visibility from the panel. Each row shows
+  how many shapes that layer holds in this file (a layer carrying only text is
+  counted as `T`*n* instead), and the folder groups them by the `.lyp`'s
+  categories. A **Filter** box at the top narrows the list to layers whose
+  number, datatype, name or group matches what you type — folders with a hit
+  open themselves while you're typing and go back as they were when you clear
+  it. **Show: All | None | Invert** applies to whatever the filter is currently
+  showing, so filtering to one family and hiding it takes two clicks. The **S**
+  on each row solos that layer (hides every other one); clicking it again puts
+  back exactly the layers that were on before, rather than turning everything on.
 - **Infill** — toggle the hatched layer fill on or off from the panel.
 - **Text** — toggle the layout's text labels (GDSII/OASIS `TEXT` elements) on
   or off. Labels draw at a constant on-screen size in their layer's color and

@@ -3855,6 +3855,15 @@ val getLayers() {
         obj.set("fillColor", rgba_to_css(l->fill_color));
         obj.set("frameColor", rgba_to_css(l->frame_color));
         obj.set("visible", l->visible);
+        // What's actually on this layer in this file. A PDK's .lyp names a
+        // hundred-odd layers and any one design uses a handful of them, so
+        // "how much is here" is the difference between a list you scan and a
+        // list you search. Both counts are logical, not GPU-side: polygons
+        // include instanced copies (see LayerBuffer::polygon_count), and the
+        // label count is what makes a text-only layer -- no polygons at all,
+        // which real decks do have -- read as populated rather than empty.
+        obj.set("polygonCount", l->polygon_count);
+        obj.set("labelCount", (uint32_t)l->labels.size());
         result.set(idx++, obj);
     }
     return result;

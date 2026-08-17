@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+- **A layer panel that scales past a demo deck.** A flat checkbox list stops
+  working somewhere around twenty layers and a real PDK has well over a hundred,
+  so the panel now has the four things that make a long list usable:
+  - **A filter box**, matching a layer's number, datatype, name or group. Rows
+    are hidden rather than removed, so filtering is a view of the list and never
+    an edit to it — the visibility behind a hidden row is untouched. Categories
+    with a hit open themselves while you type (the point of typing is to see the
+    matches, not to then click nine folders open) and return to how they were
+    when the box is cleared.
+  - **Show: All | None | Invert**, scoped to whatever the filter is showing.
+    That scoping is what makes the pair worth having: filter to `metal`, click
+    **None**, and one family is hidden without touching the other ninety layers.
+  - **Solo** (the **S** on each row): show only that layer. The second click
+    restores the visibility set the first one captured, rather than turning
+    everything on — most of a PDK's layer list is layers you had already turned
+    off on purpose, and "show everything" would bury the layout in them.
+  - **Shape counts per row**, so it's visible at a glance which layers this
+    particular file actually populates and which are near-empty. A layer with no
+    polygons but with text on it counts its labels as `T`*n* instead, since a
+    bare `0` would read as empty when it isn't.
 - **A pointer coordinate readout**, above the scale bar in the bottom-right
   corner. There was a scale bar and a ruler, but nothing answering "where am
   I?" — the one readout every layout viewer has. It follows the background
