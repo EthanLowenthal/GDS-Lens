@@ -212,7 +212,12 @@ gridController.domElement.title = "Show the background grid, spaced at a round s
 // row below is the whole difference.
 const MODES = [
     { id: "pan", label: "Pan", title: "Drag to pan the view, wheel to zoom" },
-    { id: "measure", label: "Measure", title: "Click two points to measure the distance between them (Esc to cancel)" }
+    {
+        id: "measure",
+        label: "Measure",
+        title: "Click two points to measure between them. Snaps to nearby vertices and edges " +
+               "(Alt to place freely), Shift constrains to horizontal/vertical, Esc cancels."
+    }
 ];
 let currentMode = "pan";
 const modeButtons = new Map();
@@ -249,11 +254,59 @@ function setMode(id) {
     for (const [modeId, btn] of modeButtons) {
         btn.classList.toggle("mode-active", modeId === id);
     }
-    // Leaving measure mode also drops any in-progress/finished ruler
-    // (setMeasureMode(false) -> clearMeasurement in renderer.cpp).
-    modulePromise.then((Module) => Module.setMeasureMode(id === "measure"));
+    // Leaving measure mode drops a half-placed ruler but keeps the finished
+    // ones (see setMeasureMode in renderer.cpp) -- so the row below has to be
+    // re-read either way.
+    modulePromise.then((Module) => {
+        Module.setMeasureMode(id === "measure");
+        refreshRulerRow(Module);
+    });
 }
 modeButtons.get(currentMode).classList.add("mode-active");
+
+// ---- Rulers ----
+// Measurements persist once placed and stack up, so there has to be a way to
+// take them down that doesn't involve re-entering the mode that made them. The
+// row only exists while there is something to clear.
+const rulerRow = document.createElement("div");
+rulerRow.className = "lil-controller mode-row ruler-row";
+rulerRow.style.display = "none";
+const rulerName = document.createElement("div");
+rulerName.className = "lil-name";
+rulerName.textContent = "Rulers";
+const rulerWidget = document.createElement("div");
+rulerWidget.className = "lil-widget mode-widget";
+const rulerClearBtn = document.createElement("button");
+rulerClearBtn.type = "button";
+rulerClearBtn.title = "Remove every measurement on the canvas (also Esc, once nothing is being placed)";
+rulerClearBtn.addEventListener("click", () => {
+    modulePromise.then((Module) => {
+        Module.clearMeasurements();
+        refreshRulerRow(Module);
+    });
+});
+rulerWidget.appendChild(rulerClearBtn);
+rulerRow.append(rulerName, rulerWidget);
+modeRow.after(rulerRow);
+
+function refreshRulerRow(Module) {
+    const count = Module.measurementCount();
+    rulerRow.style.display = count > 0 ? "" : "none";
+    rulerClearBtn.textContent = `Clear ${count}`;
+}
+
+// Rulers are placed by clicking the canvas, and renderer.cpp owns that mouse
+// handling entirely -- this side never sees the result. So the count is re-read
+// after any click that could have finished one. setTimeout(0) rather than
+// handling it inline because it has to run after the whole event dispatch,
+// whichever order the renderer's listener and this one were registered in.
+const glCanvas = document.getElementById("glCanvas");
+if (glCanvas) {
+    glCanvas.addEventListener("mousedown", () => {
+        if (currentMode !== "measure") return;
+        setTimeout(() => modulePromise.then(refreshRulerRow), 0);
+    });
+}
 
 // Reflects a loaded-file state in a lil-gui button row (used by both the
 // .lyp and marker-file rows). With no file it's a plain load button. Once a
@@ -1150,11 +1203,18 @@ window.addEventListener("keydown", (event) => {
     // (click, click, then back to panning): M enters measure mode, Escape
     // always lands back in pan mode and drops the ruler.
     else if (event.key === "m" || event.key === "M") setMode(currentMode === "measure" ? "pan" : "measure");
-    // Escape is the "put the canvas back" key: it drops the ruler (by leaving
-    // measure mode) and the selected cell's outline, the two things the viewer
-    // draws on top of the layout at the user's request.
+    // Escape is the "put the canvas back" key: it takes down the things the
+    // viewer draws on top of the layout at the user's request. For rulers that
+    // is two steps rather than one (see escapeMeasure in renderer.cpp) -- the
+    // first press abandons a measurement being placed, and only a press with
+    // nothing left to abandon clears the finished ones and leaves the mode.
+    // A finished measurement is an annotation, so it shouldn't disappear on the
+    // same keystroke that backs out of a half-drawn one.
     else if (event.key === "Escape") {
-        setMode("pan");
+        modulePromise.then((Module) => {
+            if (!Module.escapeMeasure()) setMode("pan");
+            refreshRulerRow(Module);
+        });
         hierarchyDeselect();
     }
     // H shows/hides the hierarchy tree -- it's the one panel that takes a
@@ -1571,6 +1631,9 @@ function startWorker(worker, fileData) {
                 }
                 renderLayerList(Module.getLayers());
                 renderHierarchy(workerMessage.hierarchy);
+                // uploadLayers drops the rulers -- they were anchored to the
+                // geometry this load just replaced.
+                refreshRulerRow(Module);
                 endProgress();
                 console.log("[GDS] done, progress hidden");
             }, (err) => {

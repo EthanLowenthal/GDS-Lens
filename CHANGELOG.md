@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+- **The measure tool got the four things that make it a real ruler.**
+  - **Snapping to vertices and edges.** The ruler now lands on the nearest
+    polygon vertex within about 12px of the pointer, or failing that on the
+    nearest edge, marked by a small square under the cursor *before* you click
+    rather than discovered afterwards in the numbers. Measuring a gap between
+    two shapes now gives the gap, not an estimate of it.
+
+    The coordinates it returns are exact, not quantized to the pixel that found
+    them — even though nothing about the geometry is kept on the CPU after
+    upload. The pick pass's fragment shader carries each fragment's world
+    position through as raw bits, so a vertex drawn as a `GL_POINTS` primitive
+    reports the very `float32` its vertex buffer holds, and an edge drawn as
+    `GL_LINES` interpolates to a point lying on the segment. A vertex anywhere
+    in range beats any edge: a corner is a more specific answer than the line
+    leading to it, and it's what you aim at.
+  - **`Shift` constrains to horizontal or vertical**, along whichever axis the
+    ruler already runs further. `Shift` suspends snapping while it's held —
+    it's asking for an exact axis, and a snap would pull the point straight back
+    off it — and `Alt` suspends snapping on its own, for points that aren't on
+    any geometry at all.
+  - **An angle in the readout**, alongside the distance and Δx/Δy. Signed and
+    measured from +x through the ruler's own direction, so it answers "what
+    angle did I draw this at" rather than folding two opposite directions onto
+    one number.
+  - **Rulers persist, and stack up.** Every finished measurement stays on the
+    canvas instead of being replaced by the next one, because the questions
+    worth asking are comparisons — this gap against that one, the width at both
+    ends of a taper — and a tool that forgets the previous answer makes you hold
+    it in your head. They also survive leaving **Measure** mode: a finished
+    measurement is an annotation on the layout, not part of a mode you happen to
+    be in, and needing to stay in the mode to keep looking at one was the whole
+    reason only a single ruler ever existed. A **Rulers: Clear *n*** row appears
+    in the panel while any are up, and `Esc` now backs out in two steps —
+    abandon the measurement being placed, then (on a press with nothing left to
+    abandon) clear the finished ones and return to **Pan**.
 - **Hover identify.** Rest the pointer on a shape and the layer/datatype it
   belongs to — with its `.lyp` name, if one is loaded — appears above the
   coordinate readout. Answering "which layer is that?" previously meant toggling

@@ -22,7 +22,9 @@ colors.
   a filter box, per-layer solo, and show-all/hide-all/invert over whatever the
   filter is showing. Plus an infill (fill pattern) toggle and a text toggle for
   the layout's own labels.
-- Measure tool: click two points to read out the distance between them.
+- Measure tool: click two points for the distance, Δx/Δy and angle between
+  them, snapping to nearby vertices and edges. Rulers stay on the canvas, so
+  several measurements can be compared at once.
 - A pointer coordinate readout, and a "Go to (x, y)" box for driving the view
   from a coordinate out of a DRC report or a colleague's message.
 - Hover identify: rest the pointer on a shape to see which layer it's on.
@@ -93,9 +95,23 @@ with an unexpected extension still loads correctly):
   the point isn't inside this layout the row turns red and says so.
 - **Reset View** — refit the layout to the window from the panel.
 - **Mode: Pan | Measure** — pick the mouse's mode in the panel (or press `M` to
-  switch). In **Measure**, click two points to measure the distance between them
-  (total, Δx, and Δy); the cursor turns into a crosshair, and wheel zoom keeps
-  working. `Escape` returns to **Pan** and clears the measurement.
+  switch). In **Measure**, click two points to measure between them (total, Δx,
+  Δy and the angle); the cursor turns into a crosshair, and wheel zoom keeps
+  working.
+  - **Snapping** — the ruler snaps to the nearest polygon vertex or edge within
+    about 12px, marked by a small square under the cursor before you click, so
+    a measurement between two shapes lands on them exactly rather than near
+    them. Hold `Alt` to place a point freely instead.
+  - **`Shift`** constrains the second point to horizontal or vertical
+    (whichever the ruler already runs further along). Shift and snapping are
+    exclusive — `Shift` asks for an exact axis, and a snap would pull the point
+    back off it.
+  - **Rulers stay put.** Each finished measurement remains on the canvas, so you
+    can compare several at once, and they survive leaving **Measure** mode — a
+    completed measurement is an annotation, not part of a mode. A **Rulers:
+    Clear *n*** row appears in the panel while any are up. `Escape` abandons a
+    measurement being placed; pressing it with nothing being placed clears the
+    finished rulers and returns to **Pan**.
 - **Reload on change** — when the open layout is rewritten on disk (by a
   generator script, KLayout, ...) a header offers **Reload**, which re-reads the
   file while keeping the camera and per-layer visibility, so the new geometry
