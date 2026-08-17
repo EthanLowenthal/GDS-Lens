@@ -1,5 +1,37 @@
 # Change Log
 
+## [1.6.1] - 2026-08-17
+
+- **Calibre DRC results databases are read the way Calibre writes them.** The
+  ASCII database is a counted format — the line under each check name says how
+  many description lines and how many results follow — and the parser had been
+  guessing from the shape of the lines instead.
+
+  Edge results were the costly one. `e <n> <count>` counts *edges*, each written
+  as four numbers on one line, not `<count>` lines of `x y`. So every
+  edge-based check — spacing, enclosure, notch — parsed as malformed and drew
+  nothing at all, while the coordinate lines it rejected were read as new check
+  names. A 61,000-marker database came in as 20,116 checks, none of the real
+  ones named correctly, and 20,048 warnings.
+
+  Two more followed from the same guessing. A deck that echoes its own rule
+  source puts that source in the description lines, unquoted, so each line
+  started a bogus check and the closing brace ended up naming one. And
+  hierarchical results were skipped outright with a warning that positions may
+  be wrong — when the placement matrix needed to place them correctly is right
+  there in the record.
+
+  What the format says now gets read: waived results (`WE<n>`) are marked as
+  waived and carry their comment, per-result property records become notes
+  instead of derailing the parse, and check names, `//` comments and float
+  resolutions follow the grammar. Malformed input still never throws; it warns
+  and carries on.
+
+- **Gzipped marker databases open directly**, the same way layouts already did.
+  Full-chip results are shipped compressed, and the marker text crosses into the
+  webview as a string, so expanding it in the extension host is the last place
+  that can deal in bytes at all.
+
 ## [1.6.0] - 2026-08-17
 
 - **A quieter control panel.** The panel opened with nine rows of chrome stacked
