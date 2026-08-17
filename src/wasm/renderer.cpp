@@ -22,7 +22,6 @@
 
 #include <emscripten/bind.h>
 #include <emscripten/emscripten.h>
-#include <emscripten/eventloop.h>
 #include <emscripten/html5.h>
 #include <emscripten/val.h>
 
@@ -268,12 +267,12 @@ GLuint g_mask_tex = 0;
 // GL_MAX_TEXTURE_SIZE (AA off, but never blank).
 int g_mask_scale = 2;
 
-// ---- Pick pass (see run_pick_pass) -----------------------------------------
+// ---- Pick pass (see pick_snap_at) ------------------------------------------
 // Nothing about the geometry survives on the CPU after uploadLayers -- only
-// VBOs -- so questions *about* that geometry are answered by rasterizing it
-// again. A small window of the scene around a screen point is drawn into an
-// integer framebuffer with the layer index (or a snap kind) and the fragment's
-// world position in it, and that window is read back. The target is tiny and
+// VBOs -- so the ruler's "what is near this point" question is answered by
+// rasterizing that geometry again. A small window of the scene around a screen
+// point is drawn into an integer framebuffer carrying, per fragment, what kind
+// of thing it is and where in the world it sits, and that window is read back. The target is tiny and
 // fixed rather than canvas-sized: the pass supplies its own u_resolution and
 // u_offset, so setting them to the window size and the world point under the
 // cursor makes the texture cover exactly kPickSize x kPickSize canvas pixels
@@ -738,10 +737,10 @@ bool init_gl() {
     glBindFramebuffer(GL_FRAMEBUFFER, g_pick_fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_pick_tex, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        // Everything the pick pass drives (hover identify, ruler snapping) is
-        // an addition to a viewer that works without it, so a driver that
-        // won't render to RGBA32UI loses those and nothing else.
-        EM_ASM({ console.warn('[GDS] pick FBO incomplete; hover identify and ruler snapping are off'); });
+        // Ruler snapping is an addition to a tool that works without it, so a
+        // driver that won't render to RGBA32UI loses the snap and nothing else:
+        // pick_snap_at reports no hit and every point lands where clicked.
+        EM_ASM({ console.warn('[GDS] pick FBO incomplete; ruler snapping is off'); });
         glDeleteFramebuffers(1, &g_pick_fbo);
         g_pick_fbo = 0;
     } else {
@@ -1055,7 +1054,7 @@ double grid_fine_spacing() {
     return fine;
 }
 
-// An (x, y) pair for the pointer readout, in whichever of nm/µm/mm the grid's
+// The pointer readout's "X: … Y: …" line, in whichever of nm/µm/mm the grid's
 // current step falls in, with one shared unit suffix -- a coordinate pair is
 // read as a pair, and letting each half pick its own unit (as format_distance_um
 // does, where there is only one number) makes the two incomparable at a glance.
@@ -1087,7 +1086,8 @@ std::string format_coord_pair(double x_um, double y_um) {
     // Enough decimals to resolve a tenth of a grid step in the chosen unit.
     const int decimals = std::clamp(1 - decade_in_unit, 0, 6);
     char buf[128];
-    snprintf(buf, sizeof(buf), "%.*f, %.*f %s", decimals, x_um * scale, decimals, y_um * scale, unit);
+    snprintf(buf, sizeof(buf), "X: %.*f  Y: %.*f %s", decimals, x_um * scale, decimals, y_um * scale,
+             unit);
     return buf;
 }
 
@@ -1105,9 +1105,7 @@ void update_coord_readout() {
     }
     float wx, wy;
     screen_to_world(g_cursor_x, g_cursor_y, wx, wy);
-    // The box also holds #hoverLayer (see set_hover_text), so the number goes
-    // into its own child rather than replacing the box's contents.
-    set_inner_text("coordValue", format_coord_pair(wx, wy));
+    el.set("textContent", format_coord_pair(wx, wy));
     el["classList"].call<void>("remove", std::string("hidden"));
 }
 
@@ -1664,50 +1662,6 @@ void disable_instance_attribs() {
 // is gone from the CPU after upload, so anything that needs to know what is at
 // a point on screen asks the rasterizer.
 
-// Draws one layer's geometry -- fill triangles then outline edges, static then
-// instanced -- under whatever program is currently bound, with no per-layer
-// uniforms of its own. draw_frame's loop can't share this: it interleaves color
-// and hatch uniforms between the fill and the outline, which is exactly the
-// part a pick pass has no use for.
-//
-// The fill is drawn whether or not the Infill toggle is on. The question a pick
-// answers is which shape occupies a point, and a polygon occupies its interior
-// however it happens to be shaded; picking only what is literally painted would
-// make an unfilled layer answerable only along its 1px boundary.
-void draw_layer_geometry(const LayerBuffer& layer) {
-    if (layer.fill_vbo) {
-        glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
-        glEnableVertexAttribArray(g_loc_position);
-        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-        glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
-    }
-    if (layer.outline_ebo) {
-        glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
-        glEnableVertexAttribArray(g_loc_position);
-        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
-        glDrawElements(GL_LINES, layer.outline_index_count, GL_UNSIGNED_INT, 0);
-    }
-    for (const InstancedBatch& batch : layer.instanced_batches) {
-        enable_instance_attribs(batch.instance_vbo);
-        if (batch.fill_vbo) {
-            glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
-            glEnableVertexAttribArray(g_loc_position);
-            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
-        }
-        if (batch.outline_ebo) {
-            glBindBuffer(GL_ARRAY_BUFFER, batch.outline_vbo);
-            glEnableVertexAttribArray(g_loc_position);
-            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
-            glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
-                                    batch.instance_count);
-        }
-        disable_instance_attribs();
-    }
-}
-
 // Points the pick framebuffer at a screen point and clears it. The world point
 // under that pixel comes back through out_wx/out_wy: it is both the pass's
 // u_offset -- which is what centres the window on the cursor -- and the origin
@@ -1762,43 +1716,6 @@ float pick_texel_dist2(int i, int j) {
     float dx = ((float)i + 0.5f) - kPickCenter;
     float dy = ((float)j + 0.5f) - kPickCenter;
     return dx * dx + dy * dy;
-}
-
-// How far from the pointer a hit still counts as "under" it. Deliberately
-// small: the answer wanted is the layer the pointer is on, and a generous
-// radius on a dense layout reports a neighbour instead.
-constexpr float kPickIdentifyRadiusPx = 3.0f;
-
-// Which layer is under a screen point: an index into g_layers, or -1. Layers
-// are drawn in g_layers order -- the order draw_frame uses -- with no depth
-// test, so the last write to a texel wins and the answer is the layer that is
-// visually on top, which is the one the question is about.
-int pick_layer_at(float screen_x, float screen_y) {
-    float wx, wy;
-    if (!begin_pick_pass(screen_x, screen_y, wx, wy)) return -1;
-    const ViewRect view = pick_view_rect(wx, wy);
-    for (size_t i = 0; i < g_layers.size(); i++) {
-        const LayerBuffer& layer = g_layers[i];
-        if (!layer.visible) continue;
-        if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
-        glUniform1ui(g_pick_loc_id, (GLuint)(i + 1));
-        draw_layer_geometry(layer);
-    }
-    end_pick_pass();
-
-    int best = -1;
-    float best_dist2 = kPickIdentifyRadiusPx * kPickIdentifyRadiusPx;
-    for (int j = 0; j < kPickSize; j++) {
-        for (int i = 0; i < kPickSize; i++) {
-            const uint32_t* texel = &g_pick_buffer[((size_t)j * kPickSize + i) * 4];
-            if (texel[3] == 0u || texel[0] == 0u) continue;
-            float dist2 = pick_texel_dist2(i, j);
-            if (dist2 > best_dist2) continue;
-            best_dist2 = dist2;
-            best = (int)texel[0] - 1;
-        }
-    }
-    return best >= 0 && (size_t)best < g_layers.size() ? best : -1;
 }
 
 // ---- Ruler snapping ---------------------------------------------------------
@@ -1928,59 +1845,6 @@ void resolve_measure_point(const EmscriptenMouseEvent* e, bool from_start, float
     }
     screen_to_world((float)e->targetX, (float)e->targetY, out_x, out_y);
     g_snap_active = false;
-}
-
-// ---- Hover identify ---------------------------------------------------------
-// The layer under a resting pointer, written into #hoverLayer above the
-// coordinate readout. Deferred rather than run on every move for two reasons:
-// a pick costs a frame's worth of vertex work, and "what am I pointing at" is a
-// question asked by stopping, not while sweeping across the design.
-constexpr int kHoverDelayMs = 130;
-long g_hover_timeout = 0;
-bool g_hover_scheduled = false;
-
-void set_hover_text(const std::string& text) {
-    if (!g_gl_ready) return;
-    val el = val::global("document").call<val>("getElementById", std::string("hoverLayer"));
-    if (el.isNull() || el.isUndefined()) return;
-    el.set("textContent", text);
-    el["classList"].call<void>("toggle", std::string("hidden"), text.empty());
-}
-
-void run_hover_identify(void* /*userData*/) {
-    g_hover_scheduled = false;
-    if (!g_cursor_inside) return;
-    int index = pick_layer_at(g_cursor_x, g_cursor_y);
-    if (index < 0) {
-        set_hover_text("");
-        return;
-    }
-    const LayerBuffer& layer = g_layers[(size_t)index];
-    std::string text = std::to_string(layer.layer) + "/" + std::to_string(layer.datatype);
-    auto it = g_lyp_info.find(layer.tag());
-    if (it != g_lyp_info.end() && !it->second.name.empty()) {
-        text += " \xE2\x80\x93 " + it->second.name;  // en dash, matching the panel's rows
-    }
-    set_hover_text(text);
-}
-
-void schedule_hover_identify() {
-    if (!g_gl_ready || !g_pick_fbo) return;
-    if (g_hover_scheduled) emscripten_clear_timeout(g_hover_timeout);
-    // Whatever is on screen answers for where the pointer *was*. Clearing it up
-    // front is the honest option: a stale layer name is worse than none, and
-    // the gap is a tenth of a second.
-    set_hover_text("");
-    g_hover_timeout = emscripten_set_timeout(run_hover_identify, (double)kHoverDelayMs, nullptr);
-    g_hover_scheduled = true;
-}
-
-void cancel_hover_identify() {
-    if (g_hover_scheduled) {
-        emscripten_clear_timeout(g_hover_timeout);
-        g_hover_scheduled = false;
-    }
-    set_hover_text("");
 }
 
 // Draws the background grid: one fullscreen triangle, no geometry, called
@@ -2440,9 +2304,6 @@ void clear_layers() {
     // back; dropping them here is what stops a *different* file inheriting
     // rectangles drawn around nothing.
     g_highlight_boxes.clear();
-    // Same for the hover readout: it names a layer of the file being replaced,
-    // and a pick already in flight would index a g_layers that no longer has it.
-    cancel_hover_identify();
     // The label ranges index into g_layers -- they can't outlive it.
     g_text_ranges.clear();
     g_total_labels = 0;
@@ -3200,7 +3061,6 @@ bool on_mousemove(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*user
     g_cursor_y = (float)e->targetY;
     g_cursor_inside = true;
     update_coord_readout();
-    schedule_hover_identify();
     // In measure mode the cursor is always aiming at something, whether or not
     // a ruler is half-placed: resolving the point every move is what puts the
     // snap indicator under the cursor before the first click rather than after
@@ -3238,7 +3098,6 @@ bool on_mouseup(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*us
 bool on_mouseleave(int /*eventType*/, const EmscriptenMouseEvent* /*e*/, void* /*userData*/) {
     g_cursor_inside = false;
     update_coord_readout();
-    cancel_hover_identify();
     return false;
 }
 

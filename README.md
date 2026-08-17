@@ -27,7 +27,6 @@ colors.
   several measurements can be compared at once.
 - A pointer coordinate readout, and a "Go to (x, y)" box for driving the view
   from a coordinate out of a DRC report or a colleague's message.
-- Hover identify: rest the pointer on a shape to see which layer it's on.
 - Marker databases: load DRC/LVS violation markers (KLayout `.lyrdb` or
   Calibre DRC ASCII results) as a highlight overlay with a browsable
   category/item panel that zooms to each violation.
@@ -77,15 +76,10 @@ with an unexpected extension still loads correctly):
 - **Grid** — toggle the background reference grid. Its spacing is a round
   nm/µm/mm step chosen from the zoom, so it agrees with the scale bar; on by
   default.
-- **Hover identify** — rest the pointer on a shape and the layer/datatype (and
-  its `.lyp` name, if one is loaded) appears above the coordinate readout. It
-  reports the topmost *visible* layer covering that point, and it counts a
-  polygon's whole interior whether or not **Infill** is on — a shape occupies
-  its area regardless of how it's shaded.
-- **Coordinates** — the world coordinate under the pointer is shown above the
-  scale bar in the bottom-right corner, in whichever of nm/µm/mm the grid's
-  current step falls in and to a tenth of that step, so the digits on screen are
-  the ones the grid can actually distinguish.
+- **Coordinates** — the world coordinate under the pointer is shown as
+  `X: … Y: …` below the scale bar in the bottom-right corner, in whichever of
+  nm/µm/mm the grid's current step falls in and to a tenth of that step, so the
+  digits on screen are the ones the grid can actually distinguish.
 - **Go to (x, y)** — type or paste a coordinate into the panel and press Enter to
   center the view on it. Microns unless a per-number unit says otherwise
   (`nm`/`um`/`µm`/`mm`), and the decorations coordinates arrive wrapped in —

@@ -37,29 +37,6 @@
     in the panel while any are up, and `Esc` now backs out in two steps —
     abandon the measurement being placed, then (on a press with nothing left to
     abandon) clear the finished ones and return to **Pan**.
-- **Hover identify.** Rest the pointer on a shape and the layer/datatype it
-  belongs to — with its `.lyp` name, if one is loaded — appears above the
-  coordinate readout. Answering "which layer is that?" previously meant toggling
-  layers off one at a time until the shape disappeared.
-
-  Nothing about the geometry survives on the CPU after it's uploaded, so the
-  answer comes from the rasterizer rather than from a spatial index: a 33×33
-  pixel window around the pointer is redrawn into an offscreen `RGBA32UI`
-  framebuffer with each layer's index written in place of its color, and one
-  read-back names the layer. That target is tiny and fixed rather than
-  canvas-sized because the pass supplies its own camera uniforms — pointing them
-  at the world coordinate under the cursor makes a 33×33 texture cover exactly
-  the 33×33 canvas pixels around it. Layers are drawn in the same order and
-  skipped by the same bounding-box test the normal frame uses, so the reported
-  layer is the one visually on top, and at any real zoom most of the design is
-  never touched.
-
-  It waits for the pointer to stop (about a tenth of a second) rather than
-  running on every move: a pick costs one frame's worth of vertex work, and
-  "what am I pointing at" is a question you ask by stopping. A polygon's whole
-  interior answers, whether or not **Infill** is on — a shape occupies its area
-  regardless of how it happens to be shaded, and picking only what is literally
-  painted would leave an unfilled layer answerable along its 1px boundary alone.
 - **A layer panel that scales past a demo deck.** A flat checkbox list stops
   working somewhere around twenty layers and a real PDK has well over a hundred,
   so the panel now has the four things that make a long list usable:
@@ -80,10 +57,10 @@
     particular file actually populates and which are near-empty. A layer with no
     polygons but with text on it counts its labels as `T`*n* instead, since a
     bare `0` would read as empty when it isn't.
-- **A pointer coordinate readout**, above the scale bar in the bottom-right
-  corner. There was a scale bar and a ruler, but nothing answering "where am
-  I?" — the one readout every layout viewer has. It follows the background
-  grid's unit and step rather than picking its own: the grid already decides
+- **A pointer coordinate readout** (`X: … Y: …`), below the scale bar in the
+  bottom-right corner. There was a scale bar and a ruler, but nothing answering
+  "where am I?" — the one readout every layout viewer has. It follows the
+  background grid's unit and step rather than picking its own: the grid decides
   what one square on screen means, so the readout shows that unit to a tenth of
   that step and no further, because digits finer than the grid can separate are
   noise. Both halves of the pair share one unit and one number of decimals, so
@@ -100,7 +77,6 @@
   of a report works without editing. A coordinate that can't be read as a pair,
   or that lies outside this layout, turns the row red and says which rather than
   silently parking the camera at the nearest edge of the design.
-
 - Wheel zoom is no longer wildly over-sensitive on a trackpad. Every wheel
   event applied one fixed 1.15× step regardless of how far the event said the
   wheel had turned, which is right for a stepped mouse wheel (one event per
