@@ -23,6 +23,7 @@ const fixture = (name) => fs.readFileSync(path.join(__dirname, "fixtures", name)
 const lyrdbText = fixture("sample.lyrdb");
 const calibreText = fixture("sample_calibre.txt");
 const hierText = fixture("sample_calibre_hier.txt");
+const ruleTextText = fixture("sample_calibre_ruletext.txt");
 
 const catByName = (model, name) => model.categories.find((c) => c.name === name);
 
@@ -30,7 +31,11 @@ test("sniffMarkerFormat", () => {
     assert.strictEqual(sniffMarkerFormat(lyrdbText), "lyrdb");
     assert.strictEqual(sniffMarkerFormat("﻿ \n" + lyrdbText), "lyrdb");
     assert.strictEqual(sniffMarkerFormat(calibreText), "calibre");
-    assert.strictEqual(sniffMarkerFormat("﻿TOP 1000\r\nRULE\n"), "calibre");
+    assert.strictEqual(sniffMarkerFormat("﻿TOP 1000\r\nRULE\n"), "calibre"); // header only = clean db
+    assert.strictEqual(sniffMarkerFormat("// written by some tool\nTOP 1000\nRULE\n1 1 1 Jul\n"), "calibre");
+    assert.strictEqual(sniffMarkerFormat("TOP 0.001\nRULE\n2 2 0 Jul\n"), "calibre"); // float resolution
+    // A word and a number, but no counts line under the second line.
+    assert.strictEqual(sniffMarkerFormat("chapter 4\nsome prose\nmore prose\n"), null);
     assert.strictEqual(sniffMarkerFormat("<html><body>nope</body></html>"), null);
     assert.strictEqual(sniffMarkerFormat("just some words\nmore words"), null);
     assert.strictEqual(sniffMarkerFormat(""), null);
@@ -121,7 +126,10 @@ test("calibre: rulechecks, scaling, descriptions", () => {
         ["M2.SPACING.1", "M1.WIDTH", "EMPTY.CHECK"]
     );
     const spacing = catByName(model, "M2.SPACING.1");
-    assert.strictEqual(spacing.description, "M2 space < 0.14 second description line");
+    assert.strictEqual(
+        spacing.description,
+        "Rule File Pathname: /path/rules.svrf\nM2 space < 0.14\nsecond description line"
+    );
     assert.strictEqual(spacing.items.length, 2);
 
     // precision 2000: integer coords divided by 2000 into µm.
@@ -130,20 +138,53 @@ test("calibre: rulechecks, scaling, descriptions", () => {
     assert.deepStrictEqual(Array.from(p1.polygons[0]), [0.5, 1, 0.75, 1, 0.75, 1.2, 0.5, 1.2]);
     assert.deepStrictEqual(p1.bbox, { minX: 0.5, minY: 1, maxX: 0.75, maxY: 1.2 });
 
-    // Even edge cluster: 4 vertices -> 2 independent edges.
+    // 'e' counts *edges*, four numbers per line -- "e 2 2" is an edge pair.
     assert.strictEqual(e2.label, "e 2");
     assert.deepStrictEqual(Array.from(e2.edges), [1.5, 0.25, 1.8, 0.25, 1.5, 0.35, 1.8, 0.35]);
+    assert.deepStrictEqual(e2.bbox, { minX: 1.5, minY: 0.25, maxX: 1.8, maxY: 0.35 });
 
-    // Odd edge cluster: polyline -> consecutive-vertex edges + a warning.
     const width = catByName(model, "M1.WIDTH");
     assert.strictEqual(width.items.length, 1);
-    assert.deepStrictEqual(Array.from(width.items[0].edges), [0, 0, 0.5, 0, 0.5, 0, 0.5, 0.5]);
-    assert.ok(model.warnings.some((w) => /odd vertex count 3/.test(w)));
+    assert.deepStrictEqual(Array.from(width.items[0].edges), [0, 0, 0.5, 0]);
 
     assert.strictEqual(catByName(model, "EMPTY.CHECK").items.length, 0);
+    assert.deepStrictEqual(model.warnings, []);
 
     const ids = model.categories.flatMap((c) => c.items.map((it) => it.id));
     assert.deepStrictEqual(ids, [0, 1, 2]);
+});
+
+// A record that writes more points than it declared would otherwise leave bare
+// coordinate lines where the next check's name belongs -- which is how a check
+// called "3000 700" (and a vertex line read as its counts line) gets invented.
+test("calibre: coordinate lines past the declared count don't invent checks", () => {
+    const text = [
+        "TOP 1000",
+        "M1.WIDTH",
+        "1 1 1 Jul 10 14:03:12 2026",
+        '"declares 3 vertices, writes 4"',
+        "p 1 3",
+        "0 0",
+        "1000 0",
+        "1000 1000",
+        "0 1000",
+        "M2.WIDTH",
+        "1 1 1 Jul 10 14:03:12 2026",
+        '"a real check after the strays"',
+        "p 1 3",
+        "0 0",
+        "2000 0",
+        "2000 2000",
+        "",
+    ].join("\n");
+    const model = parseCalibreAscii(text);
+    assert.deepStrictEqual(
+        model.categories.map((c) => c.name),
+        ["M1.WIDTH", "M2.WIDTH"]
+    );
+    assert.deepStrictEqual(model.categories[0].items[0].bbox, { minX: 0, minY: 0, maxX: 1, maxY: 1 });
+    assert.deepStrictEqual(model.categories[1].items[0].bbox, { minX: 0, minY: 0, maxX: 2, maxY: 2 });
+    assert.ok(model.warnings.some((w) => /1 coordinate line\(s\) past the declared point counts/.test(w)));
 });
 
 test("calibre: CRLF + blank lines tolerated", () => {
@@ -152,13 +193,74 @@ test("calibre: CRLF + blank lines tolerated", () => {
     assert.strictEqual(catByName(model, "M2.SPACING.1").items.length, 2);
 });
 
-test("calibre: hierarchical CN records skipped with warning", () => {
+// Calibre echoes the SVRF source of each check as the counts line's
+// description lines. Those lines are unquoted, so without honouring the count
+// each one starts a bogus rulecheck -- the closing "}" became a category name.
+test("calibre: echoed SVRF rule text, waivers, properties", () => {
+    const model = parseCalibreAscii(ruleTextText);
+    assert.deepStrictEqual(
+        model.categories.map((c) => c.name),
+        ["SPACE.CHECK.1", "WAIVED.CHECK", "TRUNCATED.CHECK", "BAD.COUNT", "DENSITY.OUT", "DENSITY_PRINT_FILES"]
+    );
+
+    const space = catByName(model, "SPACE.CHECK.1");
+    assert.strictEqual(
+        space.description,
+        "SPACE.CHECK.1 { @ Space of M2 >= 0.5\n  CHK = COPY M2\n" +
+            "  ERR = EXT CHK < 0.5 SINGULAR REGION\n  COPY ERR\n}"
+    );
+    assert.strictEqual(space.items.length, 2);
+    assert.deepStrictEqual(space.items[0].bbox, { minX: 1, minY: 2, maxX: 1.5, maxY: 2.4 });
+
+    // WE<n> description lines waive result n (0-based); the first line of each
+    // waiver is its author/timestamp and is dropped.
+    const waived = catByName(model, "WAIVED.CHECK");
+    assert.strictEqual(waived.description, "one result waived, one not");
+    assert.deepStrictEqual(
+        waived.items.map((it) => it.waived),
+        [true, false]
+    );
+    assert.match(waived.items[0].note, /known dummy fill interaction approved by the PDK team/);
+    assert.strictEqual(waived.items[1].note, "");
+
+    // Per-result property records become notes, not geometry.
+    const density = catByName(model, "DENSITY.OUT");
+    assert.strictEqual(density.items[0].note, "DENSITY=0.1234");
+    assert.strictEqual(density.items[0].polygons.length, 1);
+
+    // Trailing metadata blocks: 0 results, description lines only.
+    const files = catByName(model, "DENSITY_PRINT_FILES");
+    assert.strictEqual(files.items.length, 0);
+    assert.strictEqual(files.description, "DENSITY.CHECK.1.density\nDENSITY.CHECK.2.density");
+
+    // A short block and an over-long description count are both reported, and
+    // neither swallows the next check.
+    assert.strictEqual(catByName(model, "TRUNCATED.CHECK").items.length, 1);
+    assert.strictEqual(catByName(model, "BAD.COUNT").items.length, 1);
+    assert.ok(model.warnings.some((w) => /TRUNCATED\.CHECK: results ended after 1 of 2/.test(w)));
+    assert.ok(model.warnings.some((w) => /BAD\.COUNT: description count 9 overruns/.test(w)));
+    assert.strictEqual(model.warnings.length, 2);
+});
+
+// Hierarchical databases place results with a CN record. Only the 'c' (cell
+// space) form needs transforming -- without it the coordinates are already
+// absolute and the matrix just says where the cell sits.
+test("calibre: hierarchical CN placements applied", () => {
     const model = parseCalibreAscii(hierText);
     assert.strictEqual(model.categories.length, 1);
-    const item = model.categories[0].items[0];
-    assert.strictEqual(item.polygons[0].length, 8);
-    assert.deepStrictEqual(item.bbox, { minX: 0.1, minY: 0.2, maxX: 0.3, maxY: 0.4 });
-    assert.ok(model.warnings.some((w) => /hierarchical/.test(w)));
+    const [translated, absolute, rotated] = model.categories[0].items;
+
+    // 'c' + translation (1000, 2000) DBU = +1.0, +2.0 µm.
+    assert.deepStrictEqual(translated.bbox, { minX: 1.1, minY: 2.2, maxX: 1.3, maxY: 2.4 });
+    assert.match(translated.note, /cell SUBCELL/);
+
+    // No 'c': coordinates untouched despite the placement's (5000, 5000).
+    assert.deepStrictEqual(absolute.bbox, { minX: 0.1, minY: 0.2, maxX: 0.3, maxY: 0.4 });
+
+    // 'c' + r90 matrix (m11 m21 m12 m22 = 0 1 -1 0): (x,y) -> (-y,x).
+    assert.deepStrictEqual(Array.from(rotated.polygons[0]), [-0.2, 0.1, -0.2, 0.3, -0.4, 0.3, -0.4, 0.1]);
+
+    assert.ok(model.warnings.some((w) => /3 marker\(s\) placed in cells other than TOP/.test(w)));
 });
 
 test("parseMarkerFile dispatches by content", () => {
