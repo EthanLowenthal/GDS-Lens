@@ -17,7 +17,7 @@ colors.
 - Handles SREF/AREF (including array references), rotation, mirroring, and
   magnification via gdstk's flattening.
 - A cell hierarchy tree down the left edge: browse the design's cells and
-  click one to frame it.
+  click one to frame it and outline each of its placements.
 - Per-layer visibility toggles, an infill (fill pattern) toggle, and a text
   toggle for the layout's own labels.
 - Measure tool: click two points to read out the distance between them.
@@ -38,9 +38,16 @@ with an unexpected extension still loads correctly):
 - **Pan / zoom** — drag to pan, scroll to zoom.
 - **Hierarchy** — the panel down the left edge is the design's cell tree,
   starting from its top cell(s). Click the ▸ to open a cell and see the cells
-  it places; click the row itself to frame that cell in the view. A cell placed
-  more than once by its parent is one row marked `×N` — clicking it frames all
-  N placements, and opening it follows the first. The panel starts collapsed:
+  it places; click the row itself to frame that cell in the view and mark every
+  placement of it with a dashed outline on the canvas (dashed so it can't be
+  mistaken for a shape in the layout). The outlines stay on the geometry as you
+  pan and zoom, so pulling back to see where the cell sits in the design keeps
+  showing you which parts of it the cell is; `Esc` clears them, and putting the
+  panel away takes them down with the tree (reopening the panel brings them
+  back). A cell placed more than once by its parent is one row marked `×N` —
+  clicking it outlines all N copies and frames the view on them together, and
+  opening it follows the first. (Past ~1,000 copies the row is marked with one
+  outline around the lot instead; its tooltip says so.) The panel starts collapsed:
   the **Hierarchy** button in the top-left corner opens it (as does `H`), and
   the ✕ in its header puts it away again. Once opened it stays open for the rest
   of the session, and open branches and the selected cell survive a reload, so

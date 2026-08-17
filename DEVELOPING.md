@@ -13,12 +13,18 @@ see [`README.md`](README.md).
 - `src/marker-parsers.js` — standalone parsers for DRC/LVS marker databases
   (KLayout `.lyrdb`, Calibre DRC ASCII); loaded in the webview via a
   `<script>` tag and `require()`d directly by the unit tests.
-- `src/wasm/` — C++ source (`bindings.cpp`, `renderer.cpp`, `gds_common.hpp`)
-  compiled with Emscripten into `src/wasm/build/gdstk_wasm.js`, which does
-  GDSII/OASIS parsing and WebGL rendering. Which of gdstk's two readers runs
-  is decided by sniffing the file header in `gds_common.hpp`, so no caller
-  has to know the format. See `docs/rendering-rewrite.md` for the design
-  history of this C++/WASM architecture.
+- `src/wasm/` — C++ source compiled with Emscripten into
+  `src/wasm/build/gdstk_wasm.js`, which does GDSII/OASIS parsing and WebGL
+  rendering. `renderer.cpp` holds the renderer proper (GL state, camera,
+  input, layer upload, the embind API); `bindings.cpp` exposes the parse path
+  on its own for non-graphical testing. The pieces that depend on none of the
+  renderer's state sit beside them: `shaders.hpp` (the GLSL sources),
+  `stroke_font.{hpp,cpp}` (the vector font labels are drawn with),
+  `lyp_util.{hpp,cpp}` (the string/color primitives the `.lyp` reader uses)
+  and `gds_common.hpp` (shared with `bindings.cpp`). Which of gdstk's two
+  readers runs is decided by sniffing the file header in `gds_common.hpp`, so
+  no caller has to know the format. See `docs/rendering-rewrite.md` for the
+  design history of this C++/WASM architecture.
 - `third_party/gdstk`, `third_party/qhull` — git submodules the wasm build
   links against.
 - `test/` — plain-Node tests (`npm test`): marker-parser unit tests plus
@@ -84,6 +90,15 @@ it costs a fraction of the flatten that follows it, and `kMaxHierarchyCells`
 limit real designs approach — past it the tree is omitted and the panel says
 why, since describing a library that large costs more than the geometry the
 tree exists to navigate.
+
+The one exception is each row's `placements` array — the transform of every
+individual copy, which the viewer outlines one by one when a row is selected.
+That *is* per-placement data, so it carries its own two ceilings:
+`kMaxRowPlacements` (1,024 per row) and `kMaxHierarchyPlacements` (200,000 across
+the library, spent in cell order). Both are checked before `get_offsets()`
+expands an arrayed reference, since a single AREF can hold millions of copies;
+a row that hits either keeps only its spanning box and the viewer falls back to
+outlining that.
 
 ## Publishing
 

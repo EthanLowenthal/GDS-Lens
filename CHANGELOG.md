@@ -16,8 +16,54 @@
   flattens the design to draw it, which left nothing on screen saying what the
   design is *made of*; the panel now lists the top cell(s) and, as branches are
   opened, the cells each one places. Clicking a row frames that cell in the
-  view, which makes the tree a way to navigate a layout rather than just read
-  it — the fastest way to get from a whole reticle to one macro.
+  view and outlines it there, which makes the tree a way to navigate a layout
+  rather than just read it — the fastest way to get from a whole reticle to one
+  macro.
+  - The selected cell is outlined on the canvas, not just framed by the camera.
+    Framing alone answers "which shapes are this cell" for exactly as long as
+    the view holds still: zoom out to see where the cell sits among its
+    neighbours — the reason you went looking for it — and the answer is gone.
+    The outlines are world-space boxes, so they stay glued to the geometry
+    through any amount of panning and zooming, and `Esc` clears them (the same
+    key that drops the ruler). They are only drawn while the panel is up: the
+    outline is the tree pointing at the layout, so hiding the tree takes it down
+    too — a dashed rectangle over the design with nothing on screen to explain it
+    is just clutter — and reopening the panel puts it back for whichever row is
+    still selected.
+  - **One outline per placement, not one around all of them.** A row stands for
+    a cell as one parent places it, so selecting a cell placed 40 times draws 40
+    outlines, each around the copy where it actually sits. The box spanning all
+    40 — which is still what clicking the row frames the camera on, since that's
+    the one view showing the row's whole meaning — mostly encloses *other* cells'
+    geometry, so drawing that as the highlight said "the selected cell is
+    everything in here", which is exactly the misreading the outline exists to
+    prevent. The tree now carries every placement's transform for this (a
+    `placements` array per row out of `build_hierarchy`), which is the first
+    per-placement data in a structure otherwise sized by the cell count, so it's
+    capped twice over: 1,024 placements per row and 200,000 across the library,
+    past which a row keeps only its spanning box. Both caps are checked before
+    the offsets of an arrayed reference are expanded at all — a single AREF can
+    hold millions — and a row that hits one falls back to the single box rather
+    than to an arbitrary 1,024 of its copies, since a partial set of outlines
+    misrepresents where the cell is in a way one honest envelope doesn't. The
+    row's tooltip says which of the two you're looking at.
+  - The outline is **dashed**, at a fixed on-screen dash pitch and thickness.
+    Drawn solid at a layer's line weight it was indistinguishable from a drawn
+    rectangle — the viewer's own annotation reading as content in the file,
+    which is the one thing a layout viewer must not do. Nothing in a GDSII or
+    OASIS file comes out dashed, so the dashes alone mark it as chrome, and
+    holding the pitch and thickness in pixels rather than in microns means
+    zooming in never turns it into geometry. It's built as screen-thickness
+    quads rather than a line strip, since WebGL may ignore any `glLineWidth`
+    but 1. A box that would come out smaller than 20px on screen is grown about
+    its centre, so a small cell viewed from across the die is still a mark you
+    can aim at, and the dashes are clipped to the viewport and laid on a grid
+    anchored to the box — a die-sized cell viewed up close costs the few dozen
+    dashes actually on screen rather than the millions of pixels of perimeter it
+    has, and panning slides them with the geometry instead of along the edge.
+    Its blue is the panel's own selection accent, per theme: red belongs to the
+    marker overlay and the ink color to the ruler, so reusing either would have
+    read as one of those.
   - Rows collapse per cell, not per placement: a cell a parent places 40,000
     times is one row marked `×40000`, since the alternative is a panel with
     40,000 identical siblings in it. Clicking that row frames all of the

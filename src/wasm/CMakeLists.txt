@@ -65,7 +65,8 @@ set(QHULL_SOURCES
     "${QHULL_DIR}/src/libqhull_r/userprintf_r.c"
     "${QHULL_DIR}/src/libqhull_r/userprintf_rbox_r.c")
 
-add_executable(gdstk_wasm bindings.cpp renderer.cpp ${GDSTK_SOURCES} ${QHULL_SOURCES})
+add_executable(gdstk_wasm bindings.cpp renderer.cpp lyp_util.cpp stroke_font.cpp
+    ${GDSTK_SOURCES} ${QHULL_SOURCES})
 
 target_include_directories(gdstk_wasm PRIVATE
     "${GDSTK_DIR}/include"

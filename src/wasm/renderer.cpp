@@ -12,6 +12,11 @@
 //
 // GDS bytes still arrive via MEMFS (see bindings.cpp's parseGds, which is
 // kept around for non-graphical testing of the parse path in isolation).
+//
+// Three self-contained pieces sit in their own files, since none of them
+// touch any of the renderer state below: the GLSL sources (shaders.hpp), the
+// stroke font the labels are drawn with (stroke_font.hpp), and the string and
+// color primitives the .lyp reader is built on (lyp_util.hpp).
 
 #include <GLES3/gl3.h>
 
@@ -32,301 +37,14 @@
 #include <gdstk/gdstk.hpp>
 
 #include "gds_common.hpp"
+#include "lyp_util.hpp"
+#include "shaders.hpp"
+#include "stroke_font.hpp"
 
 using namespace emscripten;
 using namespace gdstk;
 
 namespace {
-
-// The three a_instance* attributes carry a per-instance 2x3 affine (2x2
-// linear part split into two columns + a translation) mapping an instanced
-// batch's unit-shape local coordinates to world space (see InstancedBatch /
-// draw_frame). Their array pointers are only enabled for instanced draws; for
-// every other (static) draw the arrays stay disabled and each attribute reads
-// its context-level "generic" value instead, which init_gl sets to the
-// identity map (col0=(1,0), col1=(0,1), translate=(0,0)) so a_position passes
-// through unchanged -- no separate non-instanced shader needed.
-const char* kVertexShaderSrc =
-    "#version 300 es\n"
-    "in vec2 a_position;\n"
-    "in vec2 a_iCol0;\n"
-    "in vec2 a_iCol1;\n"
-    "in vec2 a_iTranslate;\n"
-    "uniform vec2 u_resolution;\n"
-    "uniform vec2 u_offset;\n"
-    "uniform float u_zoom;\n"
-    "void main() {\n"
-    "    vec2 worldPos = vec2(\n"
-    "        a_iCol0.x * a_position.x + a_iCol1.x * a_position.y + a_iTranslate.x,\n"
-    "        a_iCol0.y * a_position.x + a_iCol1.y * a_position.y + a_iTranslate.y);\n"
-    "    vec2 centeredPos = worldPos - u_offset;\n"
-    "    vec2 zoomedPos = centeredPos * u_zoom;\n"
-    "    vec2 clipSpace = (zoomedPos / u_resolution) * 2.0;\n"
-    "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
-    "}";
-
-// Fill polygons are stippled rather than solid-filled so that overlapping
-// layers (and whatever is drawn underneath them) stay visible through the
-// gaps -- a flat semi-transparent fill makes stacked layers blur into mud
-// once you have more than two or three on screen. Several pattern *kinds*
-// (not just one hatch angle) exist because two adjacent layers both doing
-// 45-degree lines are still hard to tell apart at a glance; KLayout's .lyp
-// stipple patterns solve the same problem the same way. Patterns are
-// computed in screen space (gl_FragCoord) rather than world space so the
-// pitch stays a constant pixel cadence regardless of zoom; world-space
-// patterns would turn into solid fill when zoomed in and disappear when
-// zoomed out. Outlines (u_useHatch=0) are unaffected.
-const char* kFragmentShaderSrc =
-    "#version 300 es\n"
-    "precision highp float;\n"
-    "uniform vec4 u_color;\n"
-    "uniform float u_useHatch;\n"
-    "uniform float u_patternType;\n"
-    "uniform float u_hatchAngle;\n"
-    "uniform float u_hatchSpacing;\n"
-    "uniform float u_hatchWidth;\n"
-    "out vec4 fragColor;\n"
-    "float lineMask(float coord, float spacing, float halfWidth) {\n"
-    "    float t = mod(coord, spacing);\n"
-    "    float d = min(t, spacing - t);\n"
-    "    float aa = fwidth(coord) * 0.5 + 0.001;\n"
-    "    return 1.0 - smoothstep(halfWidth - aa, halfWidth + aa, d);\n"
-    "}\n"
-    "void main() {\n"
-    "    float alpha = u_color.a;\n"
-    "    if (u_useHatch > 0.5) {\n"
-    "        float c = cos(u_hatchAngle);\n"
-    "        float s = sin(u_hatchAngle);\n"
-    "        vec2 p = gl_FragCoord.xy;\n"
-    "        float u = p.x * c + p.y * s;\n"
-    "        float v = -p.x * s + p.y * c;\n"
-    "        int patternType = int(u_patternType + 0.5);\n"
-    "        float mask;\n"
-    "        if (patternType == 0) {\n"
-    "            mask = lineMask(u, u_hatchSpacing, u_hatchWidth);\n"
-    "        } else if (patternType == 1) {\n"
-    "            mask = max(lineMask(u, u_hatchSpacing, u_hatchWidth), lineMask(v, u_hatchSpacing, u_hatchWidth));\n"
-    "        } else if (patternType == 2) {\n"
-    "            float du = mod(u, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
-    "            float dv = mod(v, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
-    "            float dist = length(vec2(du, dv));\n"
-    "            float aa = fwidth(dist) + 0.001;\n"
-    "            float dotRadius = u_hatchWidth * 1.7;\n"
-    "            mask = 1.0 - smoothstep(dotRadius - aa, dotRadius + aa, dist);\n"
-    "        } else {\n"
-    "            mask = max(lineMask(p.x, u_hatchSpacing, u_hatchWidth), lineMask(p.y, u_hatchSpacing, u_hatchWidth));\n"
-    "        }\n"
-    "        alpha = min(u_color.a * 1.4, 0.7) * mask;\n"
-    "    }\n"
-    "    fragColor = vec4(u_color.rgb, alpha);\n"
-    "}";
-
-// Fragment shader for merge mode's coverage pass: every covered fragment
-// writes 1 into the R8 mask texture, blending off, so any number of
-// overlapping polygons on the layer collapse into plain per-pixel coverage.
-// That mask *is* the union of the layer's polygons -- no CPU boolean ops
-// anywhere. Pairs with kVertexShaderSrc so static and instanced geometry
-// rasterize through the exact same camera/instancing path as normal draws.
-const char* kMaskFragmentShaderSrc =
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "out vec4 fragColor;\n"
-    "void main() { fragColor = vec4(1.0); }";
-
-// Fullscreen triangle for merge mode's composite pass, derived from
-// gl_VertexID -- no vertex buffer, no attributes. (0,0)/(2,0)/(0,2) in UV
-// maps to clip-space (-1,-1)/(3,-1)/(-1,3), covering the screen with one
-// triangle.
-const char* kCompositeVertexShaderSrc =
-    "#version 300 es\n"
-    "void main() {\n"
-    "    vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
-    "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
-    "}";
-
-// Merge mode's composite pass: reads the layer's coverage mask and paints the
-// union boundary in the layer's frame color and the interior with the same
-// screen-space hatch patterns the normal fill path uses (duplicated from
-// kFragmentShaderSrc, with fwidth() replaced by exact analytic derivatives --
-// the pattern coords are linear in gl_FragCoord, and derivatives after a
-// discard are undefined).
-//
-// Anti-aliasing comes from two things working together. First, supersampling:
-// the mask is u_maskScale (normally 2) times the canvas resolution, so edges
-// land between canvas pixels with sub-pixel precision. (Deliberately not MSAA
-// -- a multisampled R8 renderbuffer + resolve blit rendered blank on at least
-// one real driver; this path only uses the plain texture FBO machinery that
-// single-sample mode already proved.) Second, bilinear reconstruction: the
-// mask texture is LINEAR-filtered and every read is a texture() tap, so
-// coverage varies continuously as the true edge moves -- a texelFetch/min
-// over raw binary texels would snap the border back to hard steps no matter
-// the supersample factor, which is exactly what the first version of this
-// shader got wrong. The border weight ramps with the lowest tap in a 1-canvas-
-// pixel ring, frame color composites over fill by that weight, and the final
-// alpha scales by the pixel's own coverage so the outer silhouette fades
-// smoothly. Uncovered pixels discard, so normal alpha blending stacks merged
-// layers the same way unmerged ones stack. CLAMP_TO_EDGE on the sampler keeps
-// geometry running past the viewport from growing a false outline at the
-// screen border.
-const char* kCompositeFragmentShaderSrc =
-    "#version 300 es\n"
-    "precision highp float;\n"
-    "uniform sampler2D u_mask;\n"
-    "uniform vec4 u_fillColor;\n"
-    "uniform vec4 u_frameColor;\n"
-    "uniform float u_patternType;\n"
-    "uniform float u_hatchAngle;\n"
-    "uniform float u_hatchSpacing;\n"
-    "uniform float u_hatchWidth;\n"
-    "uniform float u_showFill;\n"
-    "uniform int u_maskScale;\n"
-    "out vec4 fragColor;\n"
-    "float lineMask(float coord, float spacing, float halfWidth, float deriv) {\n"
-    "    float t = mod(coord, spacing);\n"
-    "    float d = min(t, spacing - t);\n"
-    "    float aa = deriv * 0.5 + 0.001;\n"
-    "    return 1.0 - smoothstep(halfWidth - aa, halfWidth + aa, d);\n"
-    "}\n"
-    "void main() {\n"
-    // uv of this canvas pixel's center in the (canvas * scale)-sized mask;
-    // pixelUv is one canvas pixel expressed in uv units.
-    "    vec2 texSize = vec2(textureSize(u_mask, 0));\n"
-    "    vec2 pixelUv = float(u_maskScale) / texSize;\n"
-    "    vec2 uv = gl_FragCoord.xy * pixelUv;\n"
-    // Bilinear center tap: at scale 2 the pixel center sits exactly between
-    // its 2x2 mask block, so this single tap IS the block average -- the
-    // pixel's fractional coverage.
-    "    float coverage = texture(u_mask, uv).r;\n"
-    "    if (coverage <= 0.0) discard;\n"
-    // Border weight: lowest bilinear tap in a 1-canvas-pixel ring. Every tap
-    // is itself an interpolated (continuous) value, so the ramp moves
-    // smoothly with the true edge instead of snapping at texel boundaries.
-    // 1.4 sharpens it so the outline reads as a line rather than a soft glow.
-    "    float inner = coverage;\n"
-    "    for (int dy = -1; dy <= 1; dy++) {\n"
-    "        for (int dx = -1; dx <= 1; dx++) {\n"
-    "            if (dx == 0 && dy == 0) continue;\n"
-    "            inner = min(inner, texture(u_mask, uv + vec2(dx, dy) * pixelUv).r);\n"
-    "        }\n"
-    "    }\n"
-    "    float border = min(1.0, (1.0 - inner) * 1.4);\n"
-    "    float fillAlpha = 0.0;\n"
-    "    if (u_showFill > 0.5) {\n"
-    "        float c = cos(u_hatchAngle);\n"
-    "        float s2 = sin(u_hatchAngle);\n"
-    "        vec2 p = gl_FragCoord.xy;\n"
-    "        float u = p.x * c + p.y * s2;\n"
-    "        float v = -p.x * s2 + p.y * c;\n"
-    // d(u)/d(pixel) is exactly (|c|, |s2|); fwidth would sum those, so pass
-    // |c|+|s2| (same for v by symmetry) and 1.0 for the axis-aligned grid.
-    "        float duv = abs(c) + abs(s2);\n"
-    "        int patternType = int(u_patternType + 0.5);\n"
-    "        float mask;\n"
-    "        if (patternType == 0) {\n"
-    "            mask = lineMask(u, u_hatchSpacing, u_hatchWidth, duv);\n"
-    "        } else if (patternType == 1) {\n"
-    "            mask = max(lineMask(u, u_hatchSpacing, u_hatchWidth, duv), lineMask(v, u_hatchSpacing, u_hatchWidth, duv));\n"
-    "        } else if (patternType == 2) {\n"
-    "            float du = mod(u, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
-    "            float dv = mod(v, u_hatchSpacing) - u_hatchSpacing * 0.5;\n"
-    "            float dist = length(vec2(du, dv));\n"
-    "            float aa = 1.0 + 0.001;\n"  // fwidth(dist) <= sqrt(2); 1.0 is close enough
-    "            float dotRadius = u_hatchWidth * 1.7;\n"
-    "            mask = 1.0 - smoothstep(dotRadius - aa, dotRadius + aa, dist);\n"
-    "        } else {\n"
-    "            mask = max(lineMask(p.x, u_hatchSpacing, u_hatchWidth, 1.0), lineMask(p.y, u_hatchSpacing, u_hatchWidth, 1.0));\n"
-    "        }\n"
-    "        fillAlpha = min(u_fillColor.a * 1.4, 0.7) * mask;\n"
-    "    }\n"
-    // Frame-over-fill compositing by border weight, then the whole result
-    // fades by the pixel's own coverage at the outer silhouette.
-    "    float frameAlpha = u_frameColor.a * border;\n"
-    "    float outAlpha = frameAlpha + fillAlpha * (1.0 - frameAlpha);\n"
-    "    float finalAlpha = outAlpha * coverage;\n"
-    "    if (finalAlpha < 0.002) discard;\n"
-    "    vec3 rgb = (u_frameColor.rgb * frameAlpha + u_fillColor.rgb * fillAlpha * (1.0 - frameAlpha)) / max(outAlpha, 0.0001);\n"
-    "    fragColor = vec4(rgb, finalAlpha);\n"
-    "}";
-
-// Background reference grid (see draw_grid), drawn as a fullscreen pass over
-// the cleared canvas before any geometry. Reuses kCompositeVertexShaderSrc's
-// attribute-free fullscreen triangle.
-//
-// Two decade levels are drawn at once so the grid can level-of-detail with
-// zoom without the pitch ever popping: level 0 is the finer decade (its
-// on-screen pitch runs from kGridTargetPx down to a tenth of that as you zoom
-// out) and level 1 is ten times coarser. Level 0's alpha fades to zero exactly
-// as its pitch approaches the too-dense end, so at the moment the CPU-side
-// decade counter ticks over -- level 0 becoming what level 1 was -- nothing
-// visible changes: the level that leaves the pair had already faded out, and
-// the new coarse level's lines are a subset of the existing ones at the same
-// alpha. Both levels therefore use one alpha ceiling; a brighter "major" level
-// would make that new level pop into view on every decade crossing.
-//
-// Lines are positioned in world space (unlike the layer hatch patterns, which
-// are deliberately screen-space) -- the whole point is for a grid square to
-// mean a fixed distance on the layout. Coordinates come in pre-reduced modulo
-// each level's pitch (u_panMod) because a full-chip pan offset divided by a
-// nanometre-scale pitch overflows highp float's 24-bit mantissa and the grid
-// visibly tears; the reduction happens on the CPU in double precision. Line
-// width and anti-aliasing are exact in pixels -- the distance to the nearest
-// line is linear in gl_FragCoord, so no fwidth() is needed.
-const char* kGridFragmentShaderSrc =
-    "#version 300 es\n"
-    "precision highp float;\n"
-    "uniform vec2 u_resolution;\n"
-    "uniform float u_zoom;\n"
-    "uniform vec2 u_panMod[2];\n"
-    "uniform float u_spacing[2];\n"
-    "uniform float u_levelAlpha[2];\n"
-    "uniform vec4 u_color;\n"
-    "uniform float u_halfWidthPx;\n"
-    "out vec4 fragColor;\n"
-    // Pixel distance from this fragment to the nearest line of a grid with the
-    // given world-space pitch, turned into an anti-aliased 1-pixel-ish line.
-    "float gridMask(vec2 rel, float spacing) {\n"
-    "    vec2 t = abs(fract(rel / spacing + 0.5) - 0.5) * (spacing * u_zoom);\n"
-    "    float d = min(t.x, t.y);\n"
-    "    return 1.0 - smoothstep(u_halfWidthPx, u_halfWidthPx + 1.0, d);\n"
-    "}\n"
-    "void main() {\n"
-    // Pixels from the canvas center; gl_FragCoord.y is bottom-up, matching
-    // world +y (see screen_to_world's inverse of the same transform).
-    "    vec2 p = gl_FragCoord.xy - u_resolution * 0.5;\n"
-    "    float a = 0.0;\n"
-    "    for (int i = 0; i < 2; i++) {\n"
-    "        a = max(a, gridMask(u_panMod[i] + p / u_zoom, u_spacing[i]) * u_levelAlpha[i]);\n"
-    "    }\n"
-    "    if (a <= 0.0) discard;\n"
-    "    fragColor = vec4(u_color.rgb, u_color.a * a);\n"
-    "}";
-
-// Label ("text") rendering: GDSII TEXT / OASIS TEXT elements draw as stroked
-// glyphs at a constant on-screen size (see kGlyphStrokes / rebuild_text_buffer),
-// so a_position is the label's world-space origin and a_offset is the glyph
-// vertex's offset from it in *pixels* -- the offset is added after the camera
-// zoom, which is what keeps the text the same size at every zoom level. That
-// also means the vertex data itself never depends on the camera, so panning
-// only re-picks which labels are in view, never re-shapes a glyph.
-const char* kTextVertexShaderSrc =
-    "#version 300 es\n"
-    "in vec2 a_position;\n"
-    "in vec2 a_offset;\n"
-    "uniform vec2 u_resolution;\n"
-    "uniform vec2 u_offset;\n"
-    "uniform float u_zoom;\n"
-    "void main() {\n"
-    "    vec2 screenPos = (a_position - u_offset) * u_zoom + a_offset;\n"
-    "    vec2 clipSpace = (screenPos / u_resolution) * 2.0;\n"
-    "    gl_Position = vec4(clipSpace.x, clipSpace.y, 0.0, 1.0);\n"
-    "}";
-
-const char* kTextFragmentShaderSrc =
-    "#version 300 es\n"
-    "precision mediump float;\n"
-    "uniform vec4 u_color;\n"
-    "out vec4 fragColor;\n"
-    "void main() { fragColor = u_color; }";
 
 struct PolygonRange {
     GLint first;
@@ -631,6 +349,42 @@ float g_measure_x0 = 0.0f, g_measure_y0 = 0.0f;
 float g_measure_x1 = 0.0f, g_measure_y1 = 0.0f;
 GLuint g_measure_vbo = 0;
 
+// Selected-cell highlight: the world-space boxes of whichever row the hierarchy
+// panel has selected (see setCellHighlight / draw_cell_highlight), drawn as
+// dashed outlines over the geometry. Clicking a row already frames that cell, but
+// framing only answers "which shapes are it" while the camera stays put -- zoom
+// out to see the cell in context and the answer is gone. The outlines are what
+// survive panning and zooming away, which is what makes the tree readable
+// *against* the layout rather than instead of it. Dashed because a solid
+// rectangle at a layer's line weight is indistinguishable from a drawn shape --
+// nothing in a layout file is dashed, so the dashes read as the viewer's own
+// annotation rather than as something in the design.
+//
+// A list rather than one box because a row stands for every placement of a cell
+// by one parent: a cell placed 40 times gets 40 outlines, one per copy, since a
+// single box around all of them is a box around mostly other cells' geometry.
+// Flat, 4 floats (minX, minY, maxX, maxY) per box.
+std::vector<float> g_highlight_boxes;
+GLuint g_highlight_vbo = 0;
+
+// The outline's half-thickness, its dash and gap lengths, and the smallest box
+// it is drawn around -- all in pixels, so it keeps the same weight and dash
+// rhythm at every zoom (which is half of what stops it reading as geometry, the
+// other half being that it's dashed at all), and a cell far smaller than its
+// own outline still shows up as a mark you can aim the view at.
+constexpr float kHighlightRingPx = 1.5f;
+constexpr float kHighlightDashPx = 7.0f;
+constexpr float kHighlightGapPx = 5.0f;
+constexpr float kHighlightMinPx = 20.0f;
+
+// Backstop on one frame's worth of outline vertices (floats). A selection can
+// hold up to kMaxRowPlacements boxes, and a pathological one -- a thousand
+// placements each larger than the viewport -- would otherwise rebuild a
+// multi-megabyte buffer on every pan frame. Boxes past the ceiling are dropped
+// for that frame; reaching it at all means the outlines are already a solid mat
+// of dashes, where the thousandth box changes nothing anyone can see.
+constexpr size_t kMaxHighlightVerts = 240000;
+
 bool g_frame_requested = false;
 
 // Toggles the hatched polygon fill (the "infill") on/off for every layer at
@@ -671,6 +425,11 @@ bool g_show_grid = true;
 bool g_light_theme = false;
 std::array<float, 3> g_bg_color = {0.06f, 0.06f, 0.07f};
 std::array<float, 3> g_ink_color = {1.0f, 1.0f, 1.0f};
+// The selected cell's ring. Its own color rather than the ink: red is the
+// marker overlay's and ink is the ruler's, and a highlight that reused either
+// would read as one of those. The two values are the --accent token from
+// viewer.html, so the ring and the selected row in the panel are the same blue.
+std::array<float, 3> g_highlight_color = {0.29f, 0.62f, 1.0f};
 
 // Text GL state. One VBO holds every on-screen label's glyph segments as
 // GL_LINES, grouped into one range per layer so each range can be drawn in the
@@ -761,236 +520,6 @@ float g_marker_tick_zoom = -1.0f;
 
 bool markers_present() { return !g_markers.item_category.empty(); }
 
-// ---- Stroke font ------------------------------------------------------------
-// A vector (line-segment) font rather than a texture atlas: the glyphs are
-// drawn with the same GL_LINES machinery every other overlay in this file
-// uses, so there is no font texture to build, no atlas to pack, and nothing
-// to re-rasterize when the pixel size changes. It is also what CAD viewers
-// traditionally use for layout labels, so the result looks the part.
-//
-// One entry per printable ASCII code point, 0x20 (space) through 0x7E (~), in
-// order, followed by one fallback glyph (a hollow box) used for every other
-// byte -- GDSII/OASIS label text is a byte string with no declared encoding,
-// so anything outside printable ASCII (including the individual bytes of a
-// UTF-8 sequence) draws as that box instead of being guessed at.
-//
-// Each glyph is a set of polylines on an integer grid, written as two-digit
-// "xy" points separated by spaces, with '/' between polylines. x runs 0..4
-// left to right. y runs 0..9 bottom to top with the baseline at 2, the
-// x-height at 7 and the cap height at 9 -- so descenders reach y=0 and
-// ascenders y=9.
-const char* const kGlyphStrokes[] = {
-    "",                                                     // (space)
-    "29 24/22 23",                                          // !
-    "19 17/39 37",                                          // "
-    "17 47/15 45/19 12/39 32",                              // #
-    "48 39 19 08 07 16 35 44 43 32 12 03/21 29",            // $
-    "09 19 18 08 09/32 42 43 33 32/02 49",                  // %
-    "42 17 18 29 38 37 04 03 12 22 44",                     // &
-    "29 27",                                                // '
-    "39 17 14 32",                                          // (
-    "19 37 34 12",                                          // )
-    "28 24/07 45/47 05",                                    // *
-    "05 45/27 23",                                          // +
-    "22 21 10",                                             // ,
-    "05 45",                                                // -
-    "22 23",                                                // .
-    "02 49",                                                // /
-    "12 32 43 48 39 19 08 03 12",                           // 0
-    "08 29 22/02 42",                                       // 1
-    "08 19 39 48 47 02 42",                                 // 2
-    "08 19 39 48 47 36 45 43 32 12 03",                     // 3
-    "39 04 44/32 39",                                       // 4
-    "49 09 06 36 45 43 32 12 03",                           // 5
-    "48 39 19 08 03 12 32 43 44 35 15 04",                  // 6
-    "09 49 12",                                             // 7
-    "12 32 43 44 35 15 04 03 12/15 35 46 48 39 19 08 06 15",// 8
-    "03 12 32 43 48 39 19 08 07 16 36 47",                  // 9
-    "26 27/22 23",                                          // :
-    "26 27/22 21 10",                                       // ;
-    "48 05 42",                                             // <
-    "06 46/04 44",                                          // =
-    "08 45 02",                                             // >
-    "08 19 39 48 47 25 24/22 23",                           // ?
-    "43 12 03 08 19 39 48 45 34 24 26 36",                  // @
-    "02 29 42/15 35",                                       // A
-    "09 02/09 39 48 47 36 06/36 45 43 32 02",               // B
-    "48 39 19 08 03 12 32 43",                              // C
-    "09 02/09 39 48 43 32 02",                              // D
-    "49 09 02 42/06 36",                                    // E
-    "49 09 02/06 36",                                       // F
-    "48 39 19 08 03 12 32 43 45 25",                        // G
-    "09 02/49 42/06 46",                                    // H
-    "09 49/29 22/02 42",                                    // I
-    "39 33 22 12 03",                                       // J
-    "09 02/49 05 42",                                       // K
-    "09 02 42",                                             // L
-    "02 09 25 49 42",                                       // M
-    "02 09 42 49",                                          // N
-    "12 32 43 48 39 19 08 03 12",                           // O
-    "02 09 39 48 46 35 05",                                 // P
-    "12 32 43 48 39 19 08 03 12/23 42",                     // Q
-    "02 09 39 48 46 35 05/25 42",                           // R
-    "48 39 19 08 07 16 35 44 43 32 12 03",                  // S
-    "09 49/29 22",                                          // T
-    "09 03 12 32 43 49",                                    // U
-    "09 22 49",                                             // V
-    "09 02 26 42 49",                                       // W
-    "09 42/02 49",                                          // X
-    "09 26 49/26 22",                                       // Y
-    "09 49 02 42",                                          // Z
-    "39 29 22 32",                                          // [
-    "09 42",                                                // (backslash)
-    "19 29 22 12",                                          // ]
-    "07 29 47",                                             // ^
-    "01 41",                                                // _
-    "19 27",                                                // `
-    "06 17 37 46 42/43 32 12 03 14 44",                     // a
-    "09 02/06 17 37 46 43 32 12 03",                        // b
-    "46 37 17 06 03 12 32 43",                              // c
-    "49 42/46 37 17 06 03 12 32 43",                        // d
-    "04 44 46 37 17 06 03 12 32 43",                        // e
-    "22 28 39 49/16 36",                                    // f
-    "46 37 17 06 03 12 32 43/47 41 30 10 01",               // g
-    "09 02/05 17 37 46 42",                                 // h
-    "27 22/28 29",                                          // i
-    "37 31 20 10 01/38 39",                                 // j
-    "09 02/37 04 32",                                       // k
-    "19 29 22 32",                                          // l
-    "07 02/06 17 26 22/26 37 46 42",                        // m
-    "07 02/06 17 37 46 42",                                 // n
-    "12 32 43 46 37 17 06 03 12",                           // o
-    "07 00/06 17 37 46 43 32 12 03",                        // p
-    "47 40/46 37 17 06 03 12 32 43",                        // q
-    "07 02/06 17 37",                                       // r
-    "46 37 17 06 15 34 43 32 12 03",                        // s
-    "19 13 22 32/07 27",                                    // t
-    "07 03 12 32 43 47/47 42",                              // u
-    "07 22 47",                                             // v
-    "07 02 25 42 47",                                       // w
-    "07 42/02 47",                                          // x
-    "07 03 12 32 43 47/47 41 30 10",                        // y
-    "07 47 02 42",                                          // z
-    "39 28 26 15 24 22 32",                                 // {
-    "29 21",                                                // |
-    "19 28 26 35 24 22 12",                                 // }
-    "05 16 36 45",                                          // ~
-    "02 42 47 07 02",                                       // fallback (any other byte)
-};
-constexpr int kGlyphCount = (int)(sizeof(kGlyphStrokes) / sizeof(kGlyphStrokes[0]));
-
-// Grid metrics (see kGlyphStrokes): the cap height spans y=2..9, and each
-// glyph advances 6 units -- 4 units of drawn width plus 2 of side bearing.
-constexpr float kGlyphBaselineUnits = 2.0f;
-constexpr float kGlyphCapUnits = 7.0f;
-constexpr float kGlyphWidthUnits = 4.0f;
-constexpr float kGlyphAdvanceUnits = 6.0f;
-
-// On-screen cap height of a label, in CSS pixels. Everything else about the
-// text scales off this.
-constexpr float kTextCapHeightPx = 11.0f;
-constexpr float kTextUnitPx = kTextCapHeightPx / kGlyphCapUnits;
-
-// kGlyphStrokes decoded once into flat line segments (x0,y0,x1,y1 per
-// segment, in grid units) so building a label is a scale-and-offset copy
-// rather than a string parse -- the buffer is rebuilt on every pan, so this
-// runs a lot.
-const std::vector<std::vector<float>>& glyph_segments() {
-    static const std::vector<std::vector<float>> table = [] {
-        std::vector<std::vector<float>> glyphs;
-        glyphs.reserve(kGlyphCount);
-        for (int g = 0; g < kGlyphCount; g++) {
-            std::vector<float> segments;
-            float prev_x = 0.0f, prev_y = 0.0f;
-            bool have_prev = false;
-            for (const char* p = kGlyphStrokes[g]; *p; p++) {
-                if (*p == '/' || *p == ' ') {
-                    // '/' starts a new polyline; ' ' just separates points.
-                    if (*p == '/') have_prev = false;
-                    continue;
-                }
-                // Two digits, "xy". Anything else in the table is a typo, so
-                // stop rather than read past the end of the string.
-                if (p[1] < '0' || p[1] > '9') break;
-                float x = (float)(p[0] - '0');
-                float y = (float)(p[1] - '0');
-                p++;
-                if (have_prev) {
-                    segments.push_back(prev_x);
-                    segments.push_back(prev_y);
-                    segments.push_back(x);
-                    segments.push_back(y);
-                }
-                prev_x = x;
-                prev_y = y;
-                have_prev = true;
-            }
-            glyphs.push_back(std::move(segments));
-        }
-        return glyphs;
-    }();
-    return table;
-}
-
-// Width of `text` as drawn, in pixels: full advances between characters plus
-// one glyph's drawn width for the last one (the trailing side bearing isn't
-// part of the visible box, and including it would bias every centered label
-// half a space to the left).
-float text_width_px(const std::string& text) {
-    if (text.empty()) return 0.0f;
-    return ((float)(text.size() - 1) * kGlyphAdvanceUnits + kGlyphWidthUnits) * kTextUnitPx;
-}
-
-// Appends `text` to `out` as GL_LINES vertices -- 4 floats each: the label's
-// world origin (identical for every vertex of the label, so the camera places
-// the whole label as a unit) followed by that vertex's pixel offset from the
-// origin. `anchor` is gdstk's Anchor enum: bits 2-3 pick the vertical edge the
-// origin sits on (0 = top, 1 = middle, 2 = baseline) and bits 0-1 the
-// horizontal one (0 = left, 1 = center, 2 = right).
-//
-// The label is always drawn horizontally, ignoring any rotation/magnification
-// on the label itself or in the references above it: at a fixed pixel size,
-// inheriting the placement's transform would give upside-down and mirrored
-// (unreadable) text for the many cells that are placed that way, which is not
-// what a label is for.
-void append_text_vertices(const std::string& text, float world_x, float world_y, uint8_t anchor,
-                          std::vector<float>& out) {
-    const std::vector<std::vector<float>>& glyphs = glyph_segments();
-
-    float origin_x = 0.0f;
-    switch (anchor & 3) {
-        case 0: origin_x = 0.0f; break;                          // W (left)
-        case 1: origin_x = -text_width_px(text) * 0.5f; break;    // center
-        default: origin_x = -text_width_px(text); break;          // E (right)
-    }
-    float origin_y = 0.0f;
-    switch ((anchor >> 2) & 3) {
-        case 0: origin_y = -kTextCapHeightPx; break;         // N (top edge at origin)
-        case 1: origin_y = -kTextCapHeightPx * 0.5f; break;  // middle
-        default: origin_y = 0.0f; break;                     // S (baseline at origin)
-    }
-    // Grid y is measured from y=0, not the baseline -- shift so that the
-    // baseline lands on origin_y.
-    origin_y -= kGlyphBaselineUnits * kTextUnitPx;
-
-    for (size_t i = 0; i < text.size(); i++) {
-        unsigned char c = (unsigned char)text[i];
-        int index = (c >= 0x20 && c <= 0x7E) ? (int)c - 0x20 : kGlyphCount - 1;
-        const std::vector<float>& segments = glyphs[(size_t)index];
-        float pen_x = origin_x + (float)i * kGlyphAdvanceUnits * kTextUnitPx;
-        for (size_t s = 0; s + 3 < segments.size(); s += 4) {
-            out.push_back(world_x);
-            out.push_back(world_y);
-            out.push_back(pen_x + segments[s] * kTextUnitPx);
-            out.push_back(origin_y + segments[s + 1] * kTextUnitPx);
-            out.push_back(world_x);
-            out.push_back(world_y);
-            out.push_back(pen_x + segments[s + 2] * kTextUnitPx);
-            out.push_back(origin_y + segments[s + 3] * kTextUnitPx);
-        }
-    }
-}
-
 GLuint compile_shader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
@@ -1045,7 +574,7 @@ bool init_gl() {
     if (ctx <= 0) return false;
     if (emscripten_webgl_make_context_current(ctx) != EMSCRIPTEN_RESULT_SUCCESS) return false;
 
-    g_program = link_program(kVertexShaderSrc, kFragmentShaderSrc);
+    g_program = link_program(shaders::kVertexShaderSrc, shaders::kFragmentShaderSrc);
 
     g_loc_position = kAttrPosition;
     g_loc_i_col0 = kAttrICol0;
@@ -1076,7 +605,7 @@ bool init_gl() {
     // Label overlay program (see draw_text). Same camera uniforms as the layer
     // program plus the per-vertex pixel offset that keeps glyphs a constant
     // on-screen size.
-    g_text_program = link_program(kTextVertexShaderSrc, kTextFragmentShaderSrc);
+    g_text_program = link_program(shaders::kTextVertexShaderSrc, shaders::kTextFragmentShaderSrc);
     g_text_loc_resolution = glGetUniformLocation(g_text_program, "u_resolution");
     g_text_loc_offset = glGetUniformLocation(g_text_program, "u_offset");
     g_text_loc_zoom = glGetUniformLocation(g_text_program, "u_zoom");
@@ -1084,12 +613,12 @@ bool init_gl() {
 
     // Merge mode's two extra programs (see draw_layer_merged). The composite
     // program's sampler is bound to texture unit 0 once here.
-    g_mask_program = link_program(kVertexShaderSrc, kMaskFragmentShaderSrc);
+    g_mask_program = link_program(shaders::kVertexShaderSrc, shaders::kMaskFragmentShaderSrc);
     g_mask_loc_resolution = glGetUniformLocation(g_mask_program, "u_resolution");
     g_mask_loc_offset = glGetUniformLocation(g_mask_program, "u_offset");
     g_mask_loc_zoom = glGetUniformLocation(g_mask_program, "u_zoom");
 
-    g_comp_program = link_program(kCompositeVertexShaderSrc, kCompositeFragmentShaderSrc);
+    g_comp_program = link_program(shaders::kCompositeVertexShaderSrc, shaders::kCompositeFragmentShaderSrc);
     g_comp_loc_fill_color = glGetUniformLocation(g_comp_program, "u_fillColor");
     g_comp_loc_frame_color = glGetUniformLocation(g_comp_program, "u_frameColor");
     g_comp_loc_pattern_type = glGetUniformLocation(g_comp_program, "u_patternType");
@@ -1104,7 +633,7 @@ bool init_gl() {
     // Background grid (see draw_grid) -- shares the composite pass's
     // attribute-free fullscreen triangle. Array uniforms are queried by their
     // first element, which is the location the whole array is set through.
-    g_grid_program = link_program(kCompositeVertexShaderSrc, kGridFragmentShaderSrc);
+    g_grid_program = link_program(shaders::kCompositeVertexShaderSrc, shaders::kGridFragmentShaderSrc);
     g_grid_loc_resolution = glGetUniformLocation(g_grid_program, "u_resolution");
     g_grid_loc_zoom = glGetUniformLocation(g_grid_program, "u_zoom");
     g_grid_loc_pan_mod = glGetUniformLocation(g_grid_program, "u_panMod[0]");
@@ -1814,7 +1343,7 @@ void rebuild_text_buffer() {
             if (g_labels_drawn >= kMaxLabelsPerFrame) break;
             if (label.x < region.min_x - pad || label.x > region.max_x + pad) continue;
             if (label.y < region.min_y - pad || label.y > region.max_y + pad) continue;
-            append_text_vertices(label.text, label.x, label.y, label.anchor, vertices);
+            stroke_font::append_text_vertices(label.text, label.x, label.y, label.anchor, vertices);
             g_labels_drawn++;
         }
         GLsizei count = (GLsizei)(vertices.size() / 4) - first;
@@ -2055,6 +1584,121 @@ void draw_layer_merged(const LayerBuffer& layer) {
     glUseProgram(g_program);
 }
 
+// Draws the selected cell's outlines: one dashed rectangle per box in
+// g_highlight_boxes, built as screen-thickness quads. Both properties are there
+// to keep them from reading as part of the layout -- a solid thin rectangle is
+// exactly what a drawn shape looks like, whereas nothing in a GDSII/OASIS file
+// comes out dashed, so the dashes alone say "this is the viewer talking". The
+// thickness doesn't depend on glLineWidth (WebGL is free to ignore any width but
+// 1) and neither it nor the dash pitch depends on the zoom, so an outline keeps
+// the same weight and rhythm at every scale rather than turning into geometry
+// the closer you get.
+//
+// Like draw_measure_line it reuses the layer shader with u_useHatch=0 and
+// re-uploads its vertices every frame: they're a function of the camera, and
+// off-screen boxes and their dashes are skipped before they cost anything, so
+// what's built is bounded by the viewport rather than by the selection.
+void draw_cell_highlight() {
+    if (g_highlight_boxes.empty()) return;
+
+    float t = kHighlightRingPx / g_zoom;  // half-thickness
+    float dash = kHighlightDashPx / g_zoom;
+    float period = (kHighlightDashPx + kHighlightGapPx) / g_zoom;
+    float min_world = kHighlightMinPx / g_zoom;
+
+    // Clipping to the view is what bounds the work: zoomed into one corner of a
+    // die-sized cell, a side is millions of pixels long, and every dash but the
+    // handful on screen would be built only to fall outside the viewport.
+    // Clipped, the dashes along one side can't outnumber the canvas's own size
+    // in dashes -- and a selection's boxes that are off screen entirely (the
+    // other 39 copies of a cell, while you look at one) cost four comparisons.
+    //
+    // The rect is computed here rather than taken from current_view_rect()
+    // because that one pads by a *world* distance (it exists for the hatch
+    // patterns), which at a high zoom is an arbitrarily large number of pixels
+    // -- and it's precisely a pixel-sized viewport that bounds the dash count.
+    // Two dash periods of pad keeps a dash straddling the edge from popping.
+    float half_w = (float)g_canvas_width * 0.5f / g_zoom + 2.0f * period;
+    float half_h = (float)g_canvas_height * 0.5f / g_zoom + 2.0f * period;
+    const ViewRect view = {g_pan_x - half_w, g_pan_x + half_w, g_pan_y - half_h, g_pan_y + half_h};
+
+    std::vector<float> verts;
+    auto quad = [&verts](float x0, float y0, float x1, float y1) {
+        const float v[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+        verts.insert(verts.end(), v, v + 12);
+    };
+
+    // One side of one box, as dashes along [lo, hi] of one axis. The dash grid
+    // is anchored at `lo` -- the side's true start, not the clipped one -- so
+    // panning moves the dashes with the geometry instead of sliding them along
+    // the edge.
+    auto dashed_side = [&](bool horizontal, float lo, float hi, float a, float b) {
+        // Wholly off-screen across its short axis: nothing to walk at all.
+        if (horizontal) {
+            if (b < view.min_y || a > view.max_y) return;
+        } else {
+            if (b < view.min_x || a > view.max_x) return;
+        }
+        float clip_lo = std::max(lo, horizontal ? view.min_x : view.min_y);
+        float clip_hi = std::min(hi, horizontal ? view.max_x : view.max_y);
+        if (clip_hi <= clip_lo) return;
+        // Dashes are laid on a fixed grid from `lo`; start at the last one that
+        // can still reach clip_lo.
+        double first = std::floor((double)(clip_lo - lo) / (double)period);
+        for (double k = first;; k += 1.0) {
+            float start = lo + (float)(k * (double)period);
+            if (start > clip_hi) break;
+            float end = std::min(start + dash, hi);
+            if (end <= clip_lo) continue;
+            if (end <= start) continue;
+            if (horizontal) quad(std::max(start, clip_lo), a, end, b);
+            else quad(a, std::max(start, clip_lo), b, end);
+        }
+    };
+
+    for (size_t i = 0; i + 3 < g_highlight_boxes.size(); i += 4) {
+        if (verts.size() >= kMaxHighlightVerts) break;
+        float min_x = g_highlight_boxes[i], min_y = g_highlight_boxes[i + 1];
+        float max_x = g_highlight_boxes[i + 2], max_y = g_highlight_boxes[i + 3];
+
+        // Grow anything smaller than kHighlightMinPx on screen (a small cell
+        // seen from across the die, or a zero-area one) about its own center, so
+        // the outline is always drawn around a box thicker than the outline
+        // itself and long enough on each side to show as more than one dash.
+        float grow_x = (min_world - (max_x - min_x)) * 0.5f;
+        if (grow_x > 0.0f) {
+            min_x -= grow_x;
+            max_x += grow_x;
+        }
+        float grow_y = (min_world - (max_y - min_y)) * 0.5f;
+        if (grow_y > 0.0f) {
+            min_y -= grow_y;
+            max_y += grow_y;
+        }
+
+        // Outer/inner edges of the outline, straddling the box's boundary. The
+        // horizontal sides run the full outer width so the corners are solid;
+        // the vertical ones then only cover what's left between them.
+        float ox0 = min_x - t, ox1 = max_x + t, oy0 = min_y - t, oy1 = max_y + t;
+        float ix0 = min_x + t, ix1 = max_x - t, iy0 = min_y + t, iy1 = max_y - t;
+        dashed_side(true, ox0, ox1, oy0, iy0);   // bottom
+        dashed_side(true, ox0, ox1, iy1, oy1);   // top
+        dashed_side(false, iy0, iy1, ox0, ix0);  // left
+        dashed_side(false, iy0, iy1, ix1, ox1);  // right
+    }
+    if (verts.empty()) return;  // every box is off screen
+
+    if (!g_highlight_vbo) glGenBuffers(1, &g_highlight_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_highlight_vbo);
+    buffer_data_tracked(GL_ARRAY_BUFFER, g_highlight_vbo, (GLsizeiptr)(verts.size() * sizeof(float)),
+                        verts.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(g_loc_position);
+    glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glUniform4f(g_loc_color, g_highlight_color[0], g_highlight_color[1], g_highlight_color[2], 0.95f);
+    glUniform1f(g_loc_use_hatch, 0.0f);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(verts.size() / 2));
+}
+
 bool draw_frame(double time, void* /*userData*/) {
     g_frame_requested = false;
     // `time` is the rAF timestamp (ms); the delta between consecutive frames
@@ -2182,6 +1826,9 @@ bool draw_frame(double time, void* /*userData*/) {
     }
     draw_text();
     draw_markers();
+    // Over the geometry and the marker overlay (it's an answer to a question
+    // about the layout, so it can't be buried by it), under the ruler.
+    draw_cell_highlight();
     draw_measure_line();
     update_measure_label();
     update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size());
@@ -2255,6 +1902,11 @@ void clear_layers() {
         }
     }
     g_layers.clear();
+    // The outlines point at cells in the geometry that's going away. viewer.js
+    // re-selects the same row after a reload (renderHierarchy) and so puts them
+    // back; dropping them here is what stops a *different* file inheriting
+    // rectangles drawn around nothing.
+    g_highlight_boxes.clear();
     // The label ranges index into g_layers -- they can't outlive it.
     g_text_ranges.clear();
     g_total_labels = 0;
@@ -2616,6 +2268,23 @@ constexpr size_t kMaxHierarchyCells = 50000;
 // acyclic depth before the stack does.
 constexpr int kMaxHierarchyDepth = 256;
 
+// How many individual placements one tree row carries transforms for, so the
+// viewer can outline each copy of a selected cell separately rather than
+// drawing one box around the lot (see setCellHighlight). Past this the row
+// carries none and falls back to the single spanning box: 40,000 dashed
+// rectangles is not a picture of anything, and an *arbitrary 1,024 of them*
+// would be a lie -- it would look like the cell is only in the part of the
+// array we happened to keep.
+constexpr uint64_t kMaxRowPlacements = 1024;
+
+// ...and a library-wide ceiling on the same thing, since the per-row cap alone
+// says nothing about how many rows there are. A generated library can hold tens
+// of thousands of cells each placing several others hundreds of times, and this
+// is per-placement data -- the one part of the tree that isn't bounded by the
+// cell count. Rows built after the budget runs out fall back to the spanning
+// box exactly as an over-cap row does.
+constexpr uint64_t kMaxHierarchyPlacements = 200000;
+
 // min > max means "nothing in it", the same sentinel parseGdsToLayers uses for
 // the design bbox: an empty cell is a real thing in a layout (a placeholder,
 // or one holding only references to empty cells) and has no box to frame.
@@ -2773,16 +2442,34 @@ HierBox cell_box(Cell* cell, std::unordered_map<Cell*, HierBox>& memo, std::unor
 // One row of the tree's child list: every reference from a parent cell to the
 // same target collapsed into a single entry. That's what keeps this a *cell*
 // tree -- a memory cell placed 40k times is one row saying "×40000", not 40k
-// rows -- and it means the entry needs two boxes' worth of information: `box`
-// spans all those placements (what clicking the row frames), while `first` is
+// rows -- and it means the entry needs several boxes' worth of information:
+// `box` spans all those placements (what clicking the row frames), `first` is
 // the transform of the first one alone (what a deeper node composes onto, so
-// expanding a repeated cell follows one copy of it).
+// expanding a repeated cell follows one copy of it), and `placements` holds
+// every placement's transform (6 doubles each, laid out like Affine2D) so the
+// viewer can outline the copies one by one instead of drawing a box around all
+// of them. Over kMaxRowPlacements copies -- or once the library-wide budget is
+// spent -- `placements` is emptied and `capped` set: half an array's worth of
+// outlines would misrepresent where the cell actually is, so the row goes back
+// to the single spanning box.
 struct HierChild {
     double count = 0;
     HierBox box;
     Affine2D first;
     bool have_first = false;
+    std::vector<double> placements;
+    bool capped = false;
 };
+
+// Placement transforms go over as a Float64Array rather than a plain array of
+// objects: it's one bulk copy instead of thousands of JS property writes, and
+// float32 would quantize a translation on a full-reticle coordinate (~1e5 µm)
+// to about 10nm, which is visible as a nudged outline on a small cell.
+val to_float64_array(const std::vector<double>& data) {
+    val array = val::global("Float64Array").new_(data.size());
+    array.call<void>("set", typed_memory_view(data.size(), data.data()));
+    return array;
+}
 
 val hier_xform_to_val(const Affine2D& t) {
     val out = val::array();
@@ -2828,6 +2515,10 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
     }
     report_progress("hierarchy", lib.cell_array.count, lib.cell_array.count);
 
+    // Library-wide placement-transform budget, spent by the rows below in the
+    // order the cells appear in the file (see kMaxHierarchyPlacements).
+    uint64_t placements_left = kMaxHierarchyPlacements;
+
     val cells = val::array();
     for (uint64_t i = 0; i < lib.cell_array.count; i++) {
         Cell* cell = lib.cell_array[i];
@@ -2852,7 +2543,8 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
                 found = children.emplace(ref->cell, HierChild{}).first;
             }
             HierChild& child = found->second;
-            child.count += rep_count > 0 ? (double)rep_count : 1.0;
+            uint64_t places = rep_count > 0 ? rep_count : 1;
+            child.count += (double)places;
             child.box.add(placed_box(ref, boxes[ref->cell]));
             if (!child.have_first) {
                 // A repetition's first copy is always its (0,0) offset (see
@@ -2861,6 +2553,40 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
                 child.first = reference_placement(ref, Vec2{0, 0});
                 child.have_first = true;
             }
+
+            // One transform per copy, for the viewer's per-placement outlines.
+            // Both ceilings are checked *before* get_offsets, which materializes
+            // the whole offset array: a single AREF can hold millions of copies,
+            // and the point of the caps is not to build that list at all.
+            if (child.capped) continue;
+            uint64_t held = (uint64_t)(child.placements.size() / 6);
+            if (held + places > kMaxRowPlacements || places > placements_left) {
+                child.capped = true;
+                placements_left += held;  // hand the row's share back
+                child.placements.clear();
+                child.placements.shrink_to_fit();
+                continue;
+            }
+            placements_left -= places;
+            child.placements.reserve(child.placements.size() + places * 6);
+
+            Vec2 zero = {0, 0};
+            Array<Vec2> offsets = {};
+            if (ref->repetition.type != RepetitionType::None) {
+                ref->repetition.get_offsets(offsets);
+            } else {
+                // Borrowed storage for the single-copy case -- cleared below
+                // only in the repetition branch, exactly as collect_instanced
+                // does it.
+                offsets.count = 1;
+                offsets.items = &zero;
+            }
+            for (uint64_t k = 0; k < offsets.count; k++) {
+                Affine2D t = reference_placement(ref, offsets[k]);
+                const double v[6] = {t.a, t.b, t.c, t.d, t.tx, t.ty};
+                child.placements.insert(child.placements.end(), v, v + 6);
+            }
+            if (ref->repetition.type != RepetitionType::None) offsets.clear();
         }
 
         val refs = val::array();
@@ -2871,6 +2597,15 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
             entry.set("count", child.count);
             entry.set("bbox", hier_box_to_val(child.box));
             entry.set("xform", hier_xform_to_val(child.first));
+            // Null rather than an empty array when capped, so the viewer's test
+            // is "did I get the placements or not" and can't half-succeed. A row
+            // with a single placement carries none either: `box` already *is*
+            // that placement's box, so an array saying the same thing would be
+            // one more object per row of the tree for nothing.
+            bool one_placement = child.count <= 1.0;
+            entry.set("placements", (child.placements.empty() || one_placement)
+                                        ? val::null()
+                                        : to_float64_array(child.placements));
             refs.call<void>("push", entry);
         }
 
@@ -2895,157 +2630,6 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
     out.set("cells", cells);
     out.set("roots", root_indices);
     return out;
-}
-
-// Locates the next opening <tag> or <tag attr="...">, tolerating attributes,
-// at or after `from`. Returns the position of the '<' (npos if absent) and
-// sets content_start to just past the tag's closing '>'. Self-closing tags
-// (<tag/>, <tag attr/>) are skipped: they carry no value, which for every tag
-// this parser reads is equivalent to the tag being absent.
-size_t find_open_tag(const std::string& text, const char* tag, size_t from, size_t& content_start) {
-    std::string prefix = std::string("<") + tag;
-    size_t pos = text.find(prefix, from);
-    while (pos != std::string::npos) {
-        size_t after = pos + prefix.length();
-        char c = after < text.length() ? text[after] : '\0';
-        if (c == '>') {
-            content_start = after + 1;
-            return pos;
-        }
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            size_t gt = text.find('>', after);
-            if (gt == std::string::npos) return std::string::npos;
-            if (text[gt - 1] != '/') {
-                content_start = gt + 1;
-                return pos;
-            }
-        }
-        // '/' (self-closing), or a longer tag name that merely starts with
-        // `tag` (e.g. <name> vs <names>) -- keep scanning.
-        pos = text.find(prefix, pos + prefix.length());
-    }
-    return std::string::npos;
-}
-
-// Decodes the five predefined XML entities plus numeric character references
-// (&#nn; / &#xhh;) -- .lyp values are stored XML-escaped, so a layer named
-// "A&B" arrives here as "A&amp;B".
-std::string xml_unescape(const std::string& s) {
-    if (s.find('&') == std::string::npos) return s;
-    std::string out;
-    out.reserve(s.size());
-    size_t i = 0;
-    while (i < s.size()) {
-        if (s[i] != '&') {
-            out += s[i++];
-            continue;
-        }
-        size_t semi = s.find(';', i + 1);
-        // Entities are short; a far-away ';' means this '&' is just a bare
-        // ampersand in the text (technically invalid XML, but tolerated).
-        if (semi == std::string::npos || semi - i > 10) {
-            out += s[i++];
-            continue;
-        }
-        std::string ent = s.substr(i + 1, semi - i - 1);
-        long code = -1;
-        if (ent == "amp") code = '&';
-        else if (ent == "lt") code = '<';
-        else if (ent == "gt") code = '>';
-        else if (ent == "quot") code = '"';
-        else if (ent == "apos") code = '\'';
-        else if (ent.size() > 1 && ent[0] == '#') {
-            code = (ent[1] == 'x' || ent[1] == 'X') ? strtol(ent.c_str() + 2, nullptr, 16)
-                                                    : strtol(ent.c_str() + 1, nullptr, 10);
-        }
-        if (code <= 0 || code > 0x10FFFF) {
-            out += s[i++];  // unknown entity -- pass the '&' through untouched
-            continue;
-        }
-        // UTF-8 encode; embind hands the result back to JS as UTF-8.
-        if (code < 0x80) {
-            out += (char)code;
-        } else if (code < 0x800) {
-            out += (char)(0xC0 | (code >> 6));
-            out += (char)(0x80 | (code & 0x3F));
-        } else if (code < 0x10000) {
-            out += (char)(0xE0 | (code >> 12));
-            out += (char)(0x80 | ((code >> 6) & 0x3F));
-            out += (char)(0x80 | (code & 0x3F));
-        } else {
-            out += (char)(0xF0 | (code >> 18));
-            out += (char)(0x80 | ((code >> 12) & 0x3F));
-            out += (char)(0x80 | ((code >> 6) & 0x3F));
-            out += (char)(0x80 | (code & 0x3F));
-        }
-        i = semi + 1;
-    }
-    return out;
-}
-
-// Strips <!-- --> comments up front so a commented-out block (which may well
-// contain <properties> or <group-members> tags) can't confuse the
-// string-level tag scanning in loadLypText.
-std::string strip_xml_comments(const std::string& text) {
-    size_t c = text.find("<!--");
-    if (c == std::string::npos) return text;
-    std::string out;
-    out.reserve(text.size());
-    size_t pos = 0;
-    while (c != std::string::npos) {
-        out.append(text, pos, c - pos);
-        size_t e = text.find("-->", c + 4);
-        if (e == std::string::npos) return out;  // unterminated -- drop the rest
-        pos = e + 3;
-        c = text.find("<!--", pos);
-    }
-    out.append(text, pos, text.size() - pos);
-    return out;
-}
-
-bool extract_tag_value(const std::string& block, const char* tag, std::string& out) {
-    size_t content_start = 0;
-    size_t open_pos = find_open_tag(block, tag, 0, content_start);
-    if (open_pos == std::string::npos) return false;
-    std::string close_tag = std::string("</") + tag + ">";
-    size_t close_pos = block.find(close_tag, content_start);
-    if (close_pos == std::string::npos) return false;
-    out = xml_unescape(block.substr(content_start, close_pos - content_start));
-    return true;
-}
-
-std::string trim(const std::string& s) {
-    size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "";
-    size_t end = s.find_last_not_of(" \t\r\n");
-    return s.substr(start, end - start + 1);
-}
-
-// alpha output of 0 signals "invalid hex" to the caller (mirrors the old
-// hexToRgb() returning null); the requested alpha is otherwise always > 0.
-std::array<float, 4> hex_to_rgba(const std::string& hex_in, float alpha) {
-    std::string hex = trim(hex_in);
-    if (!hex.empty() && hex[0] == '#') hex = hex.substr(1);
-    if (hex.size() != 6) return {0.0f, 0.0f, 0.0f, 0.0f};
-
-    char byte_buf[3] = {0, 0, 0};
-    auto hex_byte = [&](size_t pos) -> float {
-        byte_buf[0] = hex[pos];
-        byte_buf[1] = hex[pos + 1];
-        return (float)strtol(byte_buf, nullptr, 16);
-    };
-    return {hex_byte(0) / 255.0f, hex_byte(2) / 255.0f, hex_byte(4) / 255.0f, alpha};
-}
-
-// KLayout's <frame-brightness>/<fill-brightness>: -255..255 shifts the color
-// toward black (negative) or white (positive), with +-255 reaching full
-// white/black. Alpha is left alone.
-void apply_brightness(std::array<float, 4>& color, long brightness) {
-    if (brightness == 0) return;
-    float t = (float)std::max(-255l, std::min(255l, brightness)) / 255.0f;
-    for (int i = 0; i < 3; i++) {
-        color[i] = t > 0 ? color[i] + (1.0f - color[i]) * t : color[i] * (1.0f + t);
-    }
 }
 
 bool on_mousedown(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*userData*/) {
@@ -3988,21 +3572,21 @@ void parse_lyp_leaf(const std::string& block, const std::string& category, bool 
     // layer at '/', then the datatype up to '@' (or end). A missing datatype
     // defaults to 0.
     std::string source_text;
-    if (!extract_tag_value(block, "source", source_text)) return;
+    if (!lyp_util::extract_tag_value(block, "source", source_text)) return;
 
     // A numeric layout index (@2, @3, ...) binds the entry to the Nth loaded
     // layout -- this viewer only ever has one, so entries for other layouts
     // are skipped rather than misapplied. "@1", "@*", and no index all apply.
     size_t at_pos = source_text.find('@');
     if (at_pos != std::string::npos) {
-        std::string idx_text = trim(source_text.substr(at_pos + 1));
+        std::string idx_text = lyp_util::trim(source_text.substr(at_pos + 1));
         char* idx_endptr = nullptr;
         long layout_index = strtol(idx_text.c_str(), &idx_endptr, 10);
         if (idx_endptr != idx_text.c_str() && layout_index != 1) return;
     }
 
     size_t slash_pos = source_text.find('/');
-    std::string layer_text = trim(source_text.substr(0, slash_pos));
+    std::string layer_text = lyp_util::trim(source_text.substr(0, slash_pos));
     if (layer_text.empty()) return;
     char* endptr = nullptr;
     long layer_number = strtol(layer_text.c_str(), &endptr, 10);
@@ -4012,7 +3596,7 @@ void parse_lyp_leaf(const std::string& block, const std::string& category, bool 
     if (slash_pos != std::string::npos) {
         std::string dt_text = source_text.substr(slash_pos + 1);
         if (at_pos != std::string::npos) dt_text = dt_text.substr(0, dt_text.find('@'));
-        dt_text = trim(dt_text);
+        dt_text = lyp_util::trim(dt_text);
         char* dt_endptr = nullptr;
         long parsed = strtol(dt_text.c_str(), &dt_endptr, 10);
         // Only take a fully numeric datatype; a wildcard ("*") leaves it 0.
@@ -4024,31 +3608,33 @@ void parse_lyp_leaf(const std::string& block, const std::string& category, bool 
     entry.group = category;
 
     std::string fill_text, frame_text;
-    entry.has_fill = extract_tag_value(block, "fill-color", fill_text);
-    entry.has_frame = extract_tag_value(block, "frame-color", frame_text);
+    entry.has_fill = lyp_util::extract_tag_value(block, "fill-color", fill_text);
+    entry.has_frame = lyp_util::extract_tag_value(block, "frame-color", frame_text);
     if (entry.has_fill) {
-        entry.fill_color = hex_to_rgba(fill_text, 0.55f);
+        entry.fill_color = lyp_util::hex_to_rgba(fill_text, 0.55f);
         if (entry.fill_color[3] == 0.0f) entry.has_fill = false;
     }
     if (entry.has_frame) {
-        entry.frame_color = hex_to_rgba(frame_text, 0.9f);
+        entry.frame_color = lyp_util::hex_to_rgba(frame_text, 0.9f);
         if (entry.frame_color[3] == 0.0f) entry.has_frame = false;
     }
 
     std::string brightness_text;
-    if (entry.has_fill && extract_tag_value(block, "fill-brightness", brightness_text)) {
-        apply_brightness(entry.fill_color, strtol(trim(brightness_text).c_str(), nullptr, 10));
+    if (entry.has_fill && lyp_util::extract_tag_value(block, "fill-brightness", brightness_text)) {
+        lyp_util::apply_brightness(entry.fill_color,
+                                   strtol(lyp_util::trim(brightness_text).c_str(), nullptr, 10));
     }
-    if (entry.has_frame && extract_tag_value(block, "frame-brightness", brightness_text)) {
-        apply_brightness(entry.frame_color, strtol(trim(brightness_text).c_str(), nullptr, 10));
+    if (entry.has_frame && lyp_util::extract_tag_value(block, "frame-brightness", brightness_text)) {
+        lyp_util::apply_brightness(entry.frame_color,
+                                   strtol(lyp_util::trim(brightness_text).c_str(), nullptr, 10));
     }
 
     std::string name_text;
-    if (extract_tag_value(block, "name", name_text)) entry.name = trim(name_text);
+    if (lyp_util::extract_tag_value(block, "name", name_text)) entry.name = lyp_util::trim(name_text);
 
     std::string visible_text;
-    if (extract_tag_value(block, "visible", visible_text)) {
-        std::string v = trim(visible_text);
+    if (lyp_util::extract_tag_value(block, "visible", visible_text)) {
+        std::string v = lyp_util::trim(visible_text);
         entry.visible = !(v == "false" || v == "0");
     }
     entry.visible = entry.visible && group_visible;
@@ -4060,7 +3646,7 @@ void loadLypText(const std::string& xml_text_in) {
     g_lyp_info.clear();
     g_lyp_order_counter = 0;
 
-    std::string xml_text = strip_xml_comments(xml_text_in);
+    std::string xml_text = lyp_util::strip_xml_comments(xml_text_in);
 
     // Multi-tab files: <layer-properties-tabs> wraps one <layer-properties>
     // element per tab. Parse only the first tab -- mirroring KLayout's initial
@@ -4070,7 +3656,7 @@ void loadLypText(const std::string& xml_text_in) {
     // hit is the first real tab.)
     if (xml_text.find("<layer-properties-tabs") != std::string::npos) {
         size_t tab_content = 0;
-        if (find_open_tag(xml_text, "layer-properties", 0, tab_content) != std::string::npos) {
+        if (lyp_util::find_open_tag(xml_text, "layer-properties", 0, tab_content) != std::string::npos) {
             size_t tab_close = xml_text.find("</layer-properties>", tab_content);
             if (tab_close != std::string::npos) {
                 xml_text = xml_text.substr(tab_content, tab_close - tab_content);
@@ -4090,17 +3676,17 @@ void loadLypText(const std::string& xml_text_in) {
     // it), and every leaf inherits the outermost category -- exactly the flat
     // two-level (category -> layers) view the sidebar wants.
     size_t block_start = 0;
-    size_t prop_pos = find_open_tag(xml_text, "properties", 0, block_start);
+    size_t prop_pos = lyp_util::find_open_tag(xml_text, "properties", 0, block_start);
     while (prop_pos != std::string::npos) {
         size_t next_start = 0;
-        size_t next_prop = find_open_tag(xml_text, "properties", block_start, next_start);
+        size_t next_prop = lyp_util::find_open_tag(xml_text, "properties", block_start, next_start);
         size_t block_end = (next_prop == std::string::npos) ? xml_text.length() : next_prop;
         std::string top_block = xml_text.substr(block_start, block_end - block_start);
         prop_pos = next_prop;
         block_start = next_start;
 
         size_t leaf_start = 0;
-        size_t first_members = find_open_tag(top_block, "group-members", 0, leaf_start);
+        size_t first_members = lyp_util::find_open_tag(top_block, "group-members", 0, leaf_start);
         if (first_members == std::string::npos) {
             // Flat single-layer entry, no category.
             parse_lyp_leaf(top_block, "", true);
@@ -4112,17 +3698,17 @@ void loadLypText(const std::string& xml_text_in) {
         std::string header = top_block.substr(0, first_members);
         std::string category;
         std::string name_text;
-        if (extract_tag_value(header, "name", name_text)) category = trim(name_text);
+        if (lyp_util::extract_tag_value(header, "name", name_text)) category = lyp_util::trim(name_text);
         bool group_visible = true;
         std::string visible_text;
-        if (extract_tag_value(header, "visible", visible_text)) {
-            std::string v = trim(visible_text);
+        if (lyp_util::extract_tag_value(header, "visible", visible_text)) {
+            std::string v = lyp_util::trim(visible_text);
             group_visible = !(v == "false" || v == "0");
         }
 
         for (size_t m = first_members; m != std::string::npos;) {
             size_t next_leaf_start = 0;
-            size_t next_m = find_open_tag(top_block, "group-members", leaf_start, next_leaf_start);
+            size_t next_m = lyp_util::find_open_tag(top_block, "group-members", leaf_start, next_leaf_start);
             size_t leaf_end = (next_m == std::string::npos) ? top_block.length() : next_m;
             parse_lyp_leaf(top_block.substr(leaf_start, leaf_end - leaf_start), category, group_visible);
             m = next_m;
@@ -4228,6 +3814,8 @@ void setTheme(bool light) {
                        : std::array<float, 3>{0.06f, 0.06f, 0.07f};
     g_ink_color = light ? std::array<float, 3>{0.08f, 0.08f, 0.10f}
                         : std::array<float, 3>{1.0f, 1.0f, 1.0f};
+    g_highlight_color = light ? std::array<float, 3>{0.12f, 0.44f, 0.82f}
+                              : std::array<float, 3>{0.29f, 0.62f, 1.0f};
     for (LayerBuffer& layer : g_layers) resolve_layer_colors(layer);
     request_redraw();
 }
@@ -4341,6 +3929,39 @@ void zoomToBox(double min_x, double min_y, double max_x, double max_y) {
     request_redraw();
 }
 
+// Outlines world-space boxes on the canvas -- one per placement of the cell the
+// hierarchy panel has selected (see syncCellHighlight in viewer.js), as a flat
+// [minX, minY, maxX, maxY, ...] array. The selected row supplies them: a row
+// stands for a cell as one parent places it, so a cell placed 40 times hands
+// over 40 boxes and each copy is outlined where it actually sits. Rows whose
+// placement count is over the tree's cap (kMaxRowPlacements) pass the single box
+// spanning all of them instead, which is all build_hierarchy kept for them.
+//
+// Non-finite and inverted boxes are dropped individually rather than failing the
+// whole call: they can only come from a degenerate cell in the file, and one bad
+// placement shouldn't cost the outlines around its sound siblings.
+void setCellHighlight(val boxes) {
+    std::vector<float> flat = convertJSArrayToNumberVector<float>(boxes);
+    g_highlight_boxes.clear();
+    g_highlight_boxes.reserve(flat.size());
+    for (size_t i = 0; i + 3 < flat.size(); i += 4) {
+        float min_x = flat[i], min_y = flat[i + 1], max_x = flat[i + 2], max_y = flat[i + 3];
+        if (!std::isfinite(min_x) || !std::isfinite(min_y) || !std::isfinite(max_x) ||
+            !std::isfinite(max_y)) {
+            continue;
+        }
+        if (min_x > max_x || min_y > max_y) continue;
+        g_highlight_boxes.insert(g_highlight_boxes.end(), {min_x, min_y, max_x, max_y});
+    }
+    request_redraw();
+}
+
+void clearCellHighlight() {
+    if (g_highlight_boxes.empty()) return;
+    g_highlight_boxes.clear();
+    request_redraw();
+}
+
 // CPU-side marker state summary for headless smoke tests (no GL context
 // needed) -- see test/marker-wasm.test.js.
 val getMarkerStats() {
@@ -4395,5 +4016,7 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setSelectedMarker", &setSelectedMarker);
     function("setMarkerOpacity", &setMarkerOpacity);
     function("zoomToBox", &zoomToBox);
+    function("setCellHighlight", &setCellHighlight);
+    function("clearCellHighlight", &clearCellHighlight);
     function("getMarkerStats", &getMarkerStats);
 }
