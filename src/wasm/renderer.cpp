@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -74,6 +75,9 @@ struct InstancedBatch {
     GLuint outline_vbo = 0;
     GLuint outline_ebo = 0;
     GLsizei outline_index_count = 0;
+    // Vertices in outline_vbo, as opposed to indices into it -- what the pick
+    // pass draws as GL_POINTS to find a vertex to snap the ruler to.
+    GLsizei outline_vertex_count = 0;
     // Shared across every layer touched by the same instance group (a group
     // can span multiple layers, e.g. metal + via) -- deleting the same GL
     // buffer name more than once is a defined no-op per the GL/WebGL2 spec,
@@ -125,6 +129,10 @@ struct LayerBuffer {
     // polygon.
     GLuint outline_ebo = 0;
     GLsizei outline_index_count = 0;
+    // Vertices in outline_vbo, as opposed to indices into it (outline_ebo names
+    // each one twice, once per edge it belongs to) -- what the pick pass draws
+    // as GL_POINTS to find a vertex to snap the ruler to.
+    GLsizei outline_vertex_count = 0;
     // Total vertex count in fill_vbo -- triangle lists have no loop-closing
     // constraint, so the whole buffer can be drawn in one glDrawArrays call
     // with no indices needed.
@@ -368,17 +376,34 @@ float g_cursor_y = 0.0f;
 bool g_cursor_inside = false;
 
 // Ruler ("measure") tool state -- see setMeasureMode/on_mousedown. While the
-// mode is active, clicks measure instead of pan: the first click anchors the
+// mode is active, clicks measure instead of pan: the first click anchors a
 // ruler's start point, the line then tracks the cursor (g_measure_pending),
-// and a second click freezes it. The measurement is world-space, so it stays
-// glued to the geometry across pan/zoom; only the readout label (#measureLabel,
-// repositioned every draw_frame) lives in screen space.
+// and a second click finishes it into g_measurements. Measurements are
+// world-space, so they stay glued to the geometry across pan/zoom; only the
+// readout labels (one .measure-label per ruler inside #measureLabels,
+// repositioned every draw_frame) live in screen space.
+//
+// A list rather than one ruler because the interesting questions are
+// comparisons -- this gap against that one, this width at both ends of a taper
+// -- and a tool that forgets the previous answer the moment you ask the next
+// one makes you hold it in your head. Finished rulers outlive the mode too:
+// once placed they're annotations on the layout, not a mode you're in.
+struct Measurement {
+    float x0, y0, x1, y1;
+};
 bool g_measure_mode = false;
+std::vector<Measurement> g_measurements;
 bool g_measure_pending = false;   // first point placed, waiting for the second click
-bool g_measure_has_line = false;  // anything to draw at all (pending or finalized)
 float g_measure_x0 = 0.0f, g_measure_y0 = 0.0f;
 float g_measure_x1 = 0.0f, g_measure_y1 = 0.0f;
 GLuint g_measure_vbo = 0;
+
+// Where the ruler would land if clicked right now, when that's a snap onto real
+// geometry rather than the bare cursor position (see pick_snap_at). Drawn as a
+// small square while measure mode is on, so the snap is something you aim with
+// rather than something you discover afterwards in the numbers.
+bool g_snap_active = false;
+float g_snap_x = 0.0f, g_snap_y = 0.0f;
 
 // Selected-cell highlight: the world-space boxes of whichever row the hierarchy
 // panel has selected (see setCellHighlight / draw_cell_highlight), drawn as
@@ -1086,70 +1111,115 @@ void update_coord_readout() {
     el["classList"].call<void>("remove", std::string("hidden"));
 }
 
-// Repositions/re-fills #measureLabel (viewer.html) at the ruler's midpoint,
-// or hides it when there's no measurement. Called from draw_frame so the
-// label follows the world-space ruler across pan/zoom without its own event
-// plumbing.
-void update_measure_label() {
-    val el = val::global("document").call<val>("getElementById", std::string("measureLabel"));
-    if (el.isNull() || el.isUndefined()) return;
-    if (!g_measure_has_line) {
-        el["classList"].call<void>("add", std::string("hidden"));
-        return;
-    }
-    float dx = g_measure_x1 - g_measure_x0;
-    float dy = g_measure_y1 - g_measure_y0;
-    double dist = std::sqrt((double)dx * dx + (double)dy * dy);
+// One ruler's readout: the distance, then its components and the angle it runs
+// at. The angle is signed and measured from +x through the ruler's own
+// direction (first point to second), so it answers "what angle did I draw
+// this at" rather than folding two opposite directions onto one number.
+std::string measure_label_html(const Measurement& m) {
+    double dx = (double)m.x1 - m.x0;
+    double dy = (double)m.y1 - m.y0;
+    double dist = std::sqrt(dx * dx + dy * dy);
     std::string html = "<b>" + format_distance_um(dist) + "</b><br>\xCE\x94x " +
                        format_distance_um(std::fabs(dx)) + " \xC2\xB7 \xCE\x94y " +
                        format_distance_um(std::fabs(dy));  // Δx · Δy
-    el.set("innerHTML", html);
-    float sx, sy;
-    world_to_screen((g_measure_x0 + g_measure_x1) * 0.5f, (g_measure_y0 + g_measure_y1) * 0.5f, sx, sy);
-    el["style"].set("left", std::to_string(sx) + "px");
-    el["style"].set("top", std::to_string(sy) + "px");
-    el["classList"].call<void>("remove", std::string("hidden"));
+    if (dist > 0.0) {
+        char buf[32];
+        // ∠, degrees. A zero-length ruler has no direction to report.
+        snprintf(buf, sizeof(buf), " \xC2\xB7 \xE2\x88\xA0 %.1f\xC2\xB0",
+                 std::atan2(dy, dx) * 180.0 / 3.14159265358979323846);
+        html += buf;
+    }
+    return html;
 }
 
-// Draws the ruler: the measurement segment plus a short perpendicular tick at
-// each endpoint (constant on-screen length, so world size is divided by
-// zoom). Reuses the layer shader -- the instance attributes' generic identity
-// values (see init_gl) pass positions through, and u_useHatch=0 gives a solid
-// line. The VBO is tiny and re-uploaded whenever the endpoints move.
-void draw_measure_line() {
-    if (!g_measure_has_line) return;
-    float verts[12];
-    int count = 4;
-    verts[0] = g_measure_x0;
-    verts[1] = g_measure_y0;
-    verts[2] = g_measure_x1;
-    verts[3] = g_measure_y1;
-    float dx = g_measure_x1 - g_measure_x0;
-    float dy = g_measure_y1 - g_measure_y0;
-    float len = std::sqrt(dx * dx + dy * dy);
-    if (len > 0.0f) {
-        float tick = 6.0f / g_zoom;  // 6px half-length ticks
-        float nx = -dy / len * tick;
-        float ny = dx / len * tick;
-        verts[4] = g_measure_x0 - nx;
-        verts[5] = g_measure_y0 - ny;
-        verts[6] = g_measure_x0 + nx;
-        verts[7] = g_measure_y0 + ny;
-        verts[8] = g_measure_x1 - nx;
-        verts[9] = g_measure_y1 - ny;
-        verts[10] = g_measure_x1 + nx;
-        verts[11] = g_measure_y1 + ny;
-        count = 12;
+// Repositions/re-fills one .measure-label per ruler at that ruler's midpoint,
+// inside #measureLabels (viewer.html). Called from draw_frame so the labels
+// follow their world-space rulers across pan/zoom with no event plumbing of
+// their own; the divs are created and removed here as the ruler count changes,
+// since there is no fixed number of them any more.
+void update_measure_labels() {
+    val document = val::global("document");
+    val container = document.call<val>("getElementById", std::string("measureLabels"));
+    if (container.isNull() || container.isUndefined()) return;
+
+    const size_t needed = g_measurements.size() + (g_measure_pending ? 1 : 0);
+    val children = container["children"];  // live collection
+    while (children["length"].as<size_t>() < needed) {
+        val div = document.call<val>("createElement", std::string("div"));
+        div.set("className", std::string("measure-label"));
+        container.call<void>("appendChild", div);
     }
+    while (children["length"].as<size_t>() > needed) {
+        container.call<void>("removeChild", container["lastElementChild"]);
+    }
+    if (needed == 0) return;
+
+    for (size_t i = 0; i < needed; i++) {
+        const Measurement m = i < g_measurements.size()
+                                  ? g_measurements[i]
+                                  : Measurement{g_measure_x0, g_measure_y0, g_measure_x1, g_measure_y1};
+        val el = children[(unsigned)i];
+        el.set("innerHTML", measure_label_html(m));
+        float sx, sy;
+        world_to_screen((m.x0 + m.x1) * 0.5f, (m.y0 + m.y1) * 0.5f, sx, sy);
+        el["style"].set("left", std::to_string(sx) + "px");
+        el["style"].set("top", std::to_string(sy) + "px");
+    }
+}
+
+// A ruler's line segment plus a short perpendicular tick at each endpoint, at a
+// constant on-screen length (so the world size divides by zoom).
+void append_measure_verts(std::vector<float>& verts, const Measurement& m) {
+    verts.insert(verts.end(), {m.x0, m.y0, m.x1, m.y1});
+    float dx = m.x1 - m.x0;
+    float dy = m.y1 - m.y0;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len <= 0.0f) return;
+    float tick = 6.0f / g_zoom;  // 6px half-length ticks
+    float nx = -dy / len * tick;
+    float ny = dx / len * tick;
+    verts.insert(verts.end(), {m.x0 - nx, m.y0 - ny, m.x0 + nx, m.y0 + ny,
+                               m.x1 - nx, m.y1 - ny, m.x1 + nx, m.y1 + ny});
+}
+
+// Half-width of the open square drawn around a snapped point, in pixels.
+constexpr float kSnapMarkerPx = 5.0f;
+
+// The snap indicator: a small open square around the point a click would land
+// on. Constant on-screen size like the ticks, so it reads the same at any zoom.
+void append_snap_marker(std::vector<float>& verts, float x, float y) {
+    const float r = kSnapMarkerPx / g_zoom;
+    const float cx[4] = {x - r, x + r, x + r, x - r};
+    const float cy[4] = {y - r, y - r, y + r, y + r};
+    for (int i = 0; i < 4; i++) {
+        const int k = (i + 1) & 3;
+        verts.insert(verts.end(), {cx[i], cy[i], cx[k], cy[k]});
+    }
+}
+
+// Draws every ruler -- the finished ones and the one being placed -- plus the
+// snap indicator, in one call. Reuses the layer shader: the instance
+// attributes' generic identity values (see init_gl) pass positions through, and
+// u_useHatch=0 gives a solid line. The VBO is small and re-uploaded whenever
+// anything moves.
+void draw_measure_line() {
+    std::vector<float> verts;
+    for (const Measurement& m : g_measurements) append_measure_verts(verts, m);
+    if (g_measure_pending) {
+        append_measure_verts(verts, {g_measure_x0, g_measure_y0, g_measure_x1, g_measure_y1});
+    }
+    if (g_measure_mode && g_snap_active) append_snap_marker(verts, g_snap_x, g_snap_y);
+    if (verts.empty()) return;
+
     if (!g_measure_vbo) glGenBuffers(1, &g_measure_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_measure_vbo);
-    buffer_data_tracked(GL_ARRAY_BUFFER, g_measure_vbo, (GLsizeiptr)(count * sizeof(float)), verts,
-                        GL_DYNAMIC_DRAW);
+    buffer_data_tracked(GL_ARRAY_BUFFER, g_measure_vbo, (GLsizeiptr)(verts.size() * sizeof(float)),
+                        verts.data(), GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(g_loc_position);
     glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
     glUniform4f(g_loc_color, g_ink_color[0], g_ink_color[1], g_ink_color[2], 0.95f);
     glUniform1f(g_loc_use_hatch, 0.0f);
-    glDrawArrays(GL_LINES, 0, count / 2);
+    glDrawArrays(GL_LINES, 0, (GLsizei)(verts.size() / 2));
 }
 
 bool marker_item_visible(uint32_t item_id) {
@@ -1731,6 +1801,135 @@ int pick_layer_at(float screen_x, float screen_y) {
     return best >= 0 && (size_t)best < g_layers.size() ? best : -1;
 }
 
+// ---- Ruler snapping ---------------------------------------------------------
+// What a snap candidate is. A vertex anywhere in range beats any edge: a corner
+// is a more specific answer than the line leading to it, and it's what people
+// aim at when they measure between shapes.
+constexpr uint32_t kPickKindEdge = 1u;
+constexpr uint32_t kPickKindVertex = 2u;
+
+// How far the ruler reaches for something to snap to. Wider than the identify
+// radius: you point *at* a layer, but you aim *near* a corner.
+constexpr float kSnapRadiusPx = 12.0f;
+
+// Draws one layer's outline geometry, static and instanced, under whatever
+// program is bound -- as GL_LINES through the edge index buffer, or as
+// GL_POINTS over the raw vertices.
+void draw_layer_outline(const LayerBuffer& layer, GLenum primitive) {
+    auto draw = [&](GLuint vbo, GLuint ebo, GLsizei index_count, GLsizei vertex_count,
+                    GLsizei instances) {
+        if (!vbo) return;
+        if (primitive == GL_POINTS ? vertex_count == 0 : ebo == 0) return;
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        if (primitive == GL_POINTS) {
+            if (instances > 0) glDrawArraysInstanced(GL_POINTS, 0, vertex_count, instances);
+            else glDrawArrays(GL_POINTS, 0, vertex_count);
+            return;
+        }
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+        if (instances > 0) {
+            glDrawElementsInstanced(GL_LINES, index_count, GL_UNSIGNED_INT, 0, instances);
+        } else {
+            glDrawElements(GL_LINES, index_count, GL_UNSIGNED_INT, 0);
+        }
+    };
+
+    draw(layer.outline_vbo, layer.outline_ebo, layer.outline_index_count, layer.outline_vertex_count, 0);
+    for (const InstancedBatch& batch : layer.instanced_batches) {
+        enable_instance_attribs(batch.instance_vbo);
+        draw(batch.outline_vbo, batch.outline_ebo, batch.outline_index_count,
+             batch.outline_vertex_count, batch.instance_count);
+        disable_instance_attribs();
+    }
+}
+
+// Nearest snappable point to a screen position, in world coordinates. False
+// means nothing within kSnapRadiusPx and the caller should use the bare cursor
+// position.
+//
+// What comes back is exact, not quantized to the pixel that found it: the pick
+// fragment shader carries each fragment's world position through as raw bits,
+// and for a GL_POINTS draw that varying is constant across the point, so a hit
+// texel holds the vertex's own coordinates -- the same float32 the VBO holds,
+// which is as exact as anything in this renderer gets. For GL_LINES it
+// interpolates to a point that lies on the segment. That is the whole reason
+// snapping can work with no CPU-side geometry at all: the answer doesn't have
+// to be found in a data structure, only rendered.
+bool pick_snap_at(float screen_x, float screen_y, float& out_x, float& out_y) {
+    float wx, wy;
+    if (!begin_pick_pass(screen_x, screen_y, wx, wy)) return false;
+    const ViewRect view = pick_view_rect(wx, wy);
+
+    // Two passes over the layers rather than one interleaved pass, so a vertex
+    // on an early layer can't be overwritten by an edge on a later one landing
+    // in the same texel.
+    for (GLenum primitive : {GL_LINES, GL_POINTS}) {
+        glUniform1ui(g_pick_loc_id, primitive == GL_POINTS ? kPickKindVertex : kPickKindEdge);
+        for (const LayerBuffer& layer : g_layers) {
+            if (!layer.visible) continue;
+            if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
+            draw_layer_outline(layer, primitive);
+        }
+    }
+    end_pick_pass();
+
+    int best_index = -1;
+    uint32_t best_kind = 0;
+    float best_dist2 = HUGE_VALF;
+    const float radius2 = kSnapRadiusPx * kSnapRadiusPx;
+    for (int j = 0; j < kPickSize; j++) {
+        for (int i = 0; i < kPickSize; i++) {
+            const size_t at = ((size_t)j * kPickSize + i) * 4;
+            if (g_pick_buffer[at + 3] == 0u) continue;
+            const float dist2 = pick_texel_dist2(i, j);
+            if (dist2 > radius2) continue;
+            const uint32_t kind = g_pick_buffer[at];
+            if (!(kind > best_kind || (kind == best_kind && dist2 < best_dist2))) continue;
+            best_kind = kind;
+            best_dist2 = dist2;
+            best_index = (int)at;
+        }
+    }
+    if (best_index < 0) return false;
+    std::memcpy(&out_x, &g_pick_buffer[(size_t)best_index + 1], sizeof(float));
+    std::memcpy(&out_y, &g_pick_buffer[(size_t)best_index + 2], sizeof(float));
+    return std::isfinite(out_x) && std::isfinite(out_y);
+}
+
+// Shift's constraint: hold the ruler to horizontal or vertical, whichever axis
+// it already runs further along. Orthogonal only -- a layout's own geometry is
+// what 45-degree measurements should come from, and snapping already provides
+// those exactly.
+void constrain_orthogonal(float x0, float y0, float& x1, float& y1) {
+    if (std::fabs(x1 - x0) >= std::fabs(y1 - y0)) y1 = y0;
+    else x1 = x0;
+}
+
+// Where a measure click or a moving ruler end actually lands, and whether that
+// was a snap (which is what draws the indicator). Shift and snapping are
+// deliberately exclusive: Shift asks for an exact axis, and a snap would pull
+// the point straight back off it. Alt suspends snapping for the cases where the
+// point wanted isn't on any geometry at all. Shift needs a first point to
+// constrain against, hence `from_start`.
+void resolve_measure_point(const EmscriptenMouseEvent* e, bool from_start, float& out_x, float& out_y) {
+    if (e->shiftKey && from_start) {
+        screen_to_world((float)e->targetX, (float)e->targetY, out_x, out_y);
+        constrain_orthogonal(g_measure_x0, g_measure_y0, out_x, out_y);
+        g_snap_active = false;
+        return;
+    }
+    if (!e->altKey && pick_snap_at((float)e->targetX, (float)e->targetY, out_x, out_y)) {
+        g_snap_active = true;
+        g_snap_x = out_x;
+        g_snap_y = out_y;
+        return;
+    }
+    screen_to_world((float)e->targetX, (float)e->targetY, out_x, out_y);
+    g_snap_active = false;
+}
+
 // ---- Hover identify ---------------------------------------------------------
 // The layer under a resting pointer, written into #hoverLayer above the
 // coordinate readout. Deferred rather than run on every move for two reasons:
@@ -2158,7 +2357,7 @@ bool draw_frame(double time, void* /*userData*/) {
     // about the layout, so it can't be buried by it), under the ruler.
     draw_cell_highlight();
     draw_measure_line();
-    update_measure_label();
+    update_measure_labels();
     // Here rather than at each camera-moving entry point: the world coordinate
     // under a stationary pointer changes with every one of them (wheel zoom,
     // Reset View, a marker/cell row framing the view, a resize), and they all
@@ -2972,20 +3171,19 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
 bool on_mousedown(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*userData*/) {
     if (g_measure_mode) {
         // Click-click measurement: first click anchors the start point (the
-        // line then tracks the cursor via on_mousemove), second click freezes
-        // it. A further click starts a fresh measurement.
+        // line then tracks the cursor via on_mousemove), second click finishes
+        // the ruler into g_measurements. A further click starts another one --
+        // the finished ones stay up.
         float wx, wy;
-        screen_to_world((float)e->targetX, (float)e->targetY, wx, wy);
+        resolve_measure_point(e, g_measure_pending, wx, wy);
         if (!g_measure_pending) {
             g_measure_x0 = wx;
             g_measure_y0 = wy;
             g_measure_x1 = wx;
             g_measure_y1 = wy;
             g_measure_pending = true;
-            g_measure_has_line = true;
         } else {
-            g_measure_x1 = wx;
-            g_measure_y1 = wy;
+            g_measurements.push_back({g_measure_x0, g_measure_y0, wx, wy});
             g_measure_pending = false;
         }
         request_redraw();
@@ -3003,8 +3201,17 @@ bool on_mousemove(int /*eventType*/, const EmscriptenMouseEvent* e, void* /*user
     g_cursor_inside = true;
     update_coord_readout();
     schedule_hover_identify();
-    if (g_measure_pending) {
-        screen_to_world((float)e->targetX, (float)e->targetY, g_measure_x1, g_measure_y1);
+    // In measure mode the cursor is always aiming at something, whether or not
+    // a ruler is half-placed: resolving the point every move is what puts the
+    // snap indicator under the cursor before the first click rather than after
+    // it. Dragging never pans here -- on_mousedown doesn't arm it in this mode.
+    if (g_measure_mode) {
+        float wx, wy;
+        resolve_measure_point(e, g_measure_pending, wx, wy);
+        if (g_measure_pending) {
+            g_measure_x1 = wx;
+            g_measure_y1 = wy;
+        }
         request_redraw();
         return true;
     }
@@ -3327,6 +3534,7 @@ struct UploadedGeometry {
     GLuint outline_vbo = 0;
     GLuint outline_ebo = 0;
     GLsizei outline_index_count = 0;
+    GLsizei outline_vertex_count = 0;
     GLuint fill_vbo = 0;
     GLsizei fill_vertex_count = 0;
     uint32_t polygon_count = 0;
@@ -3412,6 +3620,7 @@ UploadedGeometry upload_geometry(val entry) {
         }
     }
     g.polygon_count = outline_range_count;
+    g.outline_vertex_count = (GLsizei)(outline_vertices.size() / 2);
     g.fill_vertex_count = (GLsizei)(fill_vertices.size() / 2);
 
     glGenBuffers(1, &g.outline_vbo);
@@ -3714,10 +3923,11 @@ val parseGdsToLayers(const std::string& path) {
 void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     if (!g_gl_ready) return;
     clear_layers();
-    // A measurement is anchored to the old file's geometry -- drop it rather
-    // than leaving a stale ruler floating over the new design.
-    g_measure_has_line = false;
+    // Rulers are anchored to the old file's geometry -- drop them rather than
+    // leaving stale ones floating over the new design.
+    g_measurements.clear();
     g_measure_pending = false;
+    g_snap_active = false;
 
     unsigned layer_count = layers_data["length"].as<unsigned>();
     unsigned group_count = instance_groups_data["length"].as<unsigned>();
@@ -3746,6 +3956,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
         layer_buffer.outline_vbo = g.outline_vbo;
         layer_buffer.outline_ebo = g.outline_ebo;
         layer_buffer.outline_index_count = g.outline_index_count;
+        layer_buffer.outline_vertex_count = g.outline_vertex_count;
         layer_buffer.fill_vbo = g.fill_vbo;
         layer_buffer.fill_vertex_count = g.fill_vertex_count;
         layer_buffer.polygon_count = g.polygon_count;
@@ -3818,6 +4029,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
             batch.outline_vbo = g.outline_vbo;
             batch.outline_ebo = g.outline_ebo;
             batch.outline_index_count = g.outline_index_count;
+            batch.outline_vertex_count = g.outline_vertex_count;
             batch.instance_vbo = instance_vbo;
             batch.instance_count = instance_count;
             layer_buffer->instanced_batches.push_back(batch);
@@ -3891,11 +4103,12 @@ void showLoadError(const std::string& message) {
 
     if (!g_gl_ready) return;
     clear_layers();
-    // With no layers draw_frame early-returns and can't hide the label, so
-    // hide it here directly.
-    g_measure_has_line = false;
+    // With no layers draw_frame early-returns and can't take the ruler labels
+    // down, so do it here directly.
+    g_measurements.clear();
     g_measure_pending = false;
-    update_measure_label();
+    g_snap_active = false;
+    update_measure_labels();
     set_inner_html("ui", std::string("<b>Error</b><br>") + message);
     request_redraw();
 }
@@ -4187,29 +4400,63 @@ void setTheme(bool light) {
     request_redraw();
 }
 
-// Discards any in-progress or finalized measurement (the label hides on the
-// next draw_frame via update_measure_label). Called on measure-mode exit
-// (which is what Escape in viewer.js does, by switching back to pan mode) and
-// when a new file replaces the geometry the measurement referred to.
-void clearMeasurement() {
-    g_measure_has_line = false;
+// Drops every ruler, finished or half-placed. The panel's "Clear rulers" row,
+// and every path where a new file replaces the geometry the rulers referred to.
+void clearMeasurements() {
+    g_measurements.clear();
     g_measure_pending = false;
+    g_snap_active = false;
     // No DOM in headless (plain Node) runs -- mirror loadAndRenderGds's guard.
     if (!g_gl_ready) return;
-    // draw_frame early-returns with no layers, so it can't hide the label
-    // itself in the load-error path -- hide it directly.
-    update_measure_label();
+    // draw_frame early-returns with no layers, so it can't take the labels down
+    // itself in the load-error path -- do it directly.
+    update_measure_labels();
     request_redraw();
+}
+
+// What Escape means for the ruler, in one call so the two halves can't drift
+// apart: abandon the measurement being placed, or -- if there wasn't one --
+// clear the finished ones. Two steps rather than one because a ruler you are
+// halfway through placing is a mistake to back out of, while the ones already
+// down are work you may well want to keep -- one key shouldn't do both. Returns
+// which of the two it did, so the caller can leave measure mode only on the
+// press that had nothing left to cancel.
+bool escapeMeasure() {
+    const bool cancelled_pending = g_measure_pending;
+    if (cancelled_pending) g_measure_pending = false;
+    else g_measurements.clear();
+    g_snap_active = false;
+    if (g_gl_ready) {
+        update_measure_labels();
+        request_redraw();
+    }
+    return cancelled_pending;
+}
+
+int measurementCount() {
+    return (int)g_measurements.size();
 }
 
 // Ruler on/off -- i.e. measure mode vs pan mode (the Pan | Measure row / M
 // key in viewer.js). While on, canvas clicks measure instead of pan (see
 // on_mousedown); wheel zoom still works. The crosshair cursor is the mode's
 // visual cue on the canvas itself.
+//
+// Leaving the mode drops the half-placed ruler but keeps the finished ones: a
+// completed measurement is an annotation on the layout, not part of a mode you
+// happen to be in, and having to stay in measure mode to keep looking at one
+// was the whole reason only a single ruler ever existed.
 void setMeasureMode(bool on) {
     g_measure_mode = on;
     g_dragging = false;
-    if (!on) clearMeasurement();
+    if (!on) {
+        g_measure_pending = false;
+        g_snap_active = false;
+        if (g_gl_ready) {
+            update_measure_labels();
+            request_redraw();
+        }
+    }
     if (!g_gl_ready) return;  // no DOM in headless (plain Node) runs
     val canvas = val::global("document").call<val>("getElementById", std::string("glCanvas"));
     if (!canvas.isNull() && !canvas.isUndefined()) {
@@ -4402,7 +4649,9 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setShowGrid", &setShowGrid);
     function("setTheme", &setTheme);
     function("setMeasureMode", &setMeasureMode);
-    function("clearMeasurement", &clearMeasurement);
+    function("clearMeasurements", &clearMeasurements);
+    function("escapeMeasure", &escapeMeasure);
+    function("measurementCount", &measurementCount);
     function("setMarkers", &setMarkers);
     function("clearMarkers", &clearMarkers);
     function("setMarkerCategoryVisible", &setMarkerCategoryVisible);

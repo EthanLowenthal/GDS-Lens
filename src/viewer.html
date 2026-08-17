@@ -153,11 +153,14 @@
            so it stays readable whichever of the two it happens to sit on top of
            (it floats over the geometry, not over a panel). */
         #scaleBar { height: 4px; background: var(--fg); border: 1px solid var(--bg); margin-top: 4px; }
-        /* Ruler readout: repositioned to the measurement's midpoint on every
-           redraw by update_measure_label (renderer.cpp). The translate lifts
-           it just above the line so it doesn't cover what's being measured. */
-        #measureLabel { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: var(--fg); background: var(--label-scrim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
-        #measureLabel.hidden { display: none; }
+        /* Ruler readouts: one .measure-label per ruler, created and
+           repositioned to its measurement's midpoint on every redraw by
+           update_measure_labels (renderer.cpp). The translate lifts each one
+           just above its line so it doesn't cover what's being measured.
+           #measureLabels is a plain (unpositioned) container, so the labels
+           inside it still position against the page the way the single one
+           used to. */
+        #measureLabels .measure-label { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: var(--fg); background: var(--label-scrim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
         /* lil-gui's autoPlace default (1001) would float the panel above the
            loading overlay (z 30) and debug panel (z 40) -- keep it below both. */
         .lil-gui.autoPlace { z-index: 20 !important; }
@@ -405,7 +408,7 @@
         </div>
     </div>
 
-    <div id="measureLabel" class="hidden"></div>
+    <div id="measureLabels"></div>
 
     <!-- Base64 of gdstk_wasm.js's + wasm-worker.js's concatenated text (see
          extension.cjs) -- inert (not executed) since "text/plain" isn't a JS
