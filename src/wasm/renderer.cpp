@@ -1054,40 +1054,27 @@ double grid_fine_spacing() {
     return fine;
 }
 
-// The pointer readout's "X: … Y: …" line, in whichever of nm/µm/mm the grid's
-// current step falls in, with one shared unit suffix -- a coordinate pair is
-// read as a pair, and letting each half pick its own unit (as format_distance_um
-// does, where there is only one number) makes the two incomparable at a glance.
-// Sign and magnitude are the point here, so unlike the ruler's %.4g this is a
-// fixed number of decimals: digits below a tenth of a grid step are noise, and
-// a column of numbers whose decimal point moves as the pointer crosses zero is
-// unreadable.
+// The pointer readout's "X: … Y: …" line. Always microns -- the unit the whole
+// viewer works in -- rather than switching to nm or mm the way the scale bar and
+// the ruler do. Those two report one distance at a time, where the unit is free
+// to follow the magnitude; this reports a position you watch while moving the
+// pointer, and a unit that changes underneath it means two readings taken
+// seconds apart aren't comparable without noticing that the suffix moved.
+//
+// Zoom still decides the precision, just not the unit: the number of decimals
+// resolves a tenth of the background grid's current step, so the digits on
+// screen are the ones the grid can distinguish and no more. Unlike the ruler's
+// %.4g that count is fixed for both halves of the pair, since a decimal point
+// that shifts as the pointer crosses zero is unreadable.
 std::string format_coord_pair(double x_um, double y_um) {
     double step = grid_fine_spacing();
     if (!(step > 0.0)) step = 1.0;
     // Exact: step is a power of ten by construction.
     const int decade = (int)std::lround(std::log10(step));
-    const char* unit;
-    double scale;
-    int decade_in_unit;
-    if (decade >= 3) {
-        unit = "mm";
-        scale = 1e-3;
-        decade_in_unit = decade - 3;
-    } else if (decade >= 0) {
-        unit = "\xC2\xB5m";  // µm, UTF-8
-        scale = 1.0;
-        decade_in_unit = decade;
-    } else {
-        unit = "nm";
-        scale = 1e3;
-        decade_in_unit = decade + 3;
-    }
-    // Enough decimals to resolve a tenth of a grid step in the chosen unit.
-    const int decimals = std::clamp(1 - decade_in_unit, 0, 6);
+    const int decimals = std::clamp(1 - decade, 0, 6);
     char buf[128];
-    snprintf(buf, sizeof(buf), "X: %.*f  Y: %.*f %s", decimals, x_um * scale, decimals, y_um * scale,
-             unit);
+    // µm, UTF-8.
+    snprintf(buf, sizeof(buf), "X: %.*f  Y: %.*f \xC2\xB5m", decimals, x_um, decimals, y_um);
     return buf;
 }
 
