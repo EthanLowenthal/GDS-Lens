@@ -4202,6 +4202,78 @@ void setLayerVisible(uint32_t layer_number, uint32_t datatype, bool visible) {
     request_redraw();
 }
 
+// ---- Label search -----------------------------------------------------------
+// A layout's own TEXT labels are its index: pad names, port names, block names,
+// pin numbers. Which one you want is a string, so the viewer has to be able to
+// look one up by it -- and the strings only exist here (LayerBuffer::labels,
+// filled once by upload_labels and never handed back to JS, since a full chip's
+// worth of them is far too much to hold a second time on the other side).
+//
+// ASCII case-insensitive substring match, in scan order rather than ranked:
+// with a query broad enough to have a best match somewhere past the cap, the
+// honest answer is the count plus "narrow it", not a ranking of the arbitrary
+// prefix that fits. `limit` bounds the returned array only -- `total` counts
+// every match -- so the panel can say "200 of 1,340" instead of implying 200
+// was all there was.
+//
+// Hidden layers are searched too: a label you're hunting for is often on a
+// layer you turned off, and "no such label" would be the wrong answer to give
+// because of that. Each hit carries its layer's visibility so the row can say
+// which ones aren't on screen.
+char lower_ascii(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+
+// `needle` must already be lowercased; `haystack` is folded as it's compared,
+// so nothing is allocated per label -- this runs over every label in the design
+// on every keystroke.
+bool contains_ci(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    if (needle.size() > haystack.size()) return false;
+    const size_t last = haystack.size() - needle.size();
+    for (size_t i = 0; i <= last; i++) {
+        size_t j = 0;
+        while (j < needle.size() && lower_ascii(haystack[i + j]) == needle[j]) j++;
+        if (j == needle.size()) return true;
+    }
+    return false;
+}
+
+val findLabels(const std::string& query_in, unsigned limit) {
+    val out = val::object();
+    val hits = val::array();
+    uint64_t total = 0;
+    int emitted = 0;
+
+    std::string needle = query_in;
+    for (char& c : needle) c = lower_ascii(c);
+
+    // An empty query is "nothing asked for", not "everything matches" -- the
+    // panel clears its result list on it rather than listing the design.
+    if (!needle.empty()) {
+        for (const LayerBuffer& l : g_layers) {
+            for (const TextLabel& label : l.labels) {
+                if (!contains_ci(label.text, needle)) continue;
+                total++;
+                if ((unsigned)emitted >= limit) continue;
+                val obj = val::object();
+                obj.set("text", label.text);
+                obj.set("x", (double)label.x);
+                obj.set("y", (double)label.y);
+                obj.set("layer", l.layer);
+                obj.set("datatype", l.datatype);
+                auto it = g_lyp_info.find(l.tag());
+                obj.set("name", it != g_lyp_info.end() ? it->second.name : std::string());
+                obj.set("visible", l.visible);
+                hits.set(emitted++, obj);
+            }
+        }
+    }
+
+    out.set("total", (double)total);
+    out.set("hits", hits);
+    return out;
+}
+
+
 void setShowInfill(bool show) {
     g_show_infill = show;
     request_redraw();
@@ -4485,6 +4557,7 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("showLoadError", &showLoadError);
     function("loadLypText", &loadLypText);
     function("getLayers", &getLayers);
+    function("findLabels", &findLabels);
     function("setLayerVisible", &setLayerVisible);
     function("resetView", &reset_view);
     function("getCamera", &getCamera);
