@@ -2,7 +2,7 @@
 
 [![Visual Studio Marketplace](https://vsmarketplacebadges.dev/version-short/ethml.GDS-Lens.svg?style=flat-square&label=Marketplace&color=0f1720)](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
 [![Installs](https://vsmarketplacebadges.dev/installs-short/ethml.GDS-Lens.svg?style=flat-square&label=installs&color=0f1720)](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
-[![Open VSX downloads](https://img.shields.io/open-vsx/dt/ethml/GDS-Lens?style=flat-square&label=Installs&color=0f1720)](https://open-vsx.org/extension/ethml/GDS-Lens)
+[![Open VSX downloads](https://img.shields.io/open-vsx/dt/ethml/GDS-Lens?style=flat-square&label=Open%20VSX%20downloads&color=0f1720)](https://open-vsx.org/extension/ethml/GDS-Lens)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENCE.md)
 
 **Open a chip layout in VS Code.** GDS Lens adds a custom editor for `.gds`
