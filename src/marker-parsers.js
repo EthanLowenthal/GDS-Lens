@@ -137,7 +137,7 @@ function parseLyrdbValue(raw, item, unknownTypes) {
             }
             return "";
         }
-    } catch (err) {
+    } catch {
         return text; // malformed geometry: keep the raw string as the note
     }
     unknownTypes.add(type);

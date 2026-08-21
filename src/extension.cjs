@@ -18,6 +18,20 @@ const LAST_LYP_PATH_KEY = 'GDS-Lens.lastLypPath';
 // design B would be noise.
 const MARKER_PATHS_KEY = 'GDS-Lens.markerPathByGds';
 
+// workspaceState key holding a { gdsFsPath: [view, ...] } map of saved views --
+// a name, a camera and which layers were on (see the named-views block in
+// viewer.js). Per layout for the same reason marker databases are: a camera and
+// a layer set only mean anything against the design they were saved from.
+const NAMED_VIEWS_KEY = 'GDS-Lens.namedViewsByGds';
+
+// How many views one layout can hold, and how long a name can be. Both exist
+// because this is workspace state -- a JSON blob VS Code reads on startup -- and
+// each view carries a visibility entry per layer in the design, so a PDK-scale
+// layout is a few KB per saved view. Fifty is far more than anyone browses; the
+// cap is there so a script driving the viewer can't grow the blob without end.
+const MAX_NAMED_VIEWS = 50;
+const MAX_VIEW_NAME_LENGTH = 60;
+
 // Hard ceiling on the layout bytes. They have to be copied into the wasm
 // module's 32-bit heap (4 GB, see src/wasm/CMakeLists.txt) and the flattened
 // geometry built from them is always larger again, so a file this size cannot
@@ -237,7 +251,65 @@ class GdsEditorProvider {
         await this.context.workspaceState.update(MARKER_PATHS_KEY, map);
     }
 
-    async openCustomDocument(uri, openContext, token) {
+    // Saved views for one layout (see NAMED_VIEWS_KEY). Read and written whole:
+    // the viewer holds the working copy and sends the entire list back after
+    // every change, which makes this side a store rather than a second opinion
+    // about what the list is.
+    namedViewsFor(fsPath) {
+        const map = this.context.workspaceState.get(NAMED_VIEWS_KEY) || {};
+        const views = map[fsPath];
+        return Array.isArray(views) ? views : [];
+    }
+
+    async setNamedViews(fsPath, views) {
+        const map = { ...(this.context.workspaceState.get(NAMED_VIEWS_KEY) || {}) };
+        const kept = (Array.isArray(views) ? views : []).slice(0, MAX_NAMED_VIEWS);
+        // An empty list drops the entry rather than storing an empty array, so
+        // deleting the last saved view leaves nothing behind for this layout.
+        if (kept.length === 0) delete map[fsPath];
+        else map[fsPath] = kept;
+        await this.context.workspaceState.update(NAMED_VIEWS_KEY, map);
+    }
+
+    // Asks for the name to save the current view under. Here rather than in the
+    // webview because a webview has no prompt() to call -- and this way the box
+    // validates as you type, in the editor's own idiom. `names` is what the
+    // viewer already has, which is what makes "this replaces X" sayable before
+    // the name is committed to.
+    //
+    // Takes the caller's guarded `post` rather than the panel: this awaits a
+    // typed name, and closing the tab while the input box is open is exactly
+    // the case that leaves a postMessage aimed at a disposed webview.
+    async promptViewName(post, names) {
+        const existing = Array.isArray(names) ? names : [];
+        if (existing.length >= MAX_NAMED_VIEWS) {
+            vscode.window.showErrorMessage(
+                `GDS Lens: this layout already has ${MAX_NAMED_VIEWS} saved views — delete one first.`);
+            return;
+        }
+        const name = await vscode.window.showInputBox({
+            title: 'Save Current View',
+            prompt: 'Name for this camera position and layer visibility',
+            placeHolder: 'e.g. pad ring, top-left corner, metal only',
+            validateInput: (value) => {
+                const trimmed = value.trim();
+                if (!trimmed) return null;  // nothing typed yet, not an error
+                if (trimmed.length > MAX_VIEW_NAME_LENGTH) {
+                    return `Keep it under ${MAX_VIEW_NAME_LENGTH} characters`;
+                }
+                // A warning, not a rejection: replacing a view under the same
+                // name is a normal thing to want ("the overview moved").
+                const clash = existing.find((other) => other.toLowerCase() === trimmed.toLowerCase());
+                return clash
+                    ? { message: `Replaces the saved view "${clash}"`, severity: vscode.InputBoxValidationSeverity.Warning }
+                    : null;
+            }
+        });
+        if (!name || !name.trim()) return;
+        post({ type: 'saveViewName', name: name.trim() });
+    }
+
+    async openCustomDocument(uri, _openContext, _token) {
         return {
             uri: uri,
             onDidDispose: new vscode.EventEmitter().event,
@@ -256,6 +328,7 @@ class GdsEditorProvider {
             // 2. Fetch the absolute disk file path vectors
             const htmlPath = path.join(this.context.extensionPath, 'src', 'viewer.html');
             const jsPath = path.join(this.context.extensionPath, 'src', 'viewer.js');
+            const cellSearchJsPath = path.join(this.context.extensionPath, 'src', 'cell-search.js');
             const markerParsersJsPath = path.join(this.context.extensionPath, 'src', 'marker-parsers.js');
             const loadErrorsJsPath = path.join(this.context.extensionPath, 'src', 'load-errors.js');
             const wasmJsPath = path.join(this.context.extensionPath, 'src', 'wasm', 'build', 'gdstk_wasm.js');
@@ -264,6 +337,7 @@ class GdsEditorProvider {
 
             // 3. Convert the native viewer.js/wasm file paths into authenticated Webview URIs
             const jsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(jsPath));
+            const cellSearchJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(cellSearchJsPath));
             const markerParsersJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(markerParsersJsPath));
             const loadErrorsJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(loadErrorsJsPath));
             const wasmJsWebviewUri = webviewPanel.webview.asWebviewUri(vscode.Uri.file(wasmJsPath));
@@ -299,6 +373,7 @@ class GdsEditorProvider {
             let htmlContent = fs.readFileSync(htmlPath, 'utf8');
             htmlContent = htmlContent.replace('src="wasm/build/gdstk_wasm.js"', 'src="' + wasmJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="vendor/lil-gui.umd.min.js"', 'src="' + lilGuiJsWebviewUri.toString() + '"');
+            htmlContent = htmlContent.replace('src="cell-search.js"', 'src="' + cellSearchJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="marker-parsers.js"', 'src="' + markerParsersJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="load-errors.js"', 'src="' + loadErrorsJsWebviewUri.toString() + '"');
             htmlContent = htmlContent.replace('src="viewer.js"', 'src="' + jsWebviewUri.toString() + '"');
@@ -547,6 +622,14 @@ class GdsEditorProvider {
                     }
                     return;
                 }
+                if (message.command === 'promptViewName') {
+                    await this.promptViewName(post, message.names);
+                    return;
+                }
+                if (message.command === 'saveNamedViews') {
+                    await this.setNamedViews(document.uri.fsPath, message.views);
+                    return;
+                }
                 if (message.command === 'setAutoReload') {
                     await setAutoReload(!!message.value);
                     return;
@@ -611,6 +694,10 @@ class GdsEditorProvider {
             if (savedMarkerPath && !this.postMarkers(webviewPanel, savedMarkerPath)) {
                 await this.updateMarkerMap((map) => { delete map[document.uri.fsPath]; });
             }
+            // This layout's saved views. Sent whether or not there are any --
+            // the viewer's list is whatever arrives here, so an empty one is
+            // the message that says "none saved".
+            post({ type: 'namedViews', views: this.namedViewsFor(document.uri.fsPath) });
         } catch (err) {
             logger.appendLine('[FATAL CRASH ERROR] ' + err.stack);
             // Best-effort: if the webview got far enough to render, it's

@@ -15,6 +15,8 @@ and DRC/LVS marker browsing.
 - **GDSII and OASIS**, including gzipped (`.gds.gz`, `.oas.gz`, `.oasis.gz`).
 - **Full hierarchy** — SREF/AREF, rotation, mirroring and magnification.
 - **A cell tree** you can click through to frame and outline any cell.
+- **Find by name** — any cell, or any of the layout's own text labels.
+- **Saved views** — name a camera and layer set, and come back to it.
 - **A PDK-scale layer panel** — filter, solo, shape counts, bulk show/hide.
 - **KLayout `.lyp` colors**, remembered per layout.
 - **A ruler** with vertex/edge snapping and axis constraint.
@@ -48,6 +50,30 @@ tree, starting from its top cell(s).
 - Open branches and the selection survive a reload, so re-running a generator
   leaves the tree where you had it.
 
+#### Finding a cell or a label
+
+**Find** — the folded row under the panel's header — searches the two things in a
+design that have names: its cells, and the layout's own `TEXT` labels, with
+**Cells | Labels** choosing which. It starts closed, since the panel is there to
+browse the tree; `/` opens it and lands in the box from anywhere, opening the
+panel too if that was away.
+
+- **Results take the tree's place** while a query is up, and clearing the box
+  puts the tree back with its open branches untouched.
+- **Cells** match by name, exact matches first. Clicking one *opens the tree down
+  to it*: the branches above it unfold, the row is selected and framed, and every
+  placement is outlined — the same as having found the row by hand. The query
+  stays in the box, so clicking back into it brings the list back.
+- **Labels** match by text, including labels on layers you've hidden (the row
+  says so). Clicking one pans to it and marks it with a dashed box, leaving the
+  zoom alone — a label is drawn at a fixed size on screen, so there's no extent
+  to frame. Text drawing switches on if it was off, since finding a label and
+  showing nothing isn't an answer.
+- **↑ ↓ and Enter** walk the list and take a row; `Esc` clears the query, and
+  again folds the box away. Closing it clears the search and puts the tree back.
+- A query survives a reload of the same file and is re-run against what was
+  read, like the rest of the working context.
+
 ### Layers
 
 - **Per-layer visibility**, grouped by the `.lyp`'s categories, with each row
@@ -72,6 +98,17 @@ A collapsed folder for the things you set once:
 | **Load KLayout .lyp File** | Custom layer colors |
 | **Load Marker File** | A DRC/LVS marker database — see below |
 | **Reset View** | Refit the layout to the window |
+
+### Saved views
+
+**Views** in the panel keeps named places in a design. **Save Current View**
+asks for a name and stores the camera together with which layers were on;
+clicking a saved view puts both back, and the ✕ deletes it.
+
+Views are kept per layout and survive closing the file — so "pad ring", "the
+corner that failed DRC" or "metal only, full chip" are still there next week.
+The render toggles in **Display** are deliberately not part of a view: those are
+how you like layouts drawn, not a place in one.
 
 ### Measuring
 
@@ -121,8 +158,10 @@ per-layer visibility. **Always** reloads without asking from then on.
 | Key | Does |
 | --- | --- |
 | `H` | Show/hide the hierarchy panel |
+| `/` | Open the find box (cells and labels) and type in it |
+| `↑` `↓` `Enter` | (Find) walk the results, take a row |
 | `M` | Switch between Pan and Measure |
-| `Esc` | Abandon a measurement, clear finished rulers, or clear cell outlines |
+| `Esc` | Clear the find query, abandon a measurement, clear finished rulers, or clear cell outlines |
 | `Alt` | (Measure) place a point without snapping |
 | `Shift` | (Measure) constrain to horizontal or vertical |
 | `[` `]` | Step through marker violations |

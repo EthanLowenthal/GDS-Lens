@@ -18,6 +18,11 @@ see [`README.md`](README.md).
 - `src/marker-parsers.js` — standalone parsers for DRC/LVS marker databases
   (KLayout `.lyrdb`, Calibre DRC ASCII); loaded in the webview via a
   `<script>` tag and `require()`d directly by the unit tests.
+- `src/cell-search.js` — the two pure functions behind the hierarchy panel's
+  find box: ranking the cells a typed name matches, and the depth-first walk
+  that finds which branch the tree has to open to show one. Standalone for the
+  same reason `marker-parsers.js` is — a `<script>` tag in the webview, and
+  `require()`d directly by the unit tests.
 - `src/coord-parse.js` — reads an `x, y` pair out of pasted text (the units and
   decorations real DRC reports print). Standalone for the same reason
   `marker-parsers.js` is: the "Go to Coordinate" command validates the input box
@@ -223,7 +228,18 @@ Q3 2026. Microsoft needs a GitHub Actions story before retiring PATs on
 ship in time. If it has not shipped by ~November 2026, fall back to
 `--azure-credential`.
 
-## Known issues
+## Linting
 
-- `eslint.config.mjs` imports `globals`, which isn't a declared dependency —
-  `npx eslint` currently fails with `ERR_MODULE_NOT_FOUND`.
+`npm run lint` (`eslint .`). Clean means clean: the config reports nothing on
+the tree as it stands, so anything it prints is new.
+
+The config is split per environment rather than applied as one block, because
+this tree holds three of them and `no-undef` is only worth having if it knows
+which one a file is in — the webview's `<script>` files (browser globals plus
+whatever the tags before them defined), the parse Worker (no DOM), and the
+extension host with the unit tests (CommonJS under Node). Two things it skips:
+`src/wasm/build/` (Emscripten's generated output) and `src/vendor/`
+(a minified upstream lil-gui), neither of which is ours to fix.
+
+A leading underscore marks an argument required by a signature but unused —
+what the VS Code API's providers are handed — and the config ignores those.

@@ -368,6 +368,26 @@ function setRowVisible(Module, row, visible) {
     Module.setLayerVisible(row.item.layer, row.item.datatype, visible);
 }
 
+// Re-reads every layer row's checkbox from wasm. Needed by the paths that set
+// visibility in bulk without going through the rows themselves -- restoring a
+// saved view (see restoreNamedView) is one -- where the panel would otherwise
+// keep showing the checkboxes of the state it replaced. The reverse of
+// setRowVisible: wasm already holds the value, so this only catches the display
+// up to it.
+function syncLayerRowsFromModule(Module) {
+    const visibleByTag = new Map();
+    for (const layer of Module.getLayers()) {
+        visibleByTag.set(`${layer.layer}/${layer.datatype}`, layer.visible);
+    }
+    for (const row of layerRows) {
+        const visible = visibleByTag.get(layerTag(row.item));
+        if (visible === undefined || row.state.visible === visible) continue;
+        row.state.visible = visible;
+        row.controller.updateDisplay();
+    }
+    syncCategoryChecks();
+}
+
 // Re-derives every category's "all" checkbox from the rows under it.
 function syncCategoryChecks() {
     for (const category of layerCategories) {
@@ -889,8 +909,80 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
         // Re-selecting after a rebuild (a reload, or reopening a branch) puts
         // the outlines back without moving the camera -- only a click moves it.
         if (path === hierarchySelectedPath) hierarchySelect(row, path, boxes);
+        // ...except a rebuild the search asked for, which is standing in for the
+        // click the user would have made if the row had been on screen: that one
+        // frames the cell and scrolls the row it made to it (see revealCell).
+        if (path === hierarchyRevealPath) {
+            row.scrollIntoView({ block: "center" });
+            if (box) modulePromise.then((Module) => Module.zoomToBox(box.minX, box.minY, box.maxX, box.maxY));
+        }
         if (hierarchyExpanded.has(path)) setExpanded(true);
     }
+}
+
+// Path the search asked to reveal, consumed by addHierarchyRows as it builds
+// that row (see revealCell). Null at every other moment, so a rebuild for any
+// other reason moves nothing.
+let hierarchyRevealPath = null;
+
+// Throws the rows away and builds them again from the current model, keeping
+// the open branches and the selection (both are held by path, not by DOM node
+// -- see hierarchyExpanded). Rebuilding rather than reaching into the rows is
+// what makes revealing a cell possible at all: a row for a branch nobody has
+// opened doesn't exist yet, and adding the branch's path to hierarchyExpanded
+// and building again is how it comes to.
+function rebuildHierarchyRows() {
+    if (!hierarchyTree || !hierarchyModel) return;
+    hierarchySelectedRow = null;
+    hierarchySelectedBoxes = [];
+    hierarchyTree.textContent = "";
+
+    const cells = hierarchyModel.cells || [];
+    const roots = (hierarchyModel.roots || []).filter((index) => cells[index]);
+    // Top-level cells are drawn as if referenced once by an invisible parent
+    // at the identity transform -- their own coordinates *are* world
+    // coordinates, which is exactly what that entry says.
+    const rootNodes = roots.map((index) => ({
+        cell: index,
+        count: 1,
+        bbox: cells[index].bbox,
+        xform: HIERARCHY_IDENTITY
+    }));
+    addHierarchyRows(hierarchyTree, rootNodes, 0, "", HIERARCHY_IDENTITY);
+}
+
+// The tree's half of a cell search: cellPathToTarget (cell-search.js, loaded
+// via its own <script> tag) finds the path, and revealCell below opens it.
+function hierarchyPathToCell(target) {
+    if (!hierarchyModel) return null;
+    return cellPathToTarget(hierarchyModel.cells || [], hierarchyModel.roots || [],
+                            target, HIERARCHY_MAX_DEPTH);
+}
+
+// Opens the tree down to a cell, selects the row and frames it -- what clicking
+// that row would have done, for a row that wasn't on screen to click. False
+// means no top cell places this one (a reference cycle, or a cell the tree's
+// own caps left out), so there is no branch to open.
+function revealCell(target) {
+    const path = hierarchyPathToCell(target);
+    if (!path) return false;
+
+    const names = path.map((index) => hierarchyModel.cells[index].name);
+    // Every ancestor of the target row has to be open for it to exist, and
+    // rows are keyed by the path of names leading to them.
+    for (let i = 1; i < names.length; i++) {
+        hierarchyExpanded.add(names.slice(0, i).join("/"));
+    }
+    hierarchySelectedPath = names.join("/");
+    hierarchyRevealPath = hierarchySelectedPath;
+    try {
+        rebuildHierarchyRows();
+    } finally {
+        // Cleared even if a row throws mid-build, so a later rebuild for some
+        // unrelated reason can't jump the camera at a stale path.
+        hierarchyRevealPath = null;
+    }
+    return true;
 }
 
 // Rebuilds the tree from a freshly loaded design (or clears it, for model
@@ -922,6 +1014,7 @@ function renderHierarchy(model) {
     if (!model || cellCount === 0) {
         if (hierarchyCount) hierarchyCount.textContent = "";
         if (hierarchyShowBtn) hierarchyShowBtn.classList.add("hidden");
+        refreshFind(true);
         setHierarchyOpen(false);
         return;
     }
@@ -930,12 +1023,18 @@ function renderHierarchy(model) {
 
     // A different design: drop the previous one's open branches and selection
     // rather than matching them against unrelated cell names.
-    const rootKey = roots.map((i) => cells[i].name).join(" ");
-    if (rootKey !== hierarchyRootKey) {
+    const rootKey = roots.map((i) => cells[i].name).join(" ");
+    const sameDesign = rootKey === hierarchyRootKey;
+    if (!sameDesign) {
         hierarchyRootKey = rootKey;
         hierarchyExpanded.clear();
         hierarchySelectedPath = null;
     }
+    // The find box follows the same rule: a reload of the same design keeps the
+    // query and re-runs it over what was just read -- a search in progress is
+    // part of the working context a reload preserves, alongside the camera and
+    // the open branches -- while a different design starts from an empty box.
+    refreshFind(!sameDesign);
 
     if (model.omitted) {
         const note = document.createElement("div");
@@ -952,16 +1051,7 @@ function renderHierarchy(model) {
         hierarchyExpanded.add(cells[roots[0]].name);
     }
 
-    // Top-level cells are drawn as if referenced once by an invisible parent
-    // at the identity transform -- their own coordinates *are* world
-    // coordinates, which is exactly what that entry says.
-    const rootNodes = roots.map((index) => ({
-        cell: index,
-        count: 1,
-        bbox: cells[index].bbox,
-        xform: HIERARCHY_IDENTITY
-    }));
-    addHierarchyRows(hierarchyTree, rootNodes, 0, "", HIERARCHY_IDENTITY);
+    rebuildHierarchyRows();
 
     // Closed by default: the viewport belongs to the layout, and a panel that
     // takes 260px of it should be something you ask for. The rows above are
@@ -984,6 +1074,401 @@ if (hierarchyHide) {
 }
 if (hierarchyShowBtn) {
     hierarchyShowBtn.addEventListener("click", () => setHierarchyOpen(true, true));
+}
+
+// ---- Find: cells and labels ----
+// One box over the two things in a design that have names: its cells, and the
+// layout's own TEXT labels. Both answer the same question -- "where is the
+// thing called X" -- so they share a box, a result list and a keystroke, with
+// the scope pair saying which name is being matched.
+//
+// Results take the tree's place while a query is up, rather than filtering the
+// rows the way the Layers panel filters its list: the tree is built lazily, so
+// a cell in a branch nobody has opened has no row to show or hide. That is
+// also why choosing a cell *reveals* it -- opens the branches down to it and
+// selects the row (see revealCell) -- instead of just moving the camera and
+// leaving the tree pointing somewhere else entirely.
+const hierarchyFindToggle = document.getElementById("hierarchyFindToggle");
+const hierarchyFindTwisty = document.getElementById("hierarchyFindTwisty");
+const hierarchySearchBox = document.getElementById("hierarchySearch");
+const hierarchySearchInput = document.getElementById("hierarchySearchInput");
+const hierarchySearchCount = document.getElementById("hierarchySearchCount");
+const hierarchyResults = document.getElementById("hierarchyResults");
+const hierarchyScopeCells = document.getElementById("hierarchyScopeCells");
+const hierarchyScopeLabels = document.getElementById("hierarchyScopeLabels");
+
+// Rows past this aren't built. A 260px list is read, not scrolled through by
+// the thousand, and the count line says how many matches were left out -- the
+// same bargain the marker browser's per-category cap makes.
+const MAX_FIND_ROWS = 200;
+
+// Half-width of the box a chosen label is marked with, in pixels at the zoom it
+// was chosen at. A label has no extent of its own -- its glyphs are drawn at a
+// fixed pixel size, so there is no world-space box to frame -- which is also
+// why choosing one pans without zooming: how much around it you want to see
+// isn't something the label says (the same reasoning as Go to Coordinate).
+const LABEL_MARK_PX = 14;
+
+// "cells" or "labels".
+let findScope = "cells";
+// The query the list on screen belongs to, so an answer for a query already
+// typed past can't overwrite a newer one.
+let findQuery = "";
+// One record per built row: {element, activate}. Also what the arrow keys walk.
+let findRows = [];
+let findActiveIndex = -1;
+
+// Opens and closes the fold the box lives in (closed on arrival -- see the
+// markup in viewer.html). Closing clears the query rather than just hiding the
+// box: a result list is the answer to a question the panel would no longer be
+// showing, and leaving one up with nothing on screen to explain it is the same
+// mistake as leaving cell outlines up with the panel away.
+function setFindOpen(open) {
+    if (!hierarchySearchBox) return;
+    const changed = open !== findIsOpen();
+    hierarchySearchBox.classList.toggle("hidden", !open);
+    if (hierarchyFindTwisty) hierarchyFindTwisty.textContent = open ? "▾" : "▸";
+
+    if (open) {
+        // Opening it is asking to type in it -- and so is asking for it again
+        // when it's already out (which is what "/" does, see focusFindBox).
+        if (hierarchySearchInput) hierarchySearchInput.focus();
+        return;
+    }
+    // Only on the way down, so closing an already-closed box can't wipe a
+    // query. Nothing does that today, but runSearch below is not free on a
+    // design with a million labels.
+    if (!changed) return;
+    if (hierarchySearchInput) {
+        hierarchySearchInput.value = "";
+        hierarchySearchInput.blur();
+    }
+    runSearch();
+}
+
+function findIsOpen() {
+    return !!(hierarchySearchBox && !hierarchySearchBox.classList.contains("hidden"));
+}
+
+// The list and the tree are the same slot in the panel.
+function setFindResultsOpen(open) {
+    if (!hierarchyResults || !hierarchyTree) return;
+    hierarchyResults.classList.toggle("hidden", !open);
+    hierarchyTree.classList.toggle("hidden", open);
+}
+
+function setFindCount(text) {
+    if (hierarchySearchCount) hierarchySearchCount.textContent = text;
+}
+
+function clearFindRows() {
+    if (hierarchyResults) hierarchyResults.textContent = "";
+    findRows = [];
+    findActiveIndex = -1;
+}
+
+// A line of prose in the list: no matches, or how many were left out.
+function findNote(text) {
+    if (!hierarchyResults) return;
+    const note = document.createElement("div");
+    note.className = "find-note";
+    note.textContent = text;
+    hierarchyResults.append(note);
+}
+
+// One result row: `name` on the left, `meta` on the right, `activate(row)` on
+// click or Enter. Rows are appended in the order they're built, which is the
+// order the arrow keys walk them in.
+function addFindRow(name, meta, title, activate) {
+    if (!hierarchyResults) return;
+    const element = document.createElement("div");
+    element.className = "find-row";
+    const nameEl = document.createElement("span");
+    nameEl.className = "find-name";
+    nameEl.textContent = name;
+    const metaEl = document.createElement("span");
+    metaEl.className = "find-meta";
+    metaEl.textContent = meta;
+    element.append(nameEl, metaEl);
+    element.title = title;
+    const index = findRows.length;
+    element.addEventListener("click", () => activateFindRow(index));
+    hierarchyResults.append(element);
+    findRows.push({ element, activate });
+}
+
+function setFindActive(index) {
+    const previous = findRows[findActiveIndex];
+    if (previous) previous.element.classList.remove("find-active");
+    findActiveIndex = index;
+    const row = findRows[index];
+    if (!row) return;
+    row.element.classList.add("find-active");
+    row.element.scrollIntoView({ block: "nearest" });
+}
+
+function activateFindRow(index) {
+    const row = findRows[index];
+    if (!row || !row.activate) return;
+    setFindActive(index);
+    row.activate(row);
+}
+
+// Arrow keys walk the list and Enter takes the row they're on (the first, if
+// they haven't been used): a list you can only reach with the mouse makes you
+// let go of the keyboard you just typed the query with.
+function stepFindRow(direction) {
+    if (findRows.length === 0) return;
+    const from = findActiveIndex < 0 ? (direction > 0 ? -1 : 0) : findActiveIndex;
+    setFindActive((from + direction + findRows.length) % findRows.length);
+}
+
+// Re-runs the search from whatever is in the box: every keystroke, a scope
+// switch, and each load.
+function runSearch() {
+    if (!hierarchySearchInput) return;
+    const query = hierarchySearchInput.value.trim();
+    findQuery = query;
+    if (!query) {
+        clearFindRows();
+        setFindResultsOpen(false);
+        setFindCount("");
+        return;
+    }
+    setFindResultsOpen(true);
+    if (findScope === "labels") runLabelSearch(query);
+    else renderCellResults(query);
+}
+
+function renderCellResults(query) {
+    clearFindRows();
+    // A design too large for a tree ships no cell names at all (see the
+    // omitted case in build_hierarchy), so there is nothing here to match --
+    // say which of the two it is rather than answering "no such cell".
+    if (hierarchyModel && hierarchyModel.omitted) {
+        setFindCount("");
+        findNote(`This design's ${hierarchyModel.cellCount} cells are too many for the viewer to hold as a tree, ` +
+                 `so it has no cell names to search. Labels still work.`);
+        return;
+    }
+
+    const cells = (hierarchyModel && hierarchyModel.cells) || [];
+    // Best match first -- see rankCellMatches in cell-search.js.
+    const matches = rankCellMatches(cells, query);
+
+    setFindCount(matches.length === 0
+        ? "no match"
+        : `${Math.min(matches.length, MAX_FIND_ROWS)} of ${matches.length} cell${matches.length === 1 ? "" : "s"}`);
+
+    for (const index of matches.slice(0, MAX_FIND_ROWS)) {
+        const cell = cells[index];
+        // Same shorthand the layer rows use: a cell whose own content is text
+        // rather than geometry would otherwise read as empty behind a bare 0.
+        const meta = cell.polygons > 0
+            ? fmtCount(cell.polygons)
+            : (cell.labels > 0 ? `T${fmtCount(cell.labels)}` : "0");
+        const title = [
+            cell.name,
+            `${cell.polygons.toLocaleString()} own shape${cell.polygons === 1 ? "" : "s"}, ` +
+            `${cell.labels.toLocaleString()} label${cell.labels === 1 ? "" : "s"}, ` +
+            `${cell.refs.length} child cell${cell.refs.length === 1 ? "" : "s"}`,
+            "Click to open the tree down to it, frame it and outline every placement"
+        ].join("\n");
+        addFindRow(cell.name, meta, title, (row) => chooseCell(index, row));
+    }
+    if (matches.length > MAX_FIND_ROWS) {
+        findNote(`… ${matches.length - MAX_FIND_ROWS} more — narrow the query`);
+    }
+    if (matches.length === 0) findNote(`No cell name contains “${query}”.`);
+}
+
+// The answer to "where is this cell" is a row in the hierarchy, in context and
+// with its parents opened -- so the tree is what's on screen afterwards, and
+// the list steps aside. The query stays in the box: clicking back into it
+// brings the same list back without retyping.
+function chooseCell(index, row) {
+    // The tree goes back on screen *before* the row is built, not after:
+    // revealCell scrolls the row it makes into view, and an element inside a
+    // display:none container has nowhere to be scrolled to.
+    setFindResultsOpen(false);
+    if (revealCell(index)) return;
+
+    // No top cell places this one, so there's no branch to open down to it.
+    // Said on the row that was clicked rather than as a message elsewhere --
+    // which means bringing the list back to say it -- and the row goes inert so
+    // it doesn't invite a second try.
+    setFindResultsOpen(true);
+    row.activate = null;
+    row.element.classList.add("find-unreachable");
+    row.element.title = `${hierarchyModel.cells[index].name}\n` +
+        `No top cell places this one, so the tree has no branch that reaches it.`;
+}
+
+// Labels live in wasm and never cross back (a full chip's worth of them is far
+// too much to hold twice), so the match itself happens there -- see findLabels
+// in renderer.cpp, which also reports how many matched beyond the ones it
+// returned.
+function runLabelSearch(query) {
+    modulePromise.then((Module) => {
+        const result = Module.findLabels(query, MAX_FIND_ROWS);
+        // The box may have moved on while this was in flight.
+        if (query !== findQuery || findScope !== "labels") return;
+        renderLabelResults(query, result);
+    });
+}
+
+function renderLabelResults(query, result) {
+    clearFindRows();
+    const hits = result.hits || [];
+    const total = result.total || 0;
+    setFindCount(total === 0
+        ? "no match"
+        : `${hits.length} of ${total.toLocaleString()} label${total === 1 ? "" : "s"}`);
+
+    for (const hit of hits) {
+        const tag = hit.name ? `${hit.layer}/${hit.datatype} ${hit.name}` : `${hit.layer}/${hit.datatype}`;
+        // Hidden layers are searched too -- the label you're looking for is
+        // often on one you turned off -- so the row says when that's the case
+        // rather than sending you to a spot with nothing on it.
+        const meta = hit.visible ? tag : `${tag} · hidden`;
+        const title = [
+            hit.text,
+            `on layer ${tag}${hit.visible ? "" : " — currently hidden, but the label is still marked"}`,
+            `at (${fmtCoord(hit.x)}, ${fmtCoord(hit.y)}) µm — click to pan there and mark it`
+        ].join("\n");
+        addFindRow(hit.text, meta, title, () => goToLabel(hit));
+    }
+    if (total > hits.length) {
+        findNote(`… ${(total - hits.length).toLocaleString()} more — narrow the query`);
+    }
+    if (total === 0) findNote(`No label text contains “${query}”.`);
+}
+
+// Pans to a label and marks it. The list stays up, unlike the cell case: each
+// row here is a candidate to look at, and stepping through them is a series of
+// camera moves, not a change of what the panel is showing.
+function goToLabel(hit) {
+    modulePromise.then((Module) => {
+        Module.goToPoint(hit.x, hit.y);
+        // The layout's own labels are only drawn with the Text toggle on, and
+        // it's off by default -- landing on a label and showing nothing is the
+        // wrong end to a search, so finding one turns text on rather than
+        // explaining why it isn't there. setValue (not the bare flag) so the
+        // checkbox and wasm both follow.
+        if (!actions.showText) textController.setValue(true);
+        markLabelHit(Module, hit);
+    });
+}
+
+// The mark goes in the panel's highlight channel -- the same one a selected
+// cell's outlines use -- so Esc takes it down, hiding the panel takes it with
+// it, and pointing at one thing stops pointing at the other. The panel points
+// at one place at a time, so the tree's selection is dropped here rather than
+// left highlighted somewhere off screen.
+function markLabelHit(Module, hit) {
+    const zoom = Module.getCamera().zoom;
+    const half = LABEL_MARK_PX / (zoom > 0 ? zoom : 1);
+    if (hierarchySelectedRow) hierarchySelectedRow.classList.remove("hier-selected");
+    hierarchySelectedRow = null;
+    hierarchySelectedPath = null;
+    hierarchySelectedBoxes = [{
+        minX: hit.x - half,
+        minY: hit.y - half,
+        maxX: hit.x + half,
+        maxY: hit.y + half
+    }];
+    syncCellHighlight();
+}
+
+function setFindScope(scope) {
+    if (findScope === scope) return;
+    findScope = scope;
+    updateFindScope();
+    runSearch();
+}
+
+// Reflects the scope pair and the box's placeholder, including the case where
+// one side has nothing to search (see renderCellResults).
+function updateFindScope() {
+    const cellsAvailable = !!(hierarchyModel && !hierarchyModel.omitted &&
+                              hierarchyModel.cells && hierarchyModel.cells.length > 0);
+    if (hierarchyScopeCells) {
+        hierarchyScopeCells.classList.toggle("scope-active", findScope === "cells");
+        hierarchyScopeCells.disabled = !cellsAvailable;
+        hierarchyScopeCells.title = cellsAvailable
+            ? "Search the design's cell names"
+            : "This design's cell names aren't held in the viewer — see the note in the panel";
+    }
+    if (hierarchyScopeLabels) {
+        hierarchyScopeLabels.classList.toggle("scope-active", findScope === "labels");
+    }
+    if (hierarchySearchInput) {
+        hierarchySearchInput.placeholder = findScope === "labels" ? "label text" : "cell name";
+    }
+}
+
+// Called for every load (see renderHierarchy). `reset` empties the box; either
+// way whatever query is left is re-run, since both haystacks have just been
+// replaced by the file that was read. A design with no cell tree has nothing to
+// search by cell name, so the scope moves to the side that can still answer
+// rather than leaving a box that returns nothing whatever you type.
+function refreshFind(reset) {
+    if (reset && hierarchySearchInput) hierarchySearchInput.value = "";
+    if (hierarchyModel && hierarchyModel.omitted) findScope = "labels";
+    updateFindScope();
+    runSearch();
+}
+
+if (hierarchySearchInput) {
+    hierarchySearchInput.addEventListener("input", runSearch);
+    // Choosing a cell puts the list away; clicking back into the box is how it
+    // comes back, without retyping the query it still holds.
+    hierarchySearchInput.addEventListener("focus", () => {
+        if (findQuery) setFindResultsOpen(true);
+    });
+    hierarchySearchInput.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+            // Escape in a search box undoes the search, and only leaves the box
+            // once there's no query left to undo. Stopped here either way, so it
+            // never reaches the window handler's Escape -- which takes rulers
+            // and outlines off the canvas, and has nothing to do with typing.
+            if (hierarchySearchInput.value) {
+                hierarchySearchInput.value = "";
+                runSearch();
+            } else {
+                // Nothing left to undo: fold the box away, which is the state
+                // it was found in.
+                setFindOpen(false);
+            }
+            event.stopPropagation();
+        } else if (event.key === "Enter") {
+            activateFindRow(findActiveIndex < 0 ? 0 : findActiveIndex);
+        } else if (event.key === "ArrowDown") {
+            event.preventDefault();
+            stepFindRow(1);
+        } else if (event.key === "ArrowUp") {
+            event.preventDefault();
+            stepFindRow(-1);
+        }
+    });
+}
+if (hierarchyScopeCells) hierarchyScopeCells.addEventListener("click", () => setFindScope("cells"));
+if (hierarchyScopeLabels) hierarchyScopeLabels.addEventListener("click", () => setFindScope("labels"));
+if (hierarchyFindToggle) hierarchyFindToggle.addEventListener("click", () => setFindOpen(!findIsOpen()));
+// Once up front, so the pair reads correctly before the first load rather than
+// waiting for the refreshFind that comes with one.
+updateFindScope();
+
+// The "/" key: unfolds the box and puts the cursor in it, opening the panel too
+// if that was away. Searching is the one thing in this panel reached for
+// mid-look with a name already in mind, so a fold that has to be found with the
+// mouse first would be a fold in the way -- this is what keeps it out of the
+// way instead.
+function focusFindBox() {
+    if (!hierarchySearchInput || !hierarchyModel || !hierarchyModel.cellCount) return;
+    if (hierarchyPanel && hierarchyPanel.classList.contains("hidden")) setHierarchyOpen(true, true);
+    setFindOpen(true);
+    hierarchySearchInput.select();
 }
 
 // ---- Marker browser (DRC/LVS violation databases) ----
@@ -1161,6 +1646,13 @@ window.addEventListener("keydown", (event) => {
     // H shows/hides the hierarchy tree -- it's the one panel that takes a
     // slice of the viewport, so getting it out of the way is worth a key.
     else if (event.key === "h" || event.key === "H") toggleHierarchy();
+    // "/" jumps to the find box (opening the panel if it's away), the way it
+    // does in a file tree. preventDefault so the slash itself doesn't land in
+    // the box that just took focus.
+    else if (event.key === "/") {
+        event.preventDefault();
+        focusFindBox();
+    }
 }, true);
 
 // ---- "Newer version on disk" banner ----
@@ -1231,6 +1723,150 @@ function restoreViewState(Module, saved) {
         }
     }
     Module.setCamera(saved.camera.zoom, saved.camera.panX, saved.camera.panY);
+}
+
+// ---- Named views ----
+// A view is a camera plus which layers were on -- the two halves of "how I was
+// looking at this design" -- saved under a name and kept with the layout by the
+// extension host (see NAMED_VIEWS_KEY in extension.cjs), so they're still there
+// when the file is reopened days later.
+//
+// Deliberately not part of one: the render toggles (Infill / Text / Merge /
+// Grid). Those are a preference set once for how you like layouts drawn, not a
+// place in a design -- which is exactly the split the Display folder is built
+// around -- and a saved view that quietly flipped them back would undo a
+// setting the user didn't think they were saving.
+//
+// Restoring is the reload path's restore, reused as-is: keeping the camera and
+// the layer set across a re-read of the file is the same problem as putting
+// them back from a name, and captureViewState/restoreViewState already are it.
+const viewsFolder = gui.addFolder("Views");
+viewsFolder.close();
+// Nothing loaded yet has no view to save, so the folder isn't there to be
+// opened until the first layout is drawn (see the gdsResult handler).
+viewsFolder.hide();
+
+// [{name, camera: {zoom, panX, panY}, visibility: {"1/0": true, ...}}], in the
+// order they were saved. The host holds the copy that outlives the session; this
+// is the working one.
+let namedViews = [];
+// The rows built for them, kept so a re-render can take exactly those down and
+// leave the Save row (which isn't one of them) alone.
+let viewControllers = [];
+// The state captured when the name was asked for. A view should be the view you
+// were looking at when you hit save, not wherever the camera ended up while the
+// input box was open.
+let pendingViewCapture = null;
+
+const saveViewController = viewsFolder.add({ save: () => requestSaveView() }, "save")
+    .name("Save Current View");
+saveViewController.domElement.title =
+    "Name the current camera and layer visibility, and keep it with this layout";
+
+function persistNamedViews() {
+    vscode.postMessage({ command: "saveNamedViews", views: namedViews });
+}
+
+// The name is asked for by the extension host rather than in the page: a
+// webview has no prompt() to call, and the host's input box validates as you
+// type and looks like the rest of the editor.
+function requestSaveView() {
+    modulePromise.then((Module) => {
+        const captured = captureViewState(Module);
+        // Null means nothing is drawn yet -- there's no camera worth naming.
+        if (!captured) return;
+        pendingViewCapture = captured;
+        vscode.postMessage({
+            command: "promptViewName",
+            names: namedViews.map((view) => view.name)
+        });
+    });
+}
+
+// Saves under the name the host came back with. A name already in the list
+// replaces that view in place rather than adding a second one under it: "save
+// as Overview again" means the overview moved.
+function saveNamedView(name) {
+    const captured = pendingViewCapture;
+    pendingViewCapture = null;
+    if (!captured || !name) return;
+    // The camera is copied field by field rather than passed along: what
+    // getCamera() handed back crosses to the host and into stored state from
+    // here, and this is the shape that has to keep working when it's read back
+    // by a later version (see setNamedViews).
+    const view = {
+        name: name,
+        camera: {
+            zoom: captured.camera.zoom,
+            panX: captured.camera.panX,
+            panY: captured.camera.panY
+        },
+        visibility: captured.visibility
+    };
+    const at = namedViews.findIndex((existing) => existing.name.toLowerCase() === name.toLowerCase());
+    if (at >= 0) namedViews[at] = view;
+    else namedViews.push(view);
+    renderNamedViews();
+    persistNamedViews();
+}
+
+function deleteNamedView(view) {
+    namedViews = namedViews.filter((existing) => existing !== view);
+    renderNamedViews();
+    persistNamedViews();
+}
+
+function restoreNamedView(view) {
+    modulePromise.then((Module) => {
+        // The solo snapshot describes the visibility set this is replacing, so
+        // it would restore to a state that no longer exists.
+        forgetSolo();
+        restoreViewState(Module, view);
+        // restoreViewState writes straight to wasm (it normally runs just
+        // before the panel is rebuilt from scratch), so the checkboxes have to
+        // be caught up by hand here -- rebuilding the whole layer list instead
+        // would throw away the filter text and open folders with it.
+        syncLayerRowsFromModule(Module);
+    });
+}
+
+// Rebuilds just the view rows under the Save row. Each is a full-width button
+// that restores the view, with an ✕ that deletes it -- the same shape as the
+// loaded-file chips in the Display folder.
+function renderNamedViews() {
+    for (const controller of viewControllers) controller.destroy();
+    viewControllers = [];
+    viewsFolder.title(namedViews.length > 0 ? `Views  (${namedViews.length})` : "Views");
+
+    for (const view of namedViews) {
+        const controller = viewsFolder.add({ go: () => restoreNamedView(view) }, "go").name(view.name);
+        controller.domElement.classList.add("view-row");
+        controller.domElement.title =
+            `${view.name} — click to put the camera and layer visibility back, ✕ to delete`;
+        const remove = document.createElement("span");
+        remove.className = "view-delete";
+        remove.textContent = "✕";
+        remove.title = `Delete "${view.name}"`;
+        remove.addEventListener("click", (event) => {
+            // The ✕ overlays the row's own <button> without being inside it, so
+            // deleting a view can't also restore it on the way out.
+            event.stopPropagation();
+            deleteNamedView(view);
+        });
+        controller.domElement.appendChild(remove);
+        viewControllers.push(controller);
+    }
+}
+
+// What the host sends back from storage on open. Filtered rather than trusted:
+// this is persisted state that a future version's shape could differ from, and
+// a malformed entry would otherwise build a row that throws on click.
+function setNamedViews(views) {
+    namedViews = (Array.isArray(views) ? views : []).filter((view) =>
+        view && typeof view.name === "string" && view.name.length > 0 &&
+        view.camera && typeof view.camera.zoom === "number" &&
+        typeof view.camera.panX === "number" && typeof view.camera.panY === "number");
+    renderNamedViews();
 }
 
 const loadingOverlay = document.getElementById("loadingOverlay");
@@ -1491,6 +2127,14 @@ window.addEventListener("message", (event) => {
             renderMarkerBrowser(model);
             setMarkerChip(message.name || null);
         });
+    } else if (message.type === "namedViews") {
+        // This layout's saved views, read back from the host's storage when the
+        // editor opens (and after every change, which the host echoes nothing
+        // back for -- this side already holds what it just sent).
+        setNamedViews(message.views);
+    } else if (message.type === "saveViewName") {
+        // The name typed into the host's input box (see promptViewName).
+        saveNamedView(message.name);
     } else if (message.type === "fileChanged") {
         // The file changed on disk and auto-reload is off, so offer it.
         showStaleBanner(true, message.text || "A newer version of this file is on disk.");
@@ -1588,6 +2232,8 @@ function startWorker(worker, fileData) {
                 }
                 renderLayerList(Module.getLayers());
                 renderHierarchy(workerMessage.hierarchy);
+                // There's a view to save from now on (see viewsFolder.hide()).
+                viewsFolder.show();
                 // uploadLayers drops the rulers -- they were anchored to the
                 // geometry this load just replaced.
                 refreshRulerRow(Module);

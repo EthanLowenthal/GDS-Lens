@@ -213,6 +213,17 @@
         .lil-gui .lil-controller.lyp-loaded .lil-name { padding-right: 22px; }
         .lil-gui .lil-controller.lyp-loaded .lyp-unload { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: var(--danger-dim); cursor: pointer; font-size: 12px; z-index: 5; }
         .lil-gui .lil-controller.lyp-loaded .lyp-unload:hover { color: var(--danger); }
+        /* Saved-view rows (see renderNamedViews in viewer.js): a full-width
+           button that restores the view, with an ✕ on the right that deletes
+           it -- the same shape as the loaded-file chips above, and the same
+           reason for spelling it out separately (lil-gui has no row that
+           carries a second action). */
+        .lil-gui .lil-controller.view-row { position: relative; }
+        .lil-gui .lil-controller.view-row .lil-name { padding-right: 22px; }
+        .lil-gui .lil-controller.view-row .view-delete { position: absolute; right: 8px; top: 50%;
+                                                         transform: translateY(-50%); color: var(--danger-dim);
+                                                         cursor: pointer; font-size: 12px; z-index: 5; }
+        .lil-gui .lil-controller.view-row .view-delete:hover { color: var(--danger); }
         /* Marker browser (see renderMarkerBrowser in viewer.js): the selected
            violation's row, and the disabled "… N more" overflow row. The row
            is a full-width <button> in lil-gui, so tint the button itself
@@ -262,6 +273,67 @@
         .hier-count { flex: none; color: var(--fg-faint); }
         .hier-row.hier-selected .hier-twisty, .hier-row.hier-selected .hier-count { color: var(--accent-fg); }
         .hier-children.hidden { display: none; }
+        /* ---- Find (see the search block in viewer.js) ----
+           Sits between the header and the tree: it's a way into the same
+           panel, not a second panel. One row while it's closed, which is how
+           it starts -- see the markup below for why -- opening to the box and
+           the scope pair. The pair gets its own row rather than sharing one
+           with the input: at 260px a field narrowed by two buttons is too
+           small to read a cell name in. */
+        #hierarchyFind { flex: none; border-bottom: 1px solid var(--border); }
+        /* The closed row. Styled like a tree row rather than like the panel
+           header, because that's what it is: something you click to open. */
+        #hierarchyFindToggle { display: flex; align-items: center; gap: 4px; padding: 3px 8px;
+                               color: var(--fg-dim); cursor: pointer; white-space: nowrap; }
+        #hierarchyFindToggle:hover { background: var(--surface); color: var(--fg); }
+        #hierarchyFindTwisty { flex: none; width: 12px; text-align: center; color: var(--fg-faint); }
+        #hierarchyFindLabel { flex: none; }
+        #hierarchySearch { padding: 0 8px 6px; display: flex; flex-direction: column; gap: 5px; }
+        #hierarchySearch.hidden { display: none; }
+        /* user-select is off for the page as a whole (dragging the canvas would
+           otherwise select the chrome over it), and that inherits into a text
+           field -- where it costs you selecting what you typed, and makes the
+           select() behind the "/" shortcut a no-op. */
+        #hierarchySearchInput { width: 100%; box-sizing: border-box; font-family: inherit; font-size: 11px;
+                                background: var(--surface); color: var(--surface-fg);
+                                border: 1px solid var(--border-strong); border-radius: 3px;
+                                padding: 3px 6px; user-select: text; }
+        #hierarchySearchInput:focus { outline: none; border-color: var(--accent); }
+        #hierarchyScope { display: flex; gap: 4px; }
+        #hierarchyScope button { font-family: inherit; font-size: 10px; background: var(--surface);
+                                 color: var(--fg-dim); border: 1px solid var(--border-strong);
+                                 border-radius: 3px; padding: 1px 8px; cursor: pointer; }
+        #hierarchyScope button:hover { color: var(--fg); }
+        #hierarchyScope button.scope-active, #hierarchyScope button.scope-active:hover {
+            background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: bold; }
+        /* A design too large for a cell tree has no cell names on this side at
+           all (see the omitted case in renderHierarchy), so Cells has nothing
+           to search -- the button says so rather than returning nothing. */
+        #hierarchyScope button:disabled { opacity: 0.4; cursor: default; }
+        /* On the toggle row rather than beside the scope pair: it's the result
+           of the search, so it belongs next to the thing you'd click to get
+           back to it. Empty whenever the fold is closed, since closing clears
+           the query. */
+        #hierarchySearchCount { flex: 1; text-align: right; color: var(--fg-faint); overflow: hidden;
+                                text-overflow: ellipsis; }
+        /* Results replace the tree rather than stacking under it, so the panel
+           shows one list at a time; clearing the box brings the tree back with
+           its open branches untouched. */
+        #hierarchyResults { flex: 1; overflow: auto; padding: 4px 0 8px; }
+        #hierarchyResults.hidden, #hierarchyTree.hidden { display: none; }
+        /* A result row is the tree's row with the indent and twisty dropped and
+           a right-hand detail added (a cell's shape count, a label's layer). */
+        .find-row { display: flex; align-items: baseline; gap: 6px; padding: 2px 8px;
+                    white-space: nowrap; cursor: pointer; }
+        .find-row:hover { background: var(--surface); }
+        .find-row.find-active, .find-row.find-active:hover { background: var(--accent); color: var(--accent-fg); }
+        .find-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .find-meta { flex: none; color: var(--fg-faint); font-size: 10px; }
+        .find-row.find-active .find-meta { color: var(--accent-fg); }
+        /* A cell no top cell reaches (a reference cycle, or one the tree's own
+           caps left out) has no path to open down to, so its row only says so. */
+        .find-row.find-unreachable { opacity: 0.55; cursor: default; }
+        #hierarchyResults .find-note { padding: 6px 10px; color: var(--fg-faint); white-space: normal; line-height: 1.5; }
         /* Stand-in for a tree: no cells to show, or too many to describe. */
         #hierarchyTree .hier-note { padding: 6px 10px; color: var(--fg-faint); white-space: normal; line-height: 1.5; }
         /* Reopens the panel after it's been hidden; sits where the panel's own
@@ -369,7 +441,36 @@
             <span id="hierarchyCount"></span>
             <span id="hierarchyHide" title="Hide the hierarchy tree (H)">✕</span>
         </div>
+        <!-- Find (see the search block in viewer.js): one box over two
+             haystacks, the design's cell names and its own TEXT labels.
+             Results take the tree's place while a query is up.
+
+             Collapsed by default, and folded away behind one row rather than
+             sitting open above the tree: the panel is here to browse the
+             hierarchy, and two more rows of chrome over it are two fewer rows
+             of the thing being browsed. "/" opens it and lands in the box, so
+             the fold costs nothing to whoever is actually searching. -->
+        <div id="hierarchyFind">
+            <div id="hierarchyFindToggle"
+                 title="Find a cell by name, or a label by its text (/)">
+                <span id="hierarchyFindTwisty">▸</span>
+                <span id="hierarchyFindLabel">Find</span>
+                <span id="hierarchySearchCount"></span>
+            </div>
+            <div id="hierarchySearch" class="hidden">
+                <input id="hierarchySearchInput" type="text" placeholder="cell name"
+                       spellcheck="false" autocomplete="off"
+                       title="Find a cell by name, or a label by its text (/ focuses this box)">
+                <div id="hierarchyScope">
+                    <button id="hierarchyScopeCells" type="button"
+                            title="Search the design's cell names">Cells</button>
+                    <button id="hierarchyScopeLabels" type="button"
+                            title="Search the layout's own TEXT labels">Labels</button>
+                </div>
+            </div>
+        </div>
         <div id="hierarchyTree"></div>
+        <div id="hierarchyResults" class="hidden"></div>
     </div>
     <button id="hierarchyShowBtn" type="button" class="hidden"
             title="Show the design's cell hierarchy (H)">Hierarchy</button>
@@ -409,6 +510,7 @@
     <!-- Webview Local Script Injection Pipeline -->
     <script src="wasm/build/gdstk_wasm.js"></script>
     <script src="vendor/lil-gui.umd.min.js"></script>
+    <script src="cell-search.js"></script>
     <script src="marker-parsers.js"></script>
     <script src="load-errors.js"></script>
     <script src="viewer.js"></script>
