@@ -1,5 +1,85 @@
 # Change Log
 
+## [1.6.2] - 2026-08-21
+
+- **A find box in the hierarchy panel, over cells and labels.** The panel could
+  show you a design's cell tree and nothing else: to reach a cell you had to
+  already know which branches it was under, and clicking twenty twisties open to
+  look for `PIXEL_TAP` is not browsing, it's searching by hand.
+
+  The box searches the two things in a design that have names, with a
+  **Cells | Labels** pair choosing which, because they answer the same question
+  — where is the thing called X — and shouldn't be two places to look.
+
+  It's folded away behind one **Find** row and starts closed, for the reason the
+  Display folder is closed: the panel exists to browse a hierarchy, and rows of
+  chrome above the tree are rows of tree you don't get to see. `/` opens it and
+  lands in the box from anywhere — opening the panel too, if that was away — so
+  the fold costs nothing to whoever came to search. Closing it clears the query
+  and puts the tree back, rather than leaving a result list up with nothing on
+  screen to say where it came from.
+
+  Choosing a cell **opens the tree down to it**: the branches above it unfold,
+  the row is selected and framed and every placement of it is outlined. That's
+  the reason results replace the tree instead of filtering its rows the way the
+  Layers panel filters its list — the tree is built lazily, so a cell in a
+  branch nobody has opened has no row to hide or show, and the answer to "where
+  is this cell" is a row in context rather than a jumped camera and a tree still
+  pointing somewhere else. Clearing the box brings the tree back exactly as it
+  was, and the query stays put so clicking back into the box returns the list.
+
+  Labels are matched in wasm (a full chip's labels are far too much to hold a
+  second time on the JS side) and include ones on layers you've hidden — the
+  label you're hunting is often on a layer you turned off, and answering "no such
+  label" because of that would be wrong, so the row says which ones aren't drawn
+  instead. Choosing one pans to it, marks it with a dashed box and leaves the
+  zoom alone: a label's glyphs are drawn at a fixed size on screen, so it has no
+  extent to frame, and how much you want around it isn't something the label
+  says. Text drawing turns itself on if it was off, since landing on a label and
+  showing nothing is the wrong end to a search.
+
+  Both lists cap at 200 rows and say how many matched beyond them, `↑`/`↓` and
+  `Enter` walk them, and a query survives a reload of the same file — a search
+  in progress is part of the working context a reload already preserves,
+  alongside the camera and the open branches. A design too large for a cell tree
+  (past 50,000 cells, where the tree isn't built) has no cell names on this side
+  to match, so the box says so and stays on labels, which still work.
+
+- **Saved views.** A **Views** folder that keeps named places in a design: a
+  camera position together with which layers were on, saved under a name and
+  kept with the layout, so "pad ring" or "the corner that failed DRC" is still
+  there when the file is reopened next week. Restoring one is the same code the
+  reload path uses to put the camera and layer set back after a re-read, which
+  is the same problem stated differently.
+
+  What a view deliberately doesn't carry is the render toggles — Infill, Text,
+  Merge Overlaps, Grid. Those are a preference for how you like layouts drawn
+  rather than a place in one (the split the Display folder is built around), and
+  a view that quietly flipped them would undo a setting you didn't think you were
+  saving. Names are asked for through VS Code's own input box rather than in the
+  page, so the name validates as you type and says when it's about to replace a
+  view already saved under it.
+
+- **`npm run lint` runs, and is clean.** `eslint.config.mjs` imported `globals`,
+  which was never a declared dependency, so `npx eslint` died with
+  `ERR_MODULE_NOT_FOUND` — the lint config had, as far as anyone could tell from
+  a checkout, never run. With the dependency declared it ran and reported 235
+  warnings, well over half of them from Emscripten's generated output and the
+  vendored lil-gui build, which are now skipped.
+
+  The rest was one config describing three environments at once: the webview's
+  `<script>` files, the parse Worker and the Node side of the extension all
+  sharing a single global list, which is the same as not checking `no-undef` at
+  all — a `document` reference in the extension host passed. It's now one block
+  each, including the globals this repo's own `<script>` tags hand each other,
+  and the four real findings that surfaced are fixed. `npm run lint` is a script
+  rather than something to remember the invocation of.
+
+- **`src/viewer.js` is text again.** A stray NUL byte in the middle of a string
+  literal (the separator joining top-cell names into the key that decides whether
+  a load is the same design) meant `file` called it `data` and `grep` treated it
+  as a binary, silently matching nothing. It was always meant to be a space.
+
 ## [1.6.1] - 2026-08-17
 
 - **Calibre DRC results databases are read the way Calibre writes them.** The
