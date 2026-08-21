@@ -1,7 +1,6 @@
 .vscode/**
 .vscode-test/**
 test/**
-docs/**
 third_party/**
 src/wasm/**/*.cpp
 src/wasm/**/*.hpp
@@ -12,7 +11,6 @@ src/wasm/build/Makefile
 src/wasm/build/cmake_install.cmake
 .gitignore
 .gitmodules
-.yarnrc
 **/jsconfig.json
 **/*.map
 **/eslint.config.mjs
@@ -21,7 +19,5 @@ scripts/**
 .env.publish*
 
 # Internal docs — README.md, CHANGELOG.md and LICENCE.md still ship (vsce
-# surfaces those on the listing); everything else is for contributors only.
+# surfaces those on the listing); DEVELOPING.md is for contributors only.
 DEVELOPING.md
-LYP_SPEC_GAPS.md
-KLAYOUT_RENDERER_COMPARISON.md

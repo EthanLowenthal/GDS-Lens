@@ -1,14 +1,22 @@
-# GDS Lens
+# GDS Lens — GDSII & OASIS layout viewer for VS Code
 
-[View GDS Lens on the VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
-| [View GDS Lens on Open VSX](https://open-vsx.org/extension/ethml/GDS-Lens)
+[![Visual Studio Marketplace](https://vsmarketplacebadges.dev/version-short/ethml.GDS-Lens.svg?style=flat-square&label=Marketplace&color=0f1720)](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
+[![Installs](https://vsmarketplacebadges.dev/installs-short/ethml.GDS-Lens.svg?style=flat-square&label=installs&color=0f1720)](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
+[![Open VSX downloads](https://img.shields.io/open-vsx/dt/ethml/GDS-Lens?style=flat-square&label=Installs&color=0f1720)](https://open-vsx.org/extension/ethml/GDS-Lens)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENCE.md)
 
-Open a chip layout in VS Code. GDS Lens adds a custom editor for `.gds` (GDSII)
-and `.oas` / `.oasis` (OASIS) files, gzipped or not: open one and it's parsed and
-rendered in a WebGL2 canvas, with KLayout `.lyp` colors, a cell hierarchy tree
-and DRC/LVS marker browsing.
+**Open a chip layout in VS Code.** GDS Lens adds a custom editor for `.gds`
+(GDSII) and `.oas` / `.oasis` (OASIS) files, gzipped or not: open one and it's
+parsed and rendered in a WebGL2 canvas, with KLayout `.lyp` colors, a cell
+hierarchy tree, find-by-name, saved views, a snapping ruler and DRC/LVS marker
+browsing. No install beyond the extension — no KLayout, no Python, no server.
 
 ![GDS Lens rendering a GDSII layout](images/example.png)
+
+**Install:** search *GDS Lens* in the Extensions view, or
+[get it on the Marketplace](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens)
+/ [Open VSX](https://open-vsx.org/extension/ethml/GDS-Lens). Then open any
+`.gds`, `.oas` or `.oasis` file.
 
 ## Features
 

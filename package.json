@@ -13,19 +13,28 @@
     "gdsii",
     "gds",
     "gds.gz",
+    "gdsii viewer",
+    "layout",
+    "layout viewer",
     "oasis",
+    "oasis viewer",
+    "mask",
     "klayout",
+    "lyp",
     "vlsi",
     "eda",
-    "asic",
     "ic-layout",
     "chip-design",
     "semiconductor",
     "silicon",
     "photonics",
+    "gdsfactory",
+    "sky130",
     "drc",
     "lvs",
-    "tapeout"
+    "tapeout",
+    "asic",
+    "cad"
   ],
   "galleryBanner": {
     "color": "#0f1720",
@@ -46,11 +55,8 @@
     "publish:all": "npm run package && npm run publish:vsce && npm run publish:ovsx"
   },
   "devDependencies": {
-    "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
     "@types/vscode": "^1.125.0",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0",
     "@xmldom/xmldom": "^0.9.10",
     "eslint": "^10.5.0",
     "globals": "^17.11.0"
