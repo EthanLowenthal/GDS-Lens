@@ -1,6 +1,6 @@
 # GDS Lens
 
-GDSII & OASIS layout parsing and WebGL2 rendering for the browser — the engine
+GDSII & OASIS layout parsing and WebGL2 rendering for the browser - the engine
 behind the [GDS Lens VS Code extension](https://github.com/EthanLowenthal/GDS-Lens-Vscode).
 
 Reading and rendering only. Writing layouts is deliberately out of scope.
@@ -10,21 +10,21 @@ Reading and rendering only. Writing layouts is deliberately out of scope.
 
 ## What's here
 
-- **Parsing** — GDSII and OASIS, format and gzip both sniffed from the leading
+- **Parsing** - GDSII and OASIS, format and gzip both sniffed from the leading
   bytes rather than the filename. [`gdstk`](https://github.com/heitzmann/gdstk)
   compiled to WebAssembly, so the reader is the same one other implementations
   validate themselves against.
-- **Rendering** — a WebGL2 renderer with layer-batched vertex buffers, GPU
+- **Rendering** - a WebGL2 renderer with layer-batched vertex buffers, GPU
   instancing for repeated cells, camera, measurement and a stroke font, written
   in C++ and compiled alongside the parser.
 - **KLayout `.lyp`** colour/style support.
-- **DRC/LVS markers** — KLayout `.lyrdb` and Calibre ASCII databases.
+- **DRC/LVS markers** - KLayout `.lyrdb` and Calibre ASCII databases.
 
 ## Building
 
 Requires the [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html)
 (`emcc`/`emcmake` on `PATH`) and a Python 3.10+ for the emscripten driver
-scripts — macOS's system `python3` (3.9) is too old and fails with a
+scripts - macOS's system `python3` (3.9) is too old and fails with a
 `TypeError` on `list[str] | None`. With [uv](https://docs.astral.sh/uv/):
 
 ```sh
@@ -46,7 +46,7 @@ tarball, never committed.
 
 ## Licence
 
-MIT — see [`LICENCE.md`](LICENCE.md).
+MIT - see [`LICENCE.md`](LICENCE.md).
 
 The compiled WebAssembly statically links four third-party projects, all
 permissive: [gdstk](https://github.com/heitzmann/gdstk) (BSL-1.0), Clipper

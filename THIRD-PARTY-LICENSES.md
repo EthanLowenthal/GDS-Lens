@@ -5,13 +5,13 @@ below. All are permissive and compatible with this project's MIT licence; the
 requirement they impose is attribution, reproduced here in full.
 
 Qhull's licence in particular requires that its notice accompany any
-distribution that includes it — including binary-only distributions, for which
+distribution that includes it - including binary-only distributions, for which
 it grants no exemption. Qhull's original source can be obtained from
 <http://www.qhull.org>. Qhull is used here unmodified.
 
 ---
 
-## gdstk — Boost Software License 1.0
+## gdstk - Boost Software License 1.0
 
 <https://github.com/heitzmann/gdstk>
 
@@ -43,7 +43,7 @@ DEALINGS IN THE SOFTWARE.
 
 ---
 
-## Clipper — Boost Software License 1.0
+## Clipper - Boost Software License 1.0
 
 Angus Johnson, 2010-2017. <http://www.angusj.com>
 Distributed within gdstk as `external/clipper`.
@@ -73,7 +73,7 @@ Distributed within gdstk as `external/clipper`.
 
 ---
 
-## Qhull — Qhull licence
+## Qhull - Qhull licence
 
 <http://www.qhull.org>
 
@@ -121,7 +121,7 @@ modified, and redistributed under the following conditions:
 
 ---
 
-## earcut.hpp — ISC License
+## earcut.hpp - ISC License
 
 <https://github.com/mapbox/earcut.hpp>
 

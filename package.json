@@ -5,9 +5,25 @@
   "license": "MIT",
   "author": "Ethan Lowenthal",
   "keywords": [
-    "gdsii", "gds", "oasis", "oas", "layout", "layout-viewer",
-    "webgl", "wasm", "klayout", "lyp", "vlsi", "eda", "ic-layout",
-    "chip-design", "semiconductor", "photonics", "gdsfactory", "drc", "lvs"
+    "gdsii",
+    "gds",
+    "oasis",
+    "oas",
+    "layout",
+    "layout-viewer",
+    "webgl",
+    "wasm",
+    "klayout",
+    "lyp",
+    "vlsi",
+    "eda",
+    "ic-layout",
+    "chip-design",
+    "semiconductor",
+    "photonics",
+    "gdsfactory",
+    "drc",
+    "lvs"
   ],
   "repository": {
     "type": "git",
@@ -19,6 +35,8 @@
   },
   "scripts": {
     "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build",
+    "build": "node scripts/build-webview.mjs",
+    "watch": "node scripts/build-webview.mjs --watch",
     "test": "node --test test/*.test.js",
     "lint": "eslint ."
   },
@@ -26,5 +44,11 @@
     "@xmldom/xmldom": "^0.9.10",
     "eslint": "^10.5.0",
     "globals": "^17.11.0"
-  }
+  },
+  "files": [
+    "dist/",
+    "LICENCE.md",
+    "THIRD-PARTY-LICENSES.md",
+    "README.md"
+  ]
 }
