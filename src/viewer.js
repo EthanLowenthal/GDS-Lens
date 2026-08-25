@@ -119,6 +119,17 @@ window.addEventListener("unhandledrejection", (event) => {
 // by setting window.gdsLensHost before this script runs. Nothing below knows
 // which host it has -- see hosts/browser.js for the interface.
 const host = (typeof window !== "undefined" && window.gdsLensHost) || {};
+// A host that never arrived is the one failure that looks like nothing at all:
+// with no connect() there is nobody to hand a layout in, so the page sits on
+// its loading bar forever with an empty log. Nearly always a host.js that did
+// not load (a 404, or a CSP that blocked it), so say that plainly rather than
+// leaving the bar to be interpreted.
+if (!window.gdsLensHost) {
+    console.error(
+        "[GDS] no window.gdsLensHost -- host.js did not load or did not run. " +
+        "Nothing can drive the viewer, so no layout will ever appear."
+    );
+}
 // Every method is optional, so calls go through these rather than being
 // guarded one by one at each site. A missing service is not an error: it means
 // the embedder does not offer it, and the control for it is hidden.
