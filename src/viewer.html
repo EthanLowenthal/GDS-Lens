@@ -24,10 +24,9 @@
          rather than the shadow root because it is the host's to fill in. -->
     <script type="text/plain" id="workerBundle">{{workerBundleBase64}}</script>
 
-    <!-- Generated and vendored, loaded as classic scripts for the globals
-         they define (createGdstkModule, lil). -->
+    <!-- Emscripten's output, loaded as a classic script for the
+         createGdstkModule global it defines. -->
     <script src="gdstk_wasm.js"></script>
-    <script src="lil-gui.umd.min.js"></script>
     <!-- The embedder's ViewerHost. Must precede viewer.js, which reads
          window.gdsLensHost as it starts. Defaults to the plain-page host;
          a host that needs different services replaces this file. -->

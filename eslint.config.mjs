@@ -8,12 +8,10 @@ import globals from "globals";
 // One block covering all of them could only be the union of their globals,
 // which is the same as not checking `no-undef` at all.
 
-// Defined by files loaded as classic <script> tags ahead of the bundles, so
-// they are globals rather than imports: gdstk_wasm.js is Emscripten's output
-// and lil-gui is a minified upstream build. See scripts/build-webview.mjs.
+// Emscripten's output is loaded as a classic <script> ahead of the bundles, so
+// its factory is a global rather than an import. See scripts/build-webview.mjs.
 const vendorGlobals = {
     createGdstkModule: "readonly",
-    lil: "readonly",
 };
 
 // The same set for every block: these are the mistakes worth a warning in a
@@ -44,7 +42,7 @@ export default [
         // doesn't skip dot-directories on its own, and its multi-megabyte
         // single-line bundles run the linter out of memory rather than merely
         // slowing it down.
-        ignores: ["src/wasm/build/**", "src/vendor/**", "dist/**", ".vscode-test-web/**"],
+        ignores: ["src/wasm/build/**", "dist/**", ".vscode-test-web/**"],
     },
     // The viewer's main thread: browser globals plus the vendored ones.
     module_(["src/viewer.js"], { ...globals.browser, ...vendorGlobals }),

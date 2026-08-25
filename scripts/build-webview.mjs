@@ -15,16 +15,26 @@ import { mkdir, copyFile, access, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build, context } from "esbuild";
+import { createRequire } from "node:module";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// lil-gui ships its stylesheet as dist/lil-gui.css but its exports map
+// declares only import/require, so there is no subpath that reaches the file.
+// Resolve the package and point an alias at it, rather than reaching past the
+// exports map with a deep relative path that would break on any layout change.
+const require = createRequire(import.meta.url);
+// Resolved via the package's own entry point and then looked up beside it:
+// the exports map blocks package.json too, and a hand-written
+// node_modules/lil-gui path would break under pnpm or any hoisting layout.
+const lilGuiCss = join(dirname(require.resolve("lil-gui")), "lil-gui.css");
 const out = join(root, "dist", "webview");
 const watch = process.argv.includes("--watch");
 
-// Copied as-is: generated or vendored third-party files that already define
-// the globals the bundles expect.
+// Copied as-is: the page harness, and Emscripten's output, which is loaded as
+// a classic script for the createGdstkModule global it defines.
 const COPY = [
     ["src/viewer.html", "viewer.html"],
-    ["src/vendor/lil-gui.umd.min.js", "lil-gui.umd.min.js"],
     ["src/wasm/build/gdstk_wasm.js", "gdstk_wasm.js"]
 ];
 
@@ -59,6 +69,7 @@ const options = (entry, name) => ({
     // document for a host page to load them from, so they are inlined as
     // strings and injected into the shadow root at mount.
     loader: { ".html": "text", ".css": "text" },
+    alias: { "lil-gui-css": lilGuiCss },
     // Defined by the classic scripts loaded before these bundles.
     external: [],
     logLevel: "warning"

@@ -6,6 +6,17 @@ import { describeLoadFailure } from "./load-errors.js";
 // page to load them from.
 import shellHtml from "./viewer-shell.html";
 import viewerCss from "./viewer.css";
+// lil-gui as a real dependency rather than a vendored UMD file: it publishes
+// an ES module and, importantly here, its stylesheet as a plain .css file. The
+// panel lives in our shadow root, which cannot see the stylesheet lil-gui
+// would otherwise append to document.head, so we inject it ourselves.
+//
+// "lil-gui-css" is an alias the build resolves to that file (see
+// build-webview.mjs). It needs one because lil-gui's exports map declares only
+// import/require, so the stylesheet ships in the package but has no subpath
+// that can reach it.
+import GUI from "lil-gui";
+import guiCss from "lil-gui-css";
 
 // Thin bootstrap: instantiate the wasm module and relay postMessage payloads
 // from the extension host into it. JS never touches GDS/GL data -- that all
@@ -31,7 +42,7 @@ import viewerCss from "./viewer.css";
 const hostElement = document.querySelector("gds-lens") ||
     document.body.appendChild(document.createElement("gds-lens"));
 const shadow = hostElement.shadowRoot || hostElement.attachShadow({ mode: "open" });
-shadow.innerHTML = `<style>${viewerCss}</style>${shellHtml}`;
+shadow.innerHTML = `<style>${guiCss}</style><style>${viewerCss}</style>${shellHtml}`;
 
 // Every lookup is scoped to the shadow root. ShadowRoot is a DocumentFragment,
 // which implements NonElementParentNode, so getElementById works on it exactly
@@ -158,7 +169,7 @@ console.log("[GDS] host ready, typeof createGdstkModule:", typeof createGdstkMod
 // document.head, which a shadow root does not see, so the panel would render
 // unstyled. Its CSS is carried in viewer.css instead (see the lil-gui block
 // there), alongside everything else the shadow root owns.
-const gui = new lil.GUI({ width: 260, container: viewerRoot.getElementById("guiHost"), injectStyles: false });
+const gui = new GUI({ width: 260, container: viewerRoot.getElementById("guiHost"), injectStyles: false });
 const actions = {
     // Clicking the row always opens the file dialog (load, or replace the
     // current file); the injected ✕ (see setFileChip) handles unloading.

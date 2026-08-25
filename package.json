@@ -44,6 +44,7 @@
     "esbuild": "^0.28.2",
     "eslint": "^10.5.0",
     "globals": "^17.11.0",
+    "lil-gui": "^0.21.0",
     "playwright": "^1.62.1"
   },
   "files": [
