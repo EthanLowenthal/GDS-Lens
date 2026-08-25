@@ -99,6 +99,27 @@ test("the payload loads a layout as a plain web page", { skip: !built || !chromi
         const layers = await page.evaluate(() => window.gdsLens.getLayerCount?.() ?? null);
         if (layers !== null) assert.ok(layers > 0, "no layers reached the renderer");
 
+        // Layout, not just "it loaded". lil-gui only floats its own panel when
+        // it appends to document.body; passing a container to keep it in the
+        // shadow root skips that, and without replacing the positioning the
+        // panel becomes a full-width block that pushes the canvas down. That
+        // renders, throws nothing, and is only visible to someone looking at
+        // it -- so it is asserted here instead.
+        const geom = await page.evaluate(() => {
+            const sr = document.querySelector("gds-lens").shadowRoot;
+            const box = (el) => { const b = el.getBoundingClientRect(); return { x: b.x, y: b.y, w: b.width, h: b.height }; };
+            return {
+                gui: box(sr.querySelector(".lil-gui.lil-root")),
+                canvas: box(sr.getElementById("glCanvas")),
+                viewportWidth: window.innerWidth
+            };
+        });
+        assert.ok(geom.gui.w > 200 && geom.gui.w < 400,
+            `control panel should be a fixed-width panel, got ${geom.gui.w}px`);
+        assert.ok(geom.gui.x > geom.viewportWidth / 2,
+            `control panel should sit on the right, got x=${geom.gui.x} of ${geom.viewportWidth}`);
+        assert.equal(geom.canvas.y, 0, "canvas should start at the top, not be pushed down by the panel");
+
         // The isolation is the point, so check it rather than assume it: none
         // of the viewer's elements may be reachable from the document, and the
         // page must not have inherited its styles.

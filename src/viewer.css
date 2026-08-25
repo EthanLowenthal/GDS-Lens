@@ -183,9 +183,18 @@
            inside it still position against the page the way the single one
            used to. */
         #measureLabels .measure-label { position: absolute; transform: translate(-50%, -130%); font-family: monospace; font-size: 11px; color: var(--fg); background: var(--label-scrim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 3px 7px; text-align: center; line-height: 1.4; white-space: nowrap; z-index: 15; pointer-events: none; }
-        /* lil-gui's autoPlace default (1001) would float the panel above the
-           loading overlay (z 30) and debug panel (z 40) -- keep it below both. */
-        .lil-gui.autoPlace { z-index: 20 !important; }
+        /* lil-gui floats its own panel only when it appends to document.body,
+           by adding .lil-auto-place (position:fixed, right:15px, z 1001). We
+           pass a container instead so the panel lives inside the shadow root,
+           which skips that class entirely -- so without this the panel is a
+           plain block in normal flow, spanning the full width and pushing the
+           canvas down. Positioning it here also fixes two things lil-gui's own
+           rule got wrong for a component: absolute rather than fixed, so the
+           panel stays inside the component's box instead of pinning itself to
+           the viewport when embedded in a page; and z-index below the loading
+           overlay (30) and debug panel (40) rather than lil-gui's 1001. */
+        #guiHost { position: absolute; top: 0; right: 15px; max-height: 100%; z-index: 20; display: flex; }
+        #guiHost > .lil-gui.lil-root { max-height: 100%; }
         /* Checkbox rows (layer list + top-level toggles): lil-gui gives the
            label a 45% min-width and no overflow handling, so a long name like
            "250/74 – SIN_WG_S" would push into the checkbox column. Widen the
