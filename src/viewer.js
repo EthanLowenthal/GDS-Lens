@@ -2336,8 +2336,10 @@ function goToPointFromHost(x, y) {
     // pan -- the zoom is deliberately untouched, since a pasted coordinate
     // doesn't say how much around it you want to see (see goToPoint in
     // renderer.cpp). Only this side knows whether the point is inside the
-    // layout, so the answer goes back for the host to report.
-    modulePromise.then((Module) => {
+    // layout, so the answer goes back for the host to report -- and is also
+    // returned, so a caller driving the viewer directly does not have to
+    // implement onGotoResult just to learn whether it landed.
+    return modulePromise.then((Module) => {
         const onScreen = Module.goToPoint(x, y);
         // A crosshair on the coordinate itself, which fades out after a
         // couple of seconds (see draw_goto_flash in renderer.cpp). Panning
@@ -2347,6 +2349,7 @@ function goToPointFromHost(x, y) {
         // the middle of the screen.
         Module.flashPoint(x, y);
         hostCall("onGotoResult", { ok: !!onScreen, x, y });
+        return !!onScreen;
     });
 }
 

@@ -146,6 +146,11 @@ test("goToPoint reports back whether the point was on screen", opts, async () =>
         assert.equal(typeof result.ok, "boolean", "the host should be told whether it landed");
         assert.equal(result.x, 1);
         assert.equal(result.y, 1);
+
+        // Also returned, so a caller driving the viewer directly does not have
+        // to implement onGotoResult just to learn the answer.
+        const returned = await page.evaluate(() => window.viewer.goToPoint(1, 1));
+        assert.equal(returned, result.ok, "goToPoint should resolve to the same answer it reports");
     });
 });
 
