@@ -9,6 +9,37 @@ status note at the top of the README.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-25
+
+Nothing shipped in this release behaves differently. It exists because 0.1.0
+was published by hand -- a trusted publisher can only be configured on a
+package that already exists -- so this is the first tarball to go through the
+tag-driven workflow, and the first to carry provenance.
+
+### Changed
+
+- A shorter README opening.
+
+### Fixed
+
+Release tooling only; none of it is in the package.
+
+- `eslint .` no longer reads the Emscripten SDK's own config. The CI action
+  unpacks the SDK *inside* the working tree, and the SDK ships an
+  `eslint.config.mjs` importing a plugin only Emscripten depends on, so lint
+  failed with `ERR_MODULE_NOT_FOUND` for a package this project has never
+  heard of, before looking at a single file of its own.
+- `check:package` reads `npm pack --dry-run --json` in both shapes npm emits:
+  an array of packed-package objects on npm 11, the same objects keyed by
+  package name on npm 12. It had destructured the array form, which fails as
+  `TypeError: object is not iterable` -- naming neither npm nor a version.
+
+Both of these could only fail in the publish job: it is the only place lint
+runs alongside the SDK, and the only place npm is upgraded. `npm` is now
+pinned to `^12` there rather than tracking `latest`, since the floor for
+trusted publishing is 11.5.1 and a release is the worst place to learn that a
+tool changed its output format.
+
 ## [0.1.0] - 2026-08-25
 
 First release as a library.
@@ -163,5 +194,6 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/EthanLowenthal/GDS-Lens/releases/tag/v0.1.0
