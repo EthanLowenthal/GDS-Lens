@@ -134,6 +134,18 @@ export default [
         rules,
     },
     {
+        // The browser smoke test straddles both: the file runs in Node, but
+        // the bodies it hands to page.evaluate() are serialized and run inside
+        // Chromium, so `window` and `document` in them are real.
+        files: ["test/browser-smoke.test.js"],
+        languageOptions: {
+            globals: { ...globals.node, ...globals.browser },
+            ecmaVersion: 2022,
+            sourceType: "commonjs",
+        },
+        rules,
+    },
+    {
         // The unit tests: Node, CommonJS, and free to use Buffer and zlib to
         // build fixtures even where the code under test can't. They use
         // node:test (required explicitly, no injected globals), so there is no
