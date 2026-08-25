@@ -6,6 +6,8 @@ WebAssembly and a WebGL2 renderer.
 
 Reading and rendering only. Writing layouts is deliberately out of scope.
 
+![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](images/example.png)
+
 > **Status**: pre-release, not yet published to npm. The API is unstable and
 > will change.
 
