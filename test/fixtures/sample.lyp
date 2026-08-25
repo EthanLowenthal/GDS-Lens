@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-properties>
+ <properties>
+  <name>Metals</name>
+  <group-members>
+   <frame-color>#ff0000</frame-color>
+   <fill-color>#ff8080</fill-color>
+   <dither-pattern>I3</dither-pattern>
+   <visible>true</visible>
+   <name>METAL1</name>
+   <source>1/0@1</source>
+  </group-members>
+  <group-members>
+   <frame-color>#00ff00</frame-color>
+   <fill-color>#80ff80</fill-color>
+   <visible>true</visible>
+   <name>METAL2</name>
+   <source>2/0@1</source>
+  </group-members>
+ </properties>
+</layer-properties>
