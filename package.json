@@ -1,0 +1,30 @@
+{
+  "name": "gds-lens",
+  "version": "0.0.0",
+  "description": "GDSII & OASIS layout parsing and WebGL2 rendering for the browser",
+  "license": "MIT",
+  "author": "Ethan Lowenthal",
+  "keywords": [
+    "gdsii", "gds", "oasis", "oas", "layout", "layout-viewer",
+    "webgl", "wasm", "klayout", "lyp", "vlsi", "eda", "ic-layout",
+    "chip-design", "semiconductor", "photonics", "gdsfactory", "drc", "lvs"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EthanLowenthal/GDS-Lens"
+  },
+  "homepage": "https://github.com/EthanLowenthal/GDS-Lens#readme",
+  "bugs": {
+    "url": "https://github.com/EthanLowenthal/GDS-Lens/issues"
+  },
+  "scripts": {
+    "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build",
+    "test": "node --test test/*.test.js",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@xmldom/xmldom": "^0.9.10",
+    "eslint": "^10.5.0",
+    "globals": "^17.11.0"
+  }
+}

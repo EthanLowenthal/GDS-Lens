@@ -1,0 +1,9 @@
+node_modules/
+dist/
+
+# Emscripten build tree — gdstk_wasm.js is a build artifact, produced in CI
+# and shipped in the npm tarball. It is never committed.
+src/wasm/build/
+
+.DS_Store
+*.log
