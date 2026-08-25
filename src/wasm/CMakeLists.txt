@@ -96,6 +96,20 @@ target_link_options(gdstk_wasm PRIVATE
     # webview without needing type="module" + CSP changes for ES imports.
     -sMODULARIZE=1
     -sEXPORT_NAME=createGdstkModule
+    # The wasm binary is embedded in the .js rather than fetched, because a
+    # VS Code webview cannot reach its own asset URLs from inside a Worker.
+    #
+    # Emscripten embeds it as a raw binary string, which is smaller than base64
+    # but makes the file encoding-sensitive: it must be decoded as UTF-8 or the
+    # binary is corrupted, surfacing as a WebAssembly CompileError about
+    # section lengths. Either a charset=utf-8 on the script's Content-Type or a
+    # <meta charset="UTF-8"> on the page satisfies that, and essentially every
+    # static host sends the former; gds-lens.js warns if it sees neither.
+    #
+    # -sSINGLE_FILE_BINARY_ENCODE=0 switches to base64, which is pure ASCII and
+    # immune to this, at +89KB raw / +50KB gzipped (measured). Not taken:
+    # that is a 25% larger download for everyone, to avoid a misconfiguration
+    # that warns clearly and is fixed by one meta tag.
     -sSINGLE_FILE=1
     -sALLOW_MEMORY_GROWTH=1
     # Emscripten caps growth at 2GB by default; a big flattened layout hits

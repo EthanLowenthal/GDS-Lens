@@ -33,11 +33,17 @@ await viewer.load("chip.gds");        // a URL, or bytes you already have
 await viewer.goToPoint(120.5, -40);   // centre on a coordinate, in microns
 ```
 
-**The page must be UTF-8.** The WebAssembly binary is embedded in the script as
-a raw string, so a document in another encoding corrupts it and the module
-fails to load. Declare `<meta charset="UTF-8">` or serve the scripts as
-`text/javascript; charset=utf-8`. The element warns in the console if it
-notices.
+**The scripts must be decoded as UTF-8.** The WebAssembly binary is embedded in
+the JavaScript as a raw string, so reading it in another encoding corrupts it
+and the module fails with a `WebAssembly.instantiate()` error about section
+lengths. Either of these satisfies it, and you only need one:
+
+- the server sending `Content-Type: text/javascript; charset=utf-8`, which
+  essentially every static host and CDN does by default, or
+- `<meta charset="UTF-8">` on the page.
+
+It only breaks when neither is present. The element checks and says so in the
+console if it sees a document that is not UTF-8.
 
 ## What it does
 
