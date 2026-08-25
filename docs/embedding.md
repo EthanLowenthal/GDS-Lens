@@ -32,8 +32,8 @@ can implement any of the following methods:
 | `unloadLyp()` | `void` | The loaded `.lyp` is dismissed. |
 | `pickMarkers()` | `Promise<{name, text} \| null>` | The user asks for a marker database. |
 | `unloadMarkers()` | `void` | The loaded marker database is dismissed. |
-| `loadViews()` | `Promise<View[]>` | Once at mount, for saved camera positions. |
-| `saveViews(views)` | `void` | The saved-view set changed. Persist it. |
+| `loadViews(viewer)` | `Promise<View[]>` | Once at mount, for saved camera positions. |
+| `saveViews(views, viewer)` | `void` | The saved-view set changed. Persist it. |
 | `promptViewName(existing)` | `Promise<string \| null>` | A view is being saved. `existing` is the names already used. |
 | `requestReload()` | `void` | The user asks to re-read the layout. |
 | `setAutoReload(on)` | `void` | The user asks to always reload on change. |
@@ -50,6 +50,7 @@ rather than answering it:
 | Method | Description |
 |---|---|
 | `load(bytes, {reload})` | Display a layout from bytes. |
+| `showLoading(label?)` | Say that a layout is on its way. Call it before fetching the bytes: a viewer that has not been handed anything shows "No layout loaded", and without this that is what it shows for the length of the download. |
 | `showError(message)` | Show a fatal error. |
 | `setLyp(name, text)` | Apply layer properties. |
 | `setMarkers(name, text)` | Apply a marker database. |
@@ -59,6 +60,29 @@ rather than answering it:
 | `setNamedViews(views)` | Replace the saved-view set. |
 | `applyTheme()` | Re-ask `isLightTheme()` after a theme change. |
 | `element` | The `<gds-lens>` the viewer is mounted in. Bind anything of your own to this rather than to `window`, so it stays inside the component. |
+
+### Saved views on a page with several viewers
+
+Both view methods are handed the viewer asking, which is the same surface
+`connect` receives. A host serving one viewer can ignore it; a host serving
+several needs it, or every viewer reads and writes one shared set and whichever
+saves last overwrites the rest.
+
+The default host keys its `localStorage` bucket per viewer, in this order: the
+element's `id`, then its `src`, then -- for a page with a single viewer and
+neither -- the one key it has always used. A viewer with none of the three has
+nothing stable to key on, so its views last as long as the page does; give the
+element an `id` to have them outlive it.
+
+```html
+<!-- two viewers, two sets of saved views, both still there tomorrow -->
+<gds-lens id="before" src="rev-a.gds"></gds-lens>
+<gds-lens id="after"  src="rev-b.gds"></gds-lens>
+```
+
+An embedder with a real document identity to key on -- a file path, a document
+URI -- should implement `loadViews`/`saveViews` itself rather than inherit any
+of that.
 
 ### Example: a custom host
 

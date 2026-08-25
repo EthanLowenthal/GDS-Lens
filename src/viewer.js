@@ -262,10 +262,16 @@ export function createViewer(mountTarget) {
     // the GL context are not freed here -- there is no Emscripten teardown
     // that reliably reclaims a module -- but dropping the last reference to
     // this viewer lets the browser collect both.
+    // Watches the canvas's own box so the renderer can resize its drawing
+    // buffer to match (see watchCanvasSize). Null until the module is live,
+    // since there is nothing to tell before then.
+    let canvasResizeObserver = null;
+
     function dispose() {
         liveViewers.delete(fail);
         lightMediaQuery.removeEventListener("change", applyTheme);
         themeObserver.disconnect();
+        canvasResizeObserver?.disconnect();
         if (activeViewer === hostElement) activeViewer = null;
         if (activeWorker) {
             activeWorker.terminate();
@@ -280,8 +286,8 @@ export function createViewer(mountTarget) {
     // which host it has -- see hosts/browser.js for the interface.
     const host = (typeof window !== "undefined" && window.gdsLensHost) || {};
     // A host that never arrived is the one failure that looks like nothing at all:
-    // with no connect() there is nobody to hand a layout in, so the page sits on
-    // its loading bar forever with an empty log. Nearly always a gds-lens-host.js
+    // with no connect() there is nobody to hand a layout in, so the viewer sits
+    // on its idle "No layout loaded" forever with an empty log. Nearly always a gds-lens-host.js
     // that did
     // not load (a 404, or a CSP that blocked it), so say that plainly rather than
     // leaving the bar to be interpreted.
@@ -1881,7 +1887,7 @@ export function createViewer(mountTarget) {
         if (canvasMenuEl) canvasMenuEl.classList.add("hidden");
     }
 
-    function showCanvasMenu(clientX, clientY, text) {
+    function showCanvasMenu(canvasX, canvasY, text) {
         if (!canvasMenuEl) return;
         canvasMenuText = text;
         if (canvasMenuValueEl) canvasMenuValueEl.textContent = text;
@@ -1889,11 +1895,14 @@ export function createViewer(mountTarget) {
         canvasMenuEl.classList.remove("hidden");
         // Keep it on screen -- a right-click near the bottom or right edge would
         // otherwise open a menu that runs off it.
+        // Clamped to the canvas, not to the window: the menu is positioned
+        // inside the shadow root, so its coordinates are canvas-relative, and
+        // an embedded viewer is a box on a page rather than the page itself.
         const margin = 4;
-        const maxLeft = window.innerWidth - canvasMenuEl.offsetWidth - margin;
-        const maxTop = window.innerHeight - canvasMenuEl.offsetHeight - margin;
-        canvasMenuEl.style.left = Math.max(margin, Math.min(clientX, maxLeft)) + "px";
-        canvasMenuEl.style.top = Math.max(margin, Math.min(clientY, maxTop)) + "px";
+        const maxLeft = glCanvas.clientWidth - canvasMenuEl.offsetWidth - margin;
+        const maxTop = glCanvas.clientHeight - canvasMenuEl.offsetHeight - margin;
+        canvasMenuEl.style.left = Math.max(margin, Math.min(canvasX, maxLeft)) + "px";
+        canvasMenuEl.style.top = Math.max(margin, Math.min(canvasY, maxTop)) + "px";
         // Focus makes Enter and Escape work without a second reach for the mouse,
         // and lights the row the way hovering it does.
         if (canvasMenuCopyEl) canvasMenuCopyEl.focus();
@@ -1906,8 +1915,15 @@ export function createViewer(mountTarget) {
             // rather than swallowing the click for a menu that can't answer.
             if (!resolvedModule) return;
             event.preventDefault();
-            showCanvasMenu(event.clientX, event.clientY,
-                           resolvedModule.getCoordinateTextAt(event.clientX, event.clientY));
+            // Canvas-relative, because that is what the renderer means by a
+            // screen pixel (see getCoordinateTextAt) and what the menu is
+            // positioned in. clientX/Y are the same thing only for a viewer
+            // that starts at the top-left of the page and fills it.
+            const rect = glCanvas.getBoundingClientRect();
+            const canvasX = event.clientX - rect.left;
+            const canvasY = event.clientY - rect.top;
+            showCanvasMenu(canvasX, canvasY,
+                           resolvedModule.getCoordinateTextAt(canvasX, canvasY));
         });
 
         canvasMenuCopyEl.addEventListener("click", () => {
@@ -2102,7 +2118,10 @@ export function createViewer(mountTarget) {
         "Name the current camera and layer visibility, and keep it with this layout";
 
     function persistNamedViews() {
-        hostCall("saveViews", namedViews);
+        // The viewer goes along because a host serving more than one has no
+        // other way to tell them apart -- and one bucket shared by every viewer
+        // on the page is a set that whichever saved last overwrites.
+        hostCall("saveViews", namedViews, viewer);
     }
 
     // The name is asked for by the extension host rather than in the page: a
@@ -2246,6 +2265,7 @@ export function createViewer(mountTarget) {
     // describeLoadFailure comes from load-errors.js (its own <script> tag).
 
     const phaseLabels = {
+        fetching: "Fetching layout...",
         decompressing: "Decompressing layout...",
         parsing: "Parsing layout file...",
         flattening: "Flattening hierarchy...",
@@ -2263,9 +2283,31 @@ export function createViewer(mountTarget) {
     // viewport for a reload throws away the very view the reload restores.
     function beginProgress(inline) {
         progressInline = inline;
+        // Whatever else happens, this viewer is no longer idle: something has
+        // asked it for a layout.
+        loadingOverlay.classList.remove("idle");
         loadingOverlay.classList.toggle("hidden", inline);
         reloadProgress.classList.toggle("hidden", !inline);
         updateProgress("parsing", 0, 1);
+    }
+
+    // The overlay for work happening outside the viewer: the element or the
+    // host fetching the bytes it is about to hand over. Without it the viewer
+    // sits on "No layout loaded" for the length of the download and then
+    // snaps to a parse, which reads as nothing happening -- and the download
+    // is the slow part on anything but localhost.
+    //
+    // Deliberately not a progress bar: whoever is fetching knows the byte
+    // counts and this side does not, so it shows the phase and an empty
+    // track rather than a percentage it would have to invent.
+    function showLoading(label) {
+        clearFatalError();
+        progressInline = false;
+        loadingOverlay.classList.remove("idle", "hidden");
+        reloadProgress.classList.add("hidden");
+        loadingPhase.textContent = label || phaseLabels.fetching;
+        loadingBarFill.style.width = "0%";
+        loadingPercent.textContent = "";
     }
 
     function endProgress() {
@@ -2345,9 +2387,35 @@ export function createViewer(mountTarget) {
         }
         return createGdstkModule(moduleArgs);
     });
+    // The renderer sizes its drawing buffer to the canvas element rather than
+    // to the window (resize_canvas in renderer.cpp), so it has to be told when
+    // that box changes -- and a window resize is only one of the ways it can.
+    // A card grid rewrapping, a panel opening beside the viewer, a framework
+    // handing the element a new height: none of those touch the window, and
+    // every one of them leaves a buffer that no longer matches the box, which
+    // is a stretched layout and a mouse that reads the wrong coordinate.
+    //
+    // Per element, which is what a page with several viewers needs, and it
+    // fires once on observe(), which is how the first real size arrives -- the
+    // canvas usually has no layout yet when main() calls resize_canvas.
+    function watchCanvasSize(Module) {
+        if (typeof ResizeObserver !== "function" || !glCanvas) return;
+        if (typeof Module.resizeCanvas !== "function") return;
+        canvasResizeObserver = new ResizeObserver(() => {
+            // A viewer inside a collapsed or display:none container measures
+            // 0x0, and resize_canvas falls back to the window rather than hand
+            // GL an empty viewport. Skipping keeps the last good size instead,
+            // so reopening the container does not have to undo a reframe.
+            if (!glCanvas.clientWidth || !glCanvas.clientHeight) return;
+            Module.resizeCanvas();
+        });
+        canvasResizeObserver.observe(glCanvas);
+    }
+
     modulePromise.then(
         (Module) => {
             resolvedModule = Module;
+            watchCanvasSize(Module);
             trace("[GDS] main-thread createGdstkModule() resolved OK");
         },
         (err) => {
@@ -2679,6 +2747,9 @@ export function createViewer(mountTarget) {
             return () => adoptCallbacks.delete(callback);
         },
         load: loadLayout,
+        // For the wait before load(): a host (or the element) that is fetching
+        // bytes says so, instead of leaving the viewer looking idle.
+        showLoading,
         showError: showFatalError,
         setLyp: applyLyp,
         setMarkers: applyMarkers,
@@ -2704,7 +2775,7 @@ export function createViewer(mountTarget) {
         controllerRow(saveViewController)?.remove();
     }
 
-    Promise.resolve(hostCall("loadViews")).then((views) => {
+    Promise.resolve(hostCall("loadViews", viewer)).then((views) => {
         if (views) setNamedViews(views);
     });
 

@@ -40,6 +40,15 @@ export interface ViewerSurface {
      */
     element: HTMLElement;
     load(bytes: Uint8Array | ArrayBuffer, options?: { reload?: boolean }): void;
+    /**
+     * Say that a layout is on its way, for the wait before `load()` -- a host
+     * fetching or reading the bytes it is about to hand over. Without it the
+     * viewer shows "No layout loaded" for the length of that wait, since a
+     * viewer that has not been given anything is idle, not loading.
+     *
+     * `label` replaces the default "Fetching layout...".
+     */
+    showLoading(label?: string): void;
     showError(message: string): void;
     setLyp(name: string, text: string): void;
     setMarkers(name: string, text: string): void;
@@ -67,8 +76,13 @@ export interface ViewerHost {
     pickMarkers?(): Promise<PickedFile | null> | PickedFile | null;
     unloadMarkers?(): void;
     /** Called once at mount, for saved camera positions. */
-    loadViews?(): Promise<NamedView[]> | NamedView[];
-    saveViews?(views: NamedView[]): void;
+    /**
+     * `viewer` is the viewer asking, so a host serving several can keep a set
+     * per viewer rather than one for the page. It is the same surface
+     * `connect` is given; `viewer.element` is the way to a stable identity.
+     */
+    loadViews?(viewer?: ViewerSurface): Promise<NamedView[]> | NamedView[];
+    saveViews?(views: NamedView[], viewer?: ViewerSurface): void;
     /** `existing` is the names already in use; `null` means cancelled. */
     promptViewName?(existing: string[]): Promise<string | null> | string | null;
     requestReload?(): void;

@@ -231,6 +231,11 @@ export class GdsLens extends ElementBase {
     async load(source, options) {
         const viewer = await this.ready;
         if (typeof source === "string") {
+            // The fetch is this side's work, so the viewer has no way to know
+            // it is happening -- and until it does it shows an idle "no layout
+            // loaded". Tell it, or a slow download looks like a viewer that
+            // was never asked for anything.
+            viewer.showLoading?.();
             const response = await fetch(source);
             if (!response.ok) throw new Error(`${source}: HTTP ${response.status}`);
             return viewer.load(new Uint8Array(await response.arrayBuffer()), options);

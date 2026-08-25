@@ -352,3 +352,93 @@ test("a viewer adopted while its module is still starting still comes up", opts,
                 ?.classList.contains("hidden"), { timeout: 60_000 });
     });
 });
+
+// Both of these are about a viewer that is a box on a page rather than the
+// page itself -- the case the renderer used to assume away by sizing its
+// drawing buffer to the window.
+test("an embedded viewer sizes its buffer to the element and reads the right coordinate",
+     opts, async () => {
+    await withPage(async (page, port) => {
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        // Deliberately neither the window's size nor its shape, and offset from
+        // the origin: a window-sized buffer stretched over this box distorts the
+        // layout, and viewport coordinates read as canvas ones are off by the
+        // offset.
+        await page.evaluate(() => {
+            const el = document.createElement("gds-lens");
+            el.style.cssText = "display:block;width:520px;height:300px;margin:120px 0 0 180px";
+            document.body.appendChild(el);
+            window.el = el;
+        });
+        await page.evaluate(() => window.el.load("sample_layout.gds"));
+        await page.waitForFunction(
+            () => window.el.shadowRoot?.getElementById("loadingOverlay")?.classList.contains("hidden"),
+            { timeout: 60_000 });
+
+        const size = await page.evaluate(() => {
+            const canvas = window.el.shadowRoot.querySelector("canvas");
+            const box = canvas.getBoundingClientRect();
+            return { css: [Math.round(box.width), Math.round(box.height)],
+                     buffer: [canvas.width, canvas.height] };
+        });
+        assert.deepEqual(size.buffer, size.css,
+            `drawing buffer ${size.buffer} does not match the element's box ${size.css}`);
+
+        // The end-to-end version of the same claim, and the one a user would
+        // notice: centre the camera on a coordinate, put the pointer on the
+        // middle of the canvas, and the readout has to agree. It did not when
+        // the buffer was the window's -- the middle of the buffer was not the
+        // middle of the box, and the box was not where the pointer thought.
+        const box = await page.locator("gds-lens").boundingBox();
+        await page.evaluate(() => window.el.goToPoint(2, 3));
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.waitForFunction(() => window.el.shadowRoot
+            .getElementById("coordReadout").textContent.includes("X"), { timeout: 10_000 });
+        const readout = await page.evaluate(() => window.el.shadowRoot
+            .getElementById("coordReadout").textContent.trim());
+        assert.match(readout, /X:\s*2\.0\s+Y:\s*3\.0/,
+            `the pointer at the canvas centre read ${readout}, not the point the camera is on`);
+
+        // Resizing the element alone leaves the window untouched, so nothing but
+        // the ResizeObserver can catch it.
+        await page.evaluate(() => { window.el.style.width = "300px"; window.el.style.height = "560px"; });
+        await page.waitForFunction(() => {
+            const canvas = window.el.shadowRoot.querySelector("canvas");
+            return canvas.width === 300 && canvas.height === 560;
+        }, { timeout: 10_000 });
+    });
+});
+
+test("a viewer with nothing to show says so rather than showing a progress bar",
+     opts, async () => {
+    await withPage(async (page, port) => {
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        await page.evaluate(() => {
+            const el = document.createElement("gds-lens");
+            el.style.cssText = "display:block;width:520px;height:300px";
+            document.body.appendChild(el);
+            window.el = el;
+            return el.ready;
+        });
+        // An empty progress bar over "Loading layout..." is what a hung load
+        // looks like, and a viewer nobody has handed a layout to is not loading.
+        const idle = await page.evaluate(() => {
+            const root = window.el.shadowRoot;
+            const overlay = root.getElementById("loadingOverlay");
+            return { visible: !overlay.classList.contains("hidden"),
+                     phase: root.getElementById("loadingPhase").textContent.trim(),
+                     // offsetParent is null for a display:none ancestor chain,
+                     // which is how the idle rule hides the bar.
+                     bar: !!root.getElementById("loadingBarTrack").offsetParent };
+        });
+        assert.ok(idle.visible, "the idle viewer should still say something");
+        assert.equal(idle.phase, "No layout loaded");
+        assert.equal(idle.bar, false, "an idle viewer should show no progress bar");
+
+        // And it turns into a real load when one starts.
+        await page.evaluate(() => window.el.load("sample_layout.gds"));
+        await page.waitForFunction(
+            () => window.el.shadowRoot.getElementById("loadingOverlay").classList.contains("hidden"),
+            { timeout: 60_000 });
+    });
+});

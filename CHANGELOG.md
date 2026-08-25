@@ -4,10 +4,10 @@ Notable changes to this project. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-While the version is `0.x` the public API may change in any release. See the
-status note at the top of the README.
+From 1.0.0 on, a breaking change to the element's API waits for a major
+version. Before that, `0.x` releases changed it freely.
 
-## [Unreleased]
+## [1.0.0] - 2026-08-25
 
 ### Added
 
@@ -22,6 +22,13 @@ status note at the top of the README.
   and 19, server rendering, and what remounting does. The examples are covered
   by `test/react.test.js`, and the type declaration by
   `test/types/jsx-smoke.tsx`.
+- `showLoading(label?)` on the viewer surface, for the wait before `load()`:
+  a host that is fetching bytes can say so instead of leaving the viewer
+  looking idle. The element calls it itself when `load()` is given a URL.
+- `examples/multi-view.html`: six viewers on one page -- three loading a layout
+  from `src`, three waiting for a button -- including applying a `.lyp` and a
+  marker database to one viewer alone, and creating and releasing a viewer to
+  keep a WebGL context free.
 - `docs/embedding.md`, which is where the `ViewerHost` interface, the three
   builds, the subpath exports and the WebAssembly limits moved to. The README
   keeps the quick start and the element's own API and is a third of its previous
@@ -29,6 +36,31 @@ status note at the top of the README.
 
 ### Fixed
 
+- Saved views were shared by every viewer on the page. Each read the whole set
+  at mount and wrote the whole set back on save, so two viewers that both saved
+  a view overwrote each other and the last one won. The default host now keeps a
+  bucket per viewer, keyed by the element's `id`, else its `src`, else -- for a
+  page with a single viewer and neither -- the key it has always used. `loadViews`
+  and `saveViews` are handed the viewer asking, which is what a host serving
+  several needs to tell them apart. A viewer with no `id` and no `src` on a page
+  with others has nothing stable to key on: its views last for the life of the
+  page. Views previously saved on a page whose element carries a `src` are not
+  carried into the new per-layout bucket.
+- The renderer sized its drawing buffer to the window rather than to the canvas
+  element, which was only ever right for a viewer filling the page. In an
+  embedded `<gds-lens>` the browser stretched a window-sized buffer over the
+  element's box, so the layout was drawn distorted; every coordinate the mouse
+  produced -- the readout, the ruler, the right-click "Copy coordinate",
+  zoom-at-cursor -- answered for a pixel the pointer was not on; and each viewer
+  allocated a window-sized buffer and mask texture however small it was on
+  screen. It now sizes from the element, and a `ResizeObserver` on the canvas
+  keeps it in step with a box that changes without the window changing.
+- The canvas right-click menu passed viewport coordinates to the renderer and
+  clamped itself against the window, so in an embedded viewer it opened in the
+  wrong place and reported the coordinate of a different pixel.
+- A viewer that had not been asked for a layout showed "Loading layout..." over
+  an empty progress bar, which read as a load that had hung. It now says "No
+  layout loaded" until something actually asks for one.
 - `import "gds-lens"` shipped no default host. `sideEffects` in package.json
   did not list `src/hosts/browser.js`, whose whole purpose is the side effect
   of installing `window.gdsLensHost`, so every bundler dropped it -- including
@@ -255,6 +287,7 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.1...v1.0.0
 [0.1.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/EthanLowenthal/GDS-Lens/releases/tag/v0.1.0

@@ -425,6 +425,9 @@
         #staleBanner button#staleDismiss:hover { background: none; opacity: 1; }
         #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: var(--fg-dim); background: var(--bg); z-index: 30; }
         #loadingOverlay.hidden { display: none; }
+        /* Idle -- nothing has been asked for yet, so there is no progress to
+           report and a 0% bar would only look like a stalled one. */
+        #loadingOverlay.idle #loadingBarTrack, #loadingOverlay.idle #loadingPercent { display: none; }
         #loadingBarTrack { width: 320px; height: 8px; background: var(--surface); border-radius: 4px; overflow: hidden; }
         #loadingBarFill { width: 0%; height: 100%; background: var(--accent); transition: width 0.15s ease-out; }
         #loadingPhase { font-size: 12px; }

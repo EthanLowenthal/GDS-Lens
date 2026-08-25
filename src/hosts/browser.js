@@ -16,8 +16,8 @@
 //   unloadLyp()          -> void
 //   pickMarkers()        -> Promise<{name, text} | null>
 //   unloadMarkers()      -> void
-//   loadViews()          -> Promise<view[]>
-//   saveViews(views)     -> void
+//   loadViews(viewer)         -> Promise<view[]>
+//   saveViews(views, viewer)  -> void
 //   promptViewName(existingNames) -> Promise<string | null>
 //   requestReload()      -> void
 //   setAutoReload(on)    -> void
@@ -26,30 +26,85 @@
 //
 // `connect` is how a host drives the viewer rather than answering it:
 //
-//   viewer.load(bytes, { reload })   viewer.showError(message)
+//   viewer.load(bytes, { reload })   viewer.showLoading(label)
+//   viewer.showError(message)
 //   viewer.setLyp(name, text)        viewer.setMarkers(name, text)
 //   viewer.showStale(text)           viewer.goToPoint(x, y)
 //   viewer.toggleDebug()             viewer.element  (the mounted element)
 
 export function createBrowserHost() {
-    // Views are per-layout everywhere else; a plain page has no document
-    // identity to key on, so everything in one page shares a bucket. Wrapped
-    // because storage throws outright in some privacy modes rather than
-    // merely coming back empty.
+    // ---- Where a viewer's saved views live ----
     //
-    // Shared across viewers, too, which matters on a page with more than one:
-    // each reads the bucket once at mount, so two viewers that both save a
-    // view write whole sets over each other and the later one wins. Fixing it
-    // needs a document identity to key on, which is exactly what a plain page
-    // does not have -- an embedder that has one (a file path, a document URI)
-    // should implement loadViews/saveViews itself rather than inherit this.
+    // One bucket per viewer, not one per page. Every viewer used to share a
+    // single key, and since each reads the whole set at mount and writes the
+    // whole set back on save, two viewers that both saved a view wrote over
+    // each other and the last one won.
+    //
+    // A bucket needs a name that is still the same on the next page load, and
+    // an element's position in the page is not one: keying on it would hand one
+    // viewer's views to a different viewer after an edit to the markup. So, in
+    // order of preference:
+    //
+    //   1. the element's `id`   -- author-chosen, stable, and per instance,
+    //                              which is what a page of several viewers
+    //                              should give them.
+    //   2. its `src`            -- views belong to a layout, and on a plain
+    //                              page this is the only thing that names one.
+    //   3. the page's only viewer -- keeps a single-viewer page on the key it
+    //                              has always used, rather than silently
+    //                              orphaning views saved before this existed.
+    //   4. none of those        -- nothing stable to key on. The views are kept
+    //                              for the life of the page and not persisted,
+    //                              which is still per viewer; give the element
+    //                              an id to have them outlive the page.
+    //
+    // Worked out once per viewer and remembered: a page that mounts a second
+    // viewer later must not move the first one's views out from under it, and a
+    // viewer adopted by a new element keeps the bucket it has been using.
     const VIEWS_KEY = "gds-lens:named-views";
-    const readViews = () => {
+    const viewsKeys = new WeakMap();
+    // Rule 4's viewers. Keyed on the viewer surface rather than the element,
+    // which is the one identity that survives being adopted by a new element.
+    const sessionViews = new WeakMap();
+
+    const viewsKeyFor = (viewer) => {
+        // A host call with no viewer at all is a viewer older than this
+        // argument; the shared key is what it used to get.
+        if (!viewer) return VIEWS_KEY;
+        if (viewsKeys.has(viewer)) return viewsKeys.get(viewer);
+        const element = viewer.element;
+        const src = element && element.getAttribute("src");
+        let key = null;
+        if (element && element.id) {
+            key = `${VIEWS_KEY}:#${element.id}`;
+        } else if (src) {
+            // Resolved, so the same layout reached by a relative and an
+            // absolute path is one bucket rather than two. A src the URL parser
+            // refuses is still a name, so keep it as written.
+            let resolved = src;
+            try {
+                resolved = new URL(src, location.href).href;
+            } catch {
+                // left as written
+            }
+            key = `${VIEWS_KEY}:${resolved}`;
+        } else if (document.querySelectorAll("gds-lens").length <= 1) {
+            key = VIEWS_KEY;
+        }
+        viewsKeys.set(viewer, key);
+        return key;
+    };
+
+    // Wrapped because storage throws outright in some privacy modes rather
+    // than merely coming back empty.
+    const readViews = (viewer) => {
+        const key = viewsKeyFor(viewer);
+        if (!key) return sessionViews.get(viewer) || [];
         try {
             // Array-checked, not just parse-guarded: the catch only covers a
             // throw, and `null` or `5` parse perfectly well while being
             // nothing the caller can iterate.
-            const parsed = JSON.parse(localStorage.getItem(VIEWS_KEY) || "[]");
+            const parsed = JSON.parse(localStorage.getItem(key) || "[]");
             return Array.isArray(parsed) ? parsed : [];
         } catch {
             return [];
@@ -81,10 +136,18 @@ export function createBrowserHost() {
     return {
         pickLyp: () => pickText(".lyp"),
         pickMarkers: () => pickText(".lyrdb,.txt,.db"),
-        loadViews: async () => readViews(),
-        saveViews: (views) => {
+        loadViews: async (viewer) => readViews(viewer),
+        saveViews: (views, viewer) => {
+            const key = viewsKeyFor(viewer);
+            if (!key) {
+                // Nothing stable to key on -- see viewsKeyFor. Held for the
+                // page rather than dropped: the views still work, they just do
+                // not come back tomorrow.
+                sessionViews.set(viewer, views);
+                return;
+            }
             try {
-                localStorage.setItem(VIEWS_KEY, JSON.stringify(views));
+                localStorage.setItem(key, JSON.stringify(views));
             } catch {
                 // Full or blocked storage: the views stay live in this page,
                 // they just will not outlive it. Not worth interrupting for.
@@ -112,6 +175,9 @@ export function createBrowserHost() {
 
             const src = new URLSearchParams(location.search).get("src");
             if (src) {
+                // Same reason as the element's load(): the viewer cannot see a
+                // fetch this host is doing, so it would sit idle through it.
+                viewer.showLoading?.();
                 fetch(src)
                     .then((response) => {
                         if (!response.ok) throw new Error(`HTTP ${response.status}`);

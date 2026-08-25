@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <!-- dist/web/gds-lens.html's policy plus two allowances this page needs:
+         'unsafe-inline' for its own two scripts, and blob: in script-src because
+         the bundled build starts its parse Worker as a module Worker built from
+         a blob, and a module Worker's imports are checked against script-src
+         rather than worker-src. A page loading the served payload instead, with
+         its scripts in files, needs neither. -->
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob:; worker-src blob:; connect-src 'self';">
+    <title>GDS Lens — several viewers on one page</title>
+    <style>
+        /* The page harness only. Everything the viewer draws lives inside its
+           shadow root, so nothing here reaches it and nothing there leaks out.
+
+           The tokens track prefers-color-scheme because the viewer does: the
+           default host's isLightTheme() reads the OS preference, so a page that
+           picks its own side ends up with six light control panels on a dark
+           page (or the reverse). An embedder that wants to decide for itself
+           implements isLightTheme() on its host instead. */
+        :root {
+            color-scheme: light dark;
+            --page: #f4f4f4;
+            --card: #ffffff;
+            --well: #fdfdfd;
+            --line: #dcdcdc;
+            --text: #1c1c1c;
+            --muted: #666666;
+            --code: #333333;
+            --button: #ececec;
+            --button-hover: #e0e0e0;
+            --button-line: #cccccc;
+            --bad: #b3261e;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --page: #141414;
+                --card: #1a1a1a;
+                --well: #101010;
+                --line: #2e2e2e;
+                --text: #e6e6e6;
+                --muted: #8f8f8f;
+                --code: #cfcfcf;
+                --button: #2c2c2c;
+                --button-hover: #383838;
+                --button-line: #3d3d3d;
+                --bad: #f08c8c;
+            }
+        }
+
+        html, body { margin: 0; padding: 0; background: var(--page); }
+        body {
+            color: var(--text);
+            font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+            padding: 32px 24px 64px;
+        }
+        header { max-width: 1200px; margin: 0 auto 28px; }
+        h1 { font-size: 20px; margin: 0 0 8px; font-weight: 600; }
+        header p { margin: 0; color: var(--muted); max-width: 70ch; }
+        header code { color: var(--code); }
+
+        .grid {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+        }
+
+        .card {
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: var(--card);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .card-head {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--line);
+        }
+        .card-head h2 { font-size: 14px; font-weight: 600; margin: 0; flex: 1; }
+        .card-note { padding: 10px 14px; margin: 0; color: var(--muted); font-size: 12.5px; }
+
+        button {
+            font: inherit;
+            font-size: 13px;
+            color: var(--text);
+            background: var(--button);
+            border: 1px solid var(--button-line);
+            border-radius: 5px;
+            padding: 5px 11px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        button:hover:not(:disabled) { background: var(--button-hover); }
+        button:disabled { opacity: 0.45; cursor: default; }
+
+        /* The element is display: block with no intrinsic height, so give it
+           one -- an unsized <gds-lens> collapses to nothing. Any box will do:
+           the renderer sizes its drawing buffer to the element, so a viewer
+           need not be shaped like the window. */
+        gds-lens, .placeholder {
+            display: block;
+            width: 100%;
+            height: 340px;
+            background: var(--well);
+        }
+
+        /* Stands in for a viewer that has not been created yet (card 6). */
+        .placeholder {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .status {
+            padding: 8px 14px;
+            border-top: 1px solid var(--line);
+            color: var(--muted);
+            font-size: 12px;
+            min-height: 1.5em;
+        }
+        .status.error { color: var(--bad); }
+
+        footer {
+            max-width: 1200px;
+            margin: 32px auto 0;
+            color: var(--muted);
+            font-size: 12.5px;
+        }
+        footer code { color: var(--code); }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>GDS Lens — several viewers on one page</h1>
+        <p>
+            Each <code>&lt;gds-lens&gt;</code> below drives its own viewer: its own
+            shadow tree, its own WebAssembly instance, its own WebGL2 context. They
+            share nothing — layer properties, marker databases and saved views all
+            belong to the viewer they were given to, and the saved ones are kept
+            under each element's <code>id</code>. The first three load a layout up
+            front; the last three wait for you. Pan with the mouse, zoom with the
+            wheel, and drop a layout file on any of them.
+        </p>
+    </header>
+
+    <div class="grid">
+
+        <!-- 1. Preloaded, the whole thing: one attribute. -->
+        <section class="card">
+            <div class="card-head"><h2>Preloaded — <code>src</code> attribute</h2></div>
+            <p class="card-note">
+                <code>&lt;gds-lens src="sample_layout.gds"&gt;</code>. The element
+                fetches and frames the design as it connects; no script involved.
+            </p>
+            <gds-lens id="v-gds" src="../test/fixtures/sample_layout.gds"></gds-lens>
+            <div class="status" id="s-gds">Loading…</div>
+        </section>
+
+        <!-- 2. Preloaded, and a different format -- detected from the bytes. -->
+        <section class="card">
+            <div class="card-head"><h2>Preloaded — gzipped OASIS</h2></div>
+            <p class="card-note">
+                The same attribute pointing at <code>sample_layout.oas.gz</code>.
+                Format and gzip are read from the leading bytes, not the filename.
+            </p>
+            <gds-lens id="v-oas" src="../test/fixtures/sample_layout.oas.gz"></gds-lens>
+            <div class="status" id="s-oas">Loading…</div>
+        </section>
+
+        <!-- 3. Preloaded, then dressed with layer properties and DRC markers. -->
+        <section class="card">
+            <div class="card-head"><h2>Preloaded — with <code>.lyp</code> and DRC markers</h2></div>
+            <p class="card-note">
+                Loaded from <code>src</code>, then given a layer-properties file and
+                a <code>.lyrdb</code> report from script. Both are per viewer: the
+                other five are untouched.
+            </p>
+            <gds-lens id="v-dressed" src="../test/fixtures/sample_layout.gds"></gds-lens>
+            <div class="status" id="s-dressed">Loading…</div>
+        </section>
+
+        <!-- 4. Empty on arrival; a button hands it a URL. -->
+        <section class="card">
+            <div class="card-head">
+                <h2>On demand — load from a URL</h2>
+                <button id="b-url">Load GDS</button>
+            </div>
+            <p class="card-note">
+                The viewer mounts empty and waits. The button calls
+                <code>viewer.load(url)</code>, which is the same path the
+                <code>src</code> attribute takes.
+            </p>
+            <gds-lens id="v-url"></gds-lens>
+            <div class="status" id="s-url">Idle — nothing loaded.</div>
+        </section>
+
+        <!-- 5. Empty on arrival; a button hands it bytes off the user's disk. -->
+        <section class="card">
+            <div class="card-head">
+                <h2>On demand — load from a file</h2>
+                <button id="b-file">Load GDS…</button>
+            </div>
+            <p class="card-note">
+                Pick a <code>.gds</code>, <code>.oas</code> or gzipped file and the
+                page passes the bytes straight to <code>load()</code>. Dropping one
+                on the canvas does the same thing.
+            </p>
+            <input type="file" id="f-file" accept=".gds,.oas,.gz,.gds.gz,.oas.gz" hidden>
+            <gds-lens id="v-file"></gds-lens>
+            <div class="status" id="s-file">Idle — nothing loaded.</div>
+        </section>
+
+        <!-- 6. No element at all until asked: the context-thrifty version. -->
+        <section class="card">
+            <div class="card-head">
+                <h2>On demand — viewer created on click</h2>
+                <button id="b-lazy">Load GDS</button>
+                <button id="b-release" disabled>Release</button>
+            </div>
+            <p class="card-note">
+                The five above hold a WebGL2 context from the moment they mount.
+                This card creates no element until you ask, and
+                <code>destroy()</code> gives the context back — what a page with
+                more layouts than contexts wants.
+            </p>
+            <div id="slot-lazy"><div class="placeholder">No viewer yet.</div></div>
+            <div class="status" id="s-lazy">Idle — no viewer, no GL context.</div>
+        </section>
+
+    </div>
+
+    <footer>
+        <p>
+            Six live viewers is close to the ceiling: browsers cap WebGL2 contexts
+            per page at roughly 8 to 16, and past that they start dropping the
+            oldest. A page showing a dozen layouts wants one viewer swapping
+            layouts, or card 6's create-and-release pattern.
+        </p>
+        <p>
+            Serve the repository root over HTTP and open
+            <code>/examples/multi-view.html</code>: this page imports the built
+            bundle from <code>dist/</code> and its layouts from
+            <code>test/fixtures/</code>, and a module import will not run from
+            <code>file://</code> at all. Run <code>npm run build</code> first,
+            then, for example, <code>python3 -m http.server 8000</code> and open
+            <code>http://localhost:8000/examples/multi-view.html</code>.
+        </p>
+    </footer>
+
+    <!-- The bundled ESM build: the element, the parser, the renderer, the
+         WebAssembly binary and the default host, in one module. The served
+         payload (dist/web) works too, but its parse Worker resolves
+         gds-lens-engine.js against the *document*, so a page using it has to sit
+         in the same directory as the payload -- see docs/embedding.md. This page
+         does not, so it takes the bundle. -->
+    <script type="module">
+        import "../dist/esm/gds-lens.js";
+
+        const LAYOUT = "../test/fixtures/sample_layout.gds";
+        const $ = (id) => document.getElementById(id);
+
+        const say = (id, message, isError) => {
+            const el = $(id);
+            el.textContent = message;
+            el.classList.toggle("error", Boolean(isError));
+        };
+
+        const failure = (err) => (err && err.message) || String(err);
+
+        // What these status lines can and cannot say: load() resolves once the
+        // parse has *started*, not once geometry is on screen, and a bad layout
+        // is reported by the viewer in its own overlay rather than by rejecting.
+        // So the page reports what it handed over and leaves the outcome to the
+        // viewer, which draws its own progress bar and its own error.
+        const handedOver = (id, what) => say(id, `Handed ${what} to the viewer.`);
+
+        // The two plain preloaded cards do their loading from the src attribute,
+        // before any of this runs. `ready` resolves when the engine has mounted,
+        // which is the only part of it this page is in a position to observe.
+        for (const [viewer, status, what] of [
+            ["v-gds", "s-gds", "sample_layout.gds"],
+            ["v-oas", "s-oas", "sample_layout.oas.gz"],
+        ]) {
+            $(viewer).ready
+                .then(() => handedOver(status, `${what} (via src)`))
+                .catch((err) => say(status, failure(err), true));
+        }
+
+        // Layer properties and markers are pushed in after the element has its
+        // viewer. Both take text, so the page fetches them itself -- the viewer
+        // fetches nothing but the layout.
+        (async () => {
+            const dressed = $("v-dressed");
+            try {
+                await dressed.ready;
+                const [lyp, markers] = await Promise.all([
+                    fetch("../test/fixtures/sample.lyp").then((r) => r.text()),
+                    fetch("../test/fixtures/sample.lyrdb").then((r) => r.text()),
+                ]);
+                await dressed.setLyp("sample.lyp", lyp);
+                await dressed.setMarkers("sample.lyrdb", markers);
+                say("s-dressed", "Applied sample.lyp and sample.lyrdb.");
+            } catch (err) {
+                say("s-dressed", failure(err), true);
+            }
+        })();
+
+        // Card 4: a URL, on click. load() fetches it exactly as src would.
+        $("b-url").addEventListener("click", async () => {
+            const button = $("b-url");
+            button.disabled = true;
+            say("s-url", "Loading…");
+            try {
+                await $("v-url").load(LAYOUT);
+                handedOver("s-url", "sample_layout.gds");
+            } catch (err) {
+                // A failed fetch does reject -- a bad HTTP status, a wrong path.
+                // Anything past that is the viewer's to report.
+                say("s-url", failure(err), true);
+                $("v-url").showError(`Could not load ${LAYOUT}: ${failure(err)}`).catch(() => {});
+            } finally {
+                button.disabled = false;
+            }
+        });
+
+        // Card 5: bytes off the user's disk. load() takes a Uint8Array or an
+        // ArrayBuffer as readily as a URL.
+        $("b-file").addEventListener("click", () => $("f-file").click());
+
+        $("f-file").addEventListener("change", async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+            // Cleared first, so picking the same file twice fires again.
+            event.target.value = "";
+            say("s-file", `Loading ${file.name}…`);
+            try {
+                await $("v-file").load(new Uint8Array(await file.arrayBuffer()));
+                handedOver("s-file", file.name);
+            } catch (err) {
+                say("s-file", failure(err), true);
+                $("v-file").showError(`Could not load ${file.name}: ${failure(err)}`).catch(() => {});
+            }
+        });
+
+        // Card 6: no element, and so no GL context, until asked for one.
+        $("b-lazy").addEventListener("click", async () => {
+            const slot = $("slot-lazy");
+            let viewer = slot.querySelector("gds-lens");
+            if (!viewer) {
+                viewer = document.createElement("gds-lens");
+                slot.replaceChildren(viewer);
+                $("b-release").disabled = false;
+            }
+            $("b-lazy").disabled = true;
+            say("s-lazy", "Loading…");
+            try {
+                await viewer.load(LAYOUT);
+                handedOver("s-lazy", "sample_layout.gds");
+            } catch (err) {
+                say("s-lazy", failure(err), true);
+            } finally {
+                $("b-lazy").disabled = false;
+            }
+        });
+
+        // destroy() is the deliberate opposite of an ordinary unmount: removing
+        // an element *parks* its viewer for the next one to adopt, which is what
+        // makes a framework remount free. Only a page that is done with a viewer
+        // for good should take the context back like this.
+        $("b-release").addEventListener("click", async () => {
+            const viewer = $("slot-lazy").querySelector("gds-lens");
+            $("b-release").disabled = true;
+            if (viewer) await viewer.destroy();
+            const placeholder = document.createElement("div");
+            placeholder.className = "placeholder";
+            placeholder.textContent = "No viewer yet.";
+            $("slot-lazy").replaceChildren(placeholder);
+            say("s-lazy", "Released — the WebGL context is back.");
+        });
+    </script>
+</body>
+</html>

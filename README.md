@@ -1,11 +1,15 @@
 # GDS Lens
 
+[![npm](https://img.shields.io/npm/v/gds-lens.svg?style=flat-square&color=0f1720&label=NPM)](https://www.npmjs.com/package/gds-lens)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENCE.md)
+
 GDSII and OASIS chip layouts, parsed and rendered in the browser. A drop-in
 custom element compiled to pure JS+WASM with a WebGL2 renderer.
 
 ![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](https://raw.githubusercontent.com/EthanLowenthal/GDS-Lens/main/images/example.png)
 
-> **Status**: pre-1.0. The API is unstable and will change.
+> **Status**: 1.0. The element's API is stable, and breaking changes wait
+> for a major version. See [the changelog](CHANGELOG.md).
 
 ## Quick start
 
@@ -114,6 +118,10 @@ Each one costs a WebGL2 context, though, and browsers cap live contexts per page
 at roughly 8 to 16 — past that the browser starts dropping the oldest. A page
 showing a dozen layouts at once wants one viewer swapping layouts rather than a
 dozen elements.
+
+[`examples/multi-view.html`](examples/multi-view.html) is a working page of six:
+three loading a layout from `src`, three waiting for a button, one of them
+created and released on demand to keep a context free.
 
 #### Removal parks the viewer
 

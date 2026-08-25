@@ -1234,9 +1234,9 @@ void update_coord_readout() {
 // tracked pointer: the menu answers for the pixel that was clicked, and nothing
 // has to stay true about where the pointer wandered while the menu was open.
 //
-// Canvas pixels are CSS pixels here -- resize_canvas sizes the canvas from
-// window.innerWidth/Height with no devicePixelRatio scaling -- so the webview
-// hands a mouse event's clientX/clientY straight in.
+// Canvas pixels are CSS pixels here -- resize_canvas sizes the buffer from the
+// canvas element's clientWidth/Height with no devicePixelRatio scaling -- so a
+// mouse event's canvas-relative position goes straight in.
 //
 // "X=…, Y=…" rather than the readout's "X: … Y: … µm" because a copied
 // coordinate is going somewhere: back into "Go to Coordinate", into a script,
@@ -2450,14 +2450,45 @@ void request_redraw() {
     emscripten_request_animation_frame(draw_frame, nullptr);
 }
 
+// Sizes the drawing buffer to the canvas *element*, not to the window.
+//
+// The two are the same thing only when the viewer fills the page, which is
+// what the quick start does and what this used to assume. A <gds-lens> is a
+// component, though, and one in a card on a page of cards is neither the
+// window's size nor its shape -- and every consequence of getting this wrong
+// is silent. CSS stretches the buffer over the element's box, so a viewer
+// shaped differently from the window draws a distorted layout; g_canvas_width
+// is what screen_to_world divides by, so the mouse readout, the ruler, the
+// right-click coordinate and zoom-at-cursor all answer for a pixel the pointer
+// is not on; and each viewer allocates a window-sized buffer plus a 2x
+// supersampled mask no matter how small it is on screen.
+//
+// clientWidth/Height are CSS pixels, which is the unit the rest of this file
+// means by "canvas pixels" (see getCoordinateTextAt) and the unit Emscripten
+// reports mouse positions in, so the mouse math lines up by construction. No
+// devicePixelRatio scaling, as before -- that is a sharpness question, and a
+// separate one.
+//
+// Called at init, on a window resize, and from the ResizeObserver viewer.js
+// attaches to the canvas, which is what catches an element that changes size
+// while the window does not.
 void resize_canvas() {
-    val window = val::global("window");
-    int width = window["innerWidth"].as<int>();
-    int height = window["innerHeight"].as<int>();
+    val canvas = dom_root().call<val>("getElementById", std::string("glCanvas"));
+    int width = canvas["clientWidth"].as<int>();
+    int height = canvas["clientHeight"].as<int>();
+    // Zero means the element has no layout yet (still being mounted, or
+    // display:none). A zero viewport is not a thing GL can be handed, and
+    // clamping to 1x1 would frame the design against a pixel; fall back to the
+    // window, which is the old behaviour, and let the ResizeObserver correct it
+    // as soon as there is a box to measure.
+    if (width <= 0 || height <= 0) {
+        val window = val::global("window");
+        width = window["innerWidth"].as<int>();
+        height = window["innerHeight"].as<int>();
+    }
     g_canvas_width = width;
     g_canvas_height = height;
 
-    val canvas = dom_root().call<val>("getElementById", std::string("glCanvas"));
     canvas.set("width", width);
     canvas.set("height", height);
 
@@ -4820,4 +4851,8 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("clearCellHighlight", &clearCellHighlight);
     function("getMarkerStats", &getMarkerStats);
     function("getCoordinateTextAt", &getCoordinateTextAt);
+    // For viewer.js's ResizeObserver: the element can change size without the
+    // window doing anything (a flex layout reflowing, a panel opening, a card
+    // grid rewrapping), and the window resize event says nothing about that.
+    function("resizeCanvas", &resize_canvas);
 }

@@ -1,9 +1,13 @@
 <!-- lil-gui mounts its panel here rather than at document.body, so the
      whole control surface lives inside the shadow root. -->
 <div id="guiHost"></div>
-    <div id="loadingOverlay" role="status" aria-live="polite">
+    <!-- Starts idle: a viewer that has not been asked for a layout yet says
+         so, rather than showing a progress bar for a load nobody started. The
+         `idle` class comes off the moment one does (beginProgress and
+         showLoading in viewer.js), which is also what fills in the phase. -->
+    <div id="loadingOverlay" class="idle" role="status" aria-live="polite">
         <div id="loadingBarTrack"><div id="loadingBarFill"></div></div>
-        <div id="loadingPhase">Loading layout...</div>
+        <div id="loadingPhase">No layout loaded</div>
         <div id="loadingPercent"></div>
     </div>
     <!-- role="alert" rather than a polite live region: this replaces the

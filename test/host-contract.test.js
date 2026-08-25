@@ -130,3 +130,82 @@ test("the debug panel toggles", opts, async () => {
         assert.equal(await visible(), true, "toggleDebug should reveal them");
     });
 });
+
+// ---- The default host's own view storage ----
+//
+// Everything above replaces the default host; this pins down what the default
+// host does, because on a page with several viewers it is the piece with a
+// per-viewer answer to give. capture.js runs between the real host and the
+// element, so the surfaces it records belong to the default host.
+const CAPTURE_SCRIPT = `
+window.__surfaces = [];
+const host = window.gdsLensHost;
+const connect = host.connect.bind(host);
+host.connect = (viewer) => { window.__surfaces.push(viewer); connect(viewer); };
+`;
+
+// Two viewers, two ids, and no ?src= -- nothing here needs a layout drawn, only
+// the host's bookkeeping.
+const TWO_VIEWERS = `<!DOCTYPE html><html><head>
+    <meta charset="UTF-8">
+    </head><body>
+    <gds-lens id="before" style="width:200px;height:150px"></gds-lens>
+    <gds-lens id="after" style="width:200px;height:150px"></gds-lens>
+    <script src="gds-lens-engine.js"></script>
+    <script src="gds-lens-host.js"></script>
+    <script src="capture.js"></script>
+    <script src="gds-lens.js"></script>
+    </body></html>`;
+
+test("the default host keeps a set of views per viewer, not per page", opts, async () => {
+    await withPayload(defaultVariant, async (page, port) => {
+        await page.goto(`http://127.0.0.1:${port}/two.html`);
+        await page.waitForFunction(() => window.__surfaces?.length === 2, { timeout: 30_000 });
+
+        // Saved one after the other, which is what used to lose the first set:
+        // both viewers wrote the whole list to one key.
+        const stored = await page.evaluate(() => {
+            const host = window.gdsLensHost;
+            const [first, second] = window.__surfaces;
+            host.saveViews([{ name: "Corner", camera: { zoom: 1, panX: 0, panY: 0 } }], first);
+            host.saveViews([{ name: "Pad", camera: { zoom: 2, panX: 1, panY: 1 } },
+                            { name: "Via", camera: { zoom: 3, panX: 2, panY: 2 } }], second);
+            return Promise.all([host.loadViews(first), host.loadViews(second)]);
+        });
+        assert.deepEqual(stored.map((views) => views.map((v) => v.name)),
+                         [["Corner"], ["Pad", "Via"]],
+                         "one viewer's saved views overwrote the other's");
+
+        // And they are keyed by the element, so they are still there after a
+        // reload rather than only for the life of the page.
+        await page.reload();
+        await page.waitForFunction(() => window.__surfaces?.length === 2, { timeout: 30_000 });
+        const afterReload = await page.evaluate(() => {
+            const host = window.gdsLensHost;
+            return Promise.all(window.__surfaces.map((viewer) => host.loadViews(viewer)));
+        });
+        assert.deepEqual(afterReload.map((views) => views.map((v) => v.name)),
+                         [["Corner"], ["Pad", "Via"]],
+                         "the views did not survive a reload");
+    }, { "two.html": TWO_VIEWERS, "capture.js": { type: "text/javascript", body: CAPTURE_SCRIPT } });
+});
+
+test("a lone viewer with nothing to key on keeps the shared bucket", opts, async () => {
+    const LONE = TWO_VIEWERS
+        .replace(/<gds-lens id="before"[^>]*><\/gds-lens>\s*/, "")
+        .replace('id="after"', "");
+    await withPayload(defaultVariant, async (page, port) => {
+        await page.goto(`http://127.0.0.1:${port}/one.html`);
+        await page.waitForFunction(() => window.__surfaces?.length === 1, { timeout: 30_000 });
+        // The key a single-viewer page has always used: views saved before any
+        // of this existed have to still be there.
+        const key = await page.evaluate(async () => {
+            const host = window.gdsLensHost;
+            host.saveViews([{ name: "Whole chip", camera: { zoom: 1, panX: 0, panY: 0 } }],
+                           window.__surfaces[0]);
+            return localStorage.getItem("gds-lens:named-views");
+        });
+        assert.match(key || "", /Whole chip/,
+            "a single viewer with no id and no src should still use the shared key");
+    }, { "one.html": LONE, "capture.js": { type: "text/javascript", body: CAPTURE_SCRIPT } });
+});
