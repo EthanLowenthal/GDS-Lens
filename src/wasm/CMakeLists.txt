@@ -1,6 +1,11 @@
-# Builds gdstk + the qhull_r subset it needs + bindings.cpp into a single
-# Emscripten module (gdstk_wasm.js, with the .wasm binary embedded as base64
-# via SINGLE_FILE). Must be configured with `emcmake cmake`.
+# Builds gdstk + the qhull_r subset it needs + bindings.cpp into an Emscripten
+# module (gdstk_wasm.js). Must be configured with `emcmake cmake`.
+#
+# Two variants come out of this one file, selected by GDS_LENS_INLINE_WASM:
+# see the note on that option below. Configure each into its own build tree
+# (src/wasm/build/web and src/wasm/build/inline) -- they differ only in link
+# flags, but CMake caches those, so sharing a tree would silently keep
+# whichever was configured first.
 #
 # gdstk's own CMakeLists.txt isn't reused here: it pulls in zlib/Qhull via
 # find_package(), which assumes native installs (e.g. Homebrew) that aren't
@@ -21,6 +26,20 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 99)
+
+# OFF (the default) emits gdstk_wasm.js plus a sibling gdstk_wasm.wasm, which
+# the JS fetches. This is the normal way to ship WebAssembly: the browser
+# stream-compiles the binary while it downloads, and caches it separately from
+# the JS, so a JS-only change doesn't re-download 500KB of module.
+#
+# ON embeds the binary inside the JS instead (-sSINGLE_FILE), for hosts that
+# cannot fetch it: a VS Code webview cannot reach its own asset URLs, neither
+# from inside a Worker nor from the main thread. That costs streaming
+# compilation and the separate cache entry, and makes the .js
+# encoding-sensitive (see the SINGLE_FILE note further down), so it is opt-in
+# rather than the default.
+option(GDS_LENS_INLINE_WASM
+    "Embed the .wasm binary inside gdstk_wasm.js instead of fetching it" OFF)
 
 set(GDSTK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/gdstk")
 set(QHULL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/qhull")
@@ -96,21 +115,6 @@ target_link_options(gdstk_wasm PRIVATE
     # webview without needing type="module" + CSP changes for ES imports.
     -sMODULARIZE=1
     -sEXPORT_NAME=createGdstkModule
-    # The wasm binary is embedded in the .js rather than fetched, because a
-    # VS Code webview cannot reach its own asset URLs from inside a Worker.
-    #
-    # Emscripten embeds it as a raw binary string, which is smaller than base64
-    # but makes the file encoding-sensitive: it must be decoded as UTF-8 or the
-    # binary is corrupted, surfacing as a WebAssembly CompileError about
-    # section lengths. Either a charset=utf-8 on the script's Content-Type or a
-    # <meta charset="UTF-8"> on the page satisfies that, and essentially every
-    # static host sends the former; gds-lens.js warns if it sees neither.
-    #
-    # -sSINGLE_FILE_BINARY_ENCODE=0 switches to base64, which is pure ASCII and
-    # immune to this, at +89KB raw / +50KB gzipped (measured). Not taken:
-    # that is a 25% larger download for everyone, to avoid a misconfiguration
-    # that warns clearly and is fixed by one meta tag.
-    -sSINGLE_FILE=1
     -sALLOW_MEMORY_GROWTH=1
     # Emscripten caps growth at 2GB by default; a big flattened layout hits
     # that and dies with a bare "memory access out of bounds". 4GB is the most
@@ -130,6 +134,22 @@ target_link_options(gdstk_wasm PRIVATE
     # possible record (64KB); the default 64KB Emscripten stack isn't enough
     # headroom on top of the rest of the call chain.
     -sSTACK_SIZE=8388608)
+
+if(GDS_LENS_INLINE_WASM)
+    # Emscripten embeds the binary as a raw binary string, which is smaller
+    # than base64 but makes the file encoding-sensitive: it must be decoded as
+    # UTF-8 or the binary is corrupted, surfacing as a WebAssembly CompileError
+    # about section lengths. Either a charset=utf-8 on the script's
+    # Content-Type or a <meta charset="UTF-8"> on the page satisfies that, and
+    # essentially every static host sends the former; gds-lens.js warns if it
+    # sees neither.
+    #
+    # -sSINGLE_FILE_BINARY_ENCODE=0 switches to base64, which is pure ASCII and
+    # immune to this, at +89KB raw / +50KB gzipped (measured). Not taken: that
+    # is a 25% larger download for every consumer of this variant, to avoid a
+    # misconfiguration that warns clearly and is fixed by one meta tag.
+    target_link_options(gdstk_wasm PRIVATE -sSINGLE_FILE=1)
+endif()
 
 set_target_properties(gdstk_wasm PROPERTIES
     OUTPUT_NAME "gdstk_wasm"

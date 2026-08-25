@@ -7,27 +7,17 @@
 // VS Code, but the contract itself can, and it is what the adapter is written
 // against.
 //
-// Skipped unless dist/webview has been built (npm run build).
+// The contract is the same whichever way the wasm arrives, so this runs
+// against one payload rather than every built variant.
+//
+// Skipped unless a payload has been built (npm run build).
 
 import test from "node:test";
 import assert from "node:assert";
 import fs from "fs";
-import http from "http";
 import path from "path";
-import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const webviewDir = path.join(__dirname, "..", "dist", "webview");
-const fixtures = path.join(__dirname, "fixtures");
-const built = fs.existsSync(path.join(webviewDir, "gds-lens.js")) &&
-              fs.existsSync(path.join(webviewDir, "gdstk_wasm.js"));
-
-let chromium = null;
-try {
-    ({ chromium } = await import("playwright"));
-} catch { /* skipped below */ }
-
-const TYPES = { ".html": "text/html", ".js": "text/javascript" };
+import { chromium, defaultVariant, fixtures, withPayload } from "./payload.js";
 
 // The mock host is installed as window.gdsLensHost *before* gds-lens.js runs,
 // which is exactly how a real embedder replaces the default one. It records
@@ -50,33 +40,12 @@ window.gdsLensHost = {
 };
 `;
 
-function serve() {
-    const server = http.createServer((req, res) => {
-        const name = decodeURIComponent(req.url.split("?")[0]).replace(/^\/+/, "");
-        if (name === "host.js") {
-            res.writeHead(200, { "Content-Type": "text/javascript" });
-            return res.end(HOST_SCRIPT);
-        }
-        const fixture = path.join(fixtures, name);
-        const file = fs.existsSync(fixture) ? fixture : path.join(webviewDir, name);
-        if (!file.startsWith(webviewDir) && !file.startsWith(fixtures)) return res.writeHead(403).end();
-        fs.readFile(file, (err, data) => {
-            if (err) return res.writeHead(404).end();
-            res.writeHead(200, { "Content-Type": TYPES[path.extname(file)] || "application/octet-stream" });
-            res.end(data);
-        });
-    });
-    return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
-}
-
+// Substituting host.js is the whole setup: the payload's own default host
+// never runs, so nothing else has to be stubbed.
 async function mounted(fn) {
-    const server = await serve();
-    const port = server.address().port;
-    const browser = await chromium.launch({ args: ["--use-gl=angle", "--use-angle=swiftshader"] });
-    const page = await browser.newPage();
-    const pageErrors = [];
-    page.on("pageerror", (e) => pageErrors.push(String(e)));
-    try {
+    await withPayload(defaultVariant, async (page, port) => {
+        const pageErrors = [];
+        page.on("pageerror", (e) => pageErrors.push(String(e)));
         await page.goto(`http://127.0.0.1:${port}/viewer.html`);
         // Getting a layout in is the host's job, and this mock replaces the
         // default host that would otherwise handle ?src=. Driving it through
@@ -93,14 +62,11 @@ async function mounted(fn) {
             { timeout: 60_000 });
         await fn(page);
         assert.deepEqual(pageErrors, [], `uncaught page errors: ${pageErrors.join("; ")}`);
-    } finally {
-        await browser.close();
-        server.close();
-    }
+    }, { "host.js": HOST_SCRIPT });
 }
 
 const calls = (page) => page.evaluate(() => window.__calls.map((c) => c.name));
-const opts = { skip: !built || !chromium };
+const opts = { skip: !defaultVariant || !chromium };
 
 test("the host is connected and asked for its stored views", opts, async () => {
     await mounted(async (page) => {

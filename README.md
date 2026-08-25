@@ -12,7 +12,6 @@ Reading and rendering only. Writing layouts is deliberately out of scope.
 ## Quick start
 
 ```html
-<meta charset="UTF-8">
 <script type="module" src="gds-lens.js"></script>
 
 <gds-lens src="chip.gds" style="width: 100%; height: 600px"></gds-lens>
@@ -33,17 +32,9 @@ await viewer.load("chip.gds");        // a URL, or bytes you already have
 await viewer.goToPoint(120.5, -40);   // centre on a coordinate, in microns
 ```
 
-**The scripts must be decoded as UTF-8.** The WebAssembly binary is embedded in
-the JavaScript as a raw string, so reading it in another encoding corrupts it
-and the module fails with a `WebAssembly.instantiate()` error about section
-lengths. Either of these satisfies it, and you only need one:
-
-- the server sending `Content-Type: text/javascript; charset=utf-8`, which
-  essentially every static host and CDN does by default, or
-- `<meta charset="UTF-8">` on the page.
-
-It only breaks when neither is present. The element checks and says so in the
-console if it sees a document that is not UTF-8.
+Serve `gds-lens.js` alongside the other files in the payload (below). They must
+be on the same origin as the page: the WebAssembly binary and the parse worker
+are both fetched relative to the scripts.
 
 ## What it does
 
@@ -173,7 +164,39 @@ cleanly into Node, a worker, or an extension host.
 | `gds-lens/cell-search` | `rankCellMatches`, `cellPathToTarget` |
 | `gds-lens/load-errors` | `describeLoadFailure`, `isOutOfMemory` |
 | `gds-lens/hosts/browser` | `createBrowserHost` |
-| `gds-lens/webview/*` | The prebuilt payload, for hosts that serve files rather than bundle |
+| `gds-lens/web/*` | The prebuilt payload, for hosts that serve files rather than bundle |
+| `gds-lens/inline-wasm/*` | The same payload with the binary embedded, for hosts that cannot fetch |
+
+### The two payloads
+
+`dist/web/` is what you want. `gdstk_wasm.js` fetches a separate
+`gdstk_wasm.wasm` beside it, which is how WebAssembly is normally shipped: the
+browser stream-compiles the binary as it downloads, and caches it apart from
+the JavaScript, so a JS-only release does not re-download 400 KB of module.
+
+`dist/inline-wasm/` embeds the binary in `gdstk_wasm.js` instead. It exists for
+one situation: a host that cannot fetch a file next to its own scripts. A VS
+Code webview is the case this was built for -- its resource URLs are
+unreachable from a Worker and from the main thread alike, so there is nothing
+to fetch the binary with. Everything else in the two payloads is identical.
+
+Reach for it only if fetching genuinely does not work, because it costs:
+
+|  | `web` | `inline-wasm` |
+|---|---|---|
+| Module transfer, gzipped (JS + binary) | 188 KB | 196 KB |
+| Streaming compile | yes | no |
+| Binary cached separately from the JS | yes | no |
+| Sensitive to the page's encoding | no | yes |
+
+That last row is the sharp edge. Emscripten embeds the binary as a raw string,
+so `gdstk_wasm.js` has to be *decoded* as UTF-8 or the binary is corrupted and
+the module fails with a `WebAssembly.instantiate()` error about section
+lengths, which says nothing about the real cause. Either the server sending
+`Content-Type: text/javascript; charset=utf-8` (which essentially every static
+host does) or `<meta charset="UTF-8">` on the page satisfies it; it only breaks
+when neither is present. This build warns in the console if it sees a document
+that is not UTF-8.
 
 ```js
 import { decodeLayoutBytes } from "gds-lens/layout-bytes";
@@ -214,13 +237,18 @@ Then:
 ```sh
 git submodule update --init --recursive
 npm install
-npm run build:wasm     # -> src/wasm/build/gdstk_wasm.js
-npm run build          # -> dist/webview/
+npm run build:wasm     # both variants -> src/wasm/build/{web,inline}/
+npm run build          # -> dist/web/ and dist/inline-wasm/
 npm test
 ```
 
+`npm run build:wasm:web` and `npm run build:wasm:inline` build one variant
+each; `npm run build` then produces whichever payloads it finds, and says which
+it skipped.
+
 `npm test` includes browser tests that need Chromium
-(`npx playwright install chromium`); they skip if it is missing.
+(`npx playwright install chromium`); they skip if it is missing. The
+end-to-end load test runs once per built payload.
 
 ## Licence
 

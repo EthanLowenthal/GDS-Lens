@@ -8,22 +8,32 @@
 
 import { setMountTarget } from "./mount-target.js";
 
-// gdstk_wasm.js is Emscripten's SINGLE_FILE output: it carries the ~400KB wasm
-// binary inline as a raw string, which is 66,000-odd non-ASCII bytes. A
-// <script src> with no charset of its own is decoded using the *document's*
-// encoding, so on a page that does not declare UTF-8 those bytes are mangled
-// and the module fails with "WebAssembly.instantiate(): section was shorter
-// than expected size" -- an error that says nothing whatsoever about the
-// encoding that caused it. Say so plainly instead of letting someone lose an
-// afternoon to it.
+// True only in the inline-wasm payload, where gdstk_wasm.js carries the ~400KB
+// wasm binary inline as a raw string -- 66,000-odd non-ASCII bytes. A <script
+// src> with no charset of its own is decoded using the *document's* encoding,
+// so on a page that does not declare UTF-8 those bytes are mangled and the
+// module fails with "WebAssembly.instantiate(): section was shorter than
+// expected size" -- an error that says nothing whatsoever about the encoding
+// that caused it. Say so plainly instead of letting someone lose an afternoon
+// to it.
+//
+// esbuild substitutes this per payload (see scripts/build-webview.mjs), so the
+// warning stays silent in the default build, where the binary is a separate
+// file and the page's encoding is nobody's business. The typeof guard is for
+// running from source through the package's exports map, where nothing has
+// defined it and it should warn.
+const INLINE_WASM = typeof __GDS_LENS_INLINE_WASM__ === "undefined" || __GDS_LENS_INLINE_WASM__;
+
 function warnIfNotUtf8() {
+    if (!INLINE_WASM) return;
     const encoding = document.characterSet || document.charset;
     if (encoding && encoding.toUpperCase() !== "UTF-8") {
         console.error(
-            `[GDS] this document is ${encoding}, not UTF-8. gds-lens embeds its ` +
-            "WebAssembly binary in a script that must be decoded as UTF-8; it will " +
-            'fail to load. Add <meta charset="UTF-8"> to the page, or serve the ' +
-            "scripts as text/javascript; charset=utf-8."
+            `[GDS] this document is ${encoding}, not UTF-8. This build of gds-lens ` +
+            "embeds its WebAssembly binary in a script that must be decoded as " +
+            'UTF-8; it will fail to load. Add <meta charset="UTF-8"> to the page, ' +
+            "serve the scripts as text/javascript; charset=utf-8, or use the " +
+            "default build, which keeps the binary in a separate file."
         );
     }
 }

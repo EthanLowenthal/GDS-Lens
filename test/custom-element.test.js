@@ -4,75 +4,33 @@
 // fails visibly rather than quietly fighting the first over the renderer's
 // module-scope state.
 //
-// Skipped unless dist/webview has been built (npm run build).
+// None of that depends on how the wasm binary arrives, so unlike the smoke
+// test this runs against one payload rather than every built variant.
+//
+// Skipped unless a payload has been built (npm run build).
 
 import test from "node:test";
 import assert from "node:assert";
-import fs from "fs";
-import http from "http";
-import path from "path";
-import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const webviewDir = path.join(__dirname, "..", "dist", "webview");
-const fixture = path.join(__dirname, "fixtures", "sample_layout.gds");
-const built = fs.existsSync(path.join(webviewDir, "gds-lens.js")) &&
-              fs.existsSync(path.join(webviewDir, "gdstk_wasm.js"));
+import { chromium, defaultVariant, withPayload } from "./payload.js";
 
-let chromium = null;
-try {
-    ({ chromium } = await import("playwright"));
-} catch {
-    // left null; the tests below skip
-}
+// A page that loads only the bundles, with no <gds-lens> in it, so "importing
+// does not mount" can be observed at all. charset matters: the inline-wasm
+// build embeds the binary as a raw string, so a document that is not UTF-8
+// mangles it.
+const BARE = `<!DOCTYPE html><html><head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self';">
+    </head><body>
+    <script src="gdstk_wasm.js"></script>
+    <script src="host.js"></script>
+    <script src="gds-lens.js"></script>
+    </body></html>`;
 
-const TYPES = { ".html": "text/html", ".js": "text/javascript", ".gds": "application/octet-stream" };
+const withPage = (fn) => withPayload(defaultVariant, fn, { "bare.html": BARE });
 
-// Serves the payload plus a bare page that loads only the element bundle, so
-// "importing does not mount" can be observed at all.
-function serve() {
-    const server = http.createServer((req, res) => {
-        const name = decodeURIComponent(req.url.split("?")[0]).replace(/^\/+/, "");
-        if (name === "bare.html") {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            // charset matters: gdstk_wasm.js embeds the wasm binary as a raw
-            // string, so a document that is not UTF-8 mangles it.
-            res.end(`<!DOCTYPE html><html><head>
-                <meta charset="UTF-8">
-                <meta http-equiv="Content-Security-Policy"
-                  content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self';">
-                </head><body>
-                <script src="gdstk_wasm.js"></script>
-                <script src="host.js"></script>
-                <script src="gds-lens.js"></script>
-                </body></html>`);
-            return;
-        }
-        const file = name === "sample_layout.gds" ? fixture : path.join(webviewDir, name);
-        if (!file.startsWith(webviewDir) && file !== fixture) return res.writeHead(403).end();
-        fs.readFile(file, (err, data) => {
-            if (err) return res.writeHead(404).end();
-            res.writeHead(200, { "Content-Type": TYPES[path.extname(file)] || "application/octet-stream" });
-            res.end(data);
-        });
-    });
-    return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
-}
-
-async function withPage(fn) {
-    const server = await serve();
-    const port = server.address().port;
-    const browser = await chromium.launch({ args: ["--use-gl=angle", "--use-angle=swiftshader"] });
-    const page = await browser.newPage();
-    try {
-        await fn(page, port);
-    } finally {
-        await browser.close();
-        server.close();
-    }
-}
-
-const opts = { skip: !built || !chromium };
+const opts = { skip: !defaultVariant || !chromium };
 
 test("importing the element does not mount a viewer", opts, async () => {
     await withPage(async (page, port) => {

@@ -33,7 +33,9 @@
     "url": "https://github.com/EthanLowenthal/GDS-Lens/issues"
   },
   "scripts": {
-    "build:wasm": "emcmake cmake -S src/wasm -B src/wasm/build && cmake --build src/wasm/build",
+    "build:wasm": "npm run build:wasm:web && npm run build:wasm:inline",
+    "build:wasm:web": "emcmake cmake -S src/wasm -B src/wasm/build/web -DGDS_LENS_INLINE_WASM=OFF && cmake --build src/wasm/build/web",
+    "build:wasm:inline": "emcmake cmake -S src/wasm -B src/wasm/build/inline -DGDS_LENS_INLINE_WASM=ON && cmake --build src/wasm/build/inline",
     "build": "node scripts/build-webview.mjs",
     "watch": "node scripts/build-webview.mjs --watch",
     "test": "node --test test/*.test.js",
@@ -62,7 +64,8 @@
     "./layout-bytes": "./src/layout-bytes.js",
     "./load-errors": "./src/load-errors.js",
     "./hosts/browser": "./src/hosts/browser.js",
-    "./webview/*": "./dist/webview/*",
+    "./web/*": "./dist/web/*",
+    "./inline-wasm/*": "./dist/inline-wasm/*",
     "./package.json": "./package.json",
     "./viewer": "./src/viewer.js"
   },

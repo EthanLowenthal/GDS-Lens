@@ -1,17 +1,21 @@
 import { describeLoadFailure } from "./load-errors.js";
 
 // Runs the parse/flatten/triangulate half of loading a layout file (GDSII or
-// OASIS) off the main thread. viewer.js instantiates this via a Blob URL
-// built from THIS file's text with the full gdstk_wasm.js source prepended --
-// not `importScripts(wasmUrl)`. VS Code's webview resource protocol
-// (vscode-cdn.net) serves `<script src>` tags in the main document fine, but
-// a Worker (even a Blob one) can't reach it at all: importScripts against
-// that URL fails with a NetworkError before it even gets to CSP, and
-// `fetch()` against it fails the same way even from the main thread. Since
-// gdstk_wasm.js is built with -sSINGLE_FILE=1 (wasm embedded as base64, no
-// separate binary fetch needed), prepending its full text avoids needing any
-// network fetch from inside the worker -- createGdstkModule is simply
-// already in scope by the time this file's own code below runs. The
+// OASIS) off the main thread. Either way createGdstkModule is already in
+// scope by the time this file's own code runs, but how it got there depends
+// on the host (see createParseWorker in viewer.js):
+//
+// On an ordinary page the worker is a small blob that importScripts() both
+// gdstk_wasm.js and this file by absolute URL, and the wasm binary is a
+// separate file the module fetches for itself.
+//
+// A VS Code webview can do neither. Its resource protocol (vscode-cdn.net)
+// serves `<script src>` tags in the main document fine, but a Worker (even a
+// blob one) can't reach it at all: importScripts against that URL fails with
+// a NetworkError before it even gets to CSP, and `fetch()` fails the same way
+// even from the main thread -- so the binary can't be fetched either. That
+// host uses the inline-wasm build (-sSINGLE_FILE=1, binary embedded in the
+// .js) and prepends its full text to this file's, no network involved. The
 // concatenated text itself reaches viewer.js embedded as base64 in
 // viewer.html's #workerBundle element (see extension.cjs) rather than via
 // postMessage, since a ~270KB string sent that way reliably broke opening
@@ -74,6 +78,17 @@ self.addEventListener("unhandledrejection", (event) => {
     console.error("[GDS worker] unhandled promise rejection inside worker:", event.reason);
 });
 
+// Where to fetch gdstk_wasm.wasm from, for the build that keeps it separate.
+// Emscripten would resolve it against this worker's own script URL, which is
+// a blob: with no directory to speak of, so viewer.js passes the real one in.
+// Absent (the inline-wasm build, or a host that assembles the worker itself)
+// there is no binary to locate and the default is left alone.
+function moduleArgs() {
+    const base = self.gdsLensScriptBase;
+    if (!base) return {};
+    return { locateFile: (file) => new URL(file, base).href };
+}
+
 console.log("[GDS worker] registering onmessage handler");
 self.onmessage = (event) => {
     const message = event.data;
@@ -82,7 +97,7 @@ self.onmessage = (event) => {
 
     console.log("[GDS worker] fileData byteLength:", message.fileData && message.fileData.byteLength);
     console.log("[GDS worker] calling createGdstkModule()...");
-    createGdstkModule().then((Module) => {
+    createGdstkModule(moduleArgs()).then((Module) => {
         console.log("[GDS worker] createGdstkModule() resolved, Module keys:", Object.keys(Module).filter(k => typeof Module[k] === "function"));
         // Extension-less name on purpose: GDSII vs OASIS is decided by the
         // file's own header inside the wasm (gds_common::detect_format), so

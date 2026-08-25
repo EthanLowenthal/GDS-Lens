@@ -1,6 +1,6 @@
-// End-to-end smoke test for the payload as an ordinary web page: serves
-// dist/webview over HTTP, opens it in headless Chromium, hands it a layout,
-// and waits for geometry to reach the renderer.
+// End-to-end smoke test for a payload as an ordinary web page: serves it over
+// HTTP, opens it in headless Chromium, hands it a layout, and waits for
+// geometry to reach the renderer.
 //
 // This covers the half that unit tests structurally cannot -- whether the
 // files actually wire together. The scripts loading in the right order, the
@@ -8,66 +8,28 @@
 // document-relative URLs, wasm instantiating, and the parse landing. A
 // missing or misnamed script in the payload fails here and nowhere else.
 //
-// Skipped unless dist/webview has been built (npm run build).
+// Runs once per built payload, because the two differ in exactly this: the
+// dist/web build's Worker has to locate and fetch a separate gdstk_wasm.wasm
+// from inside a blob: URL, which nothing else exercises.
+//
+// Skipped for payloads that have not been built (npm run build).
 import test from "node:test";
 import assert from "node:assert";
-import fs from "fs";
-import http from "http";
-import path from "path";
 
-import { fileURLToPath } from "node:url";
+import { chromium, variants, withPayload } from "./payload.js";
 
-// ESM has no __dirname; every path below is relative to this file.
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-const webviewDir = path.join(__dirname, "..", "dist", "webview");
-const fixture = path.join(__dirname, "fixtures", "sample_layout.gds");
-
-const built = fs.existsSync(path.join(webviewDir, "viewer.html")) &&
-              fs.existsSync(path.join(webviewDir, "gdstk_wasm.js"));
-
-// Optional: the rest of the suite must still run where playwright's browser
-// download has not happened.
-let chromium = null;
-try {
-    ({ chromium } = await import("playwright"));
-} catch {
-    // left null; the test below skips
-}
-
-const TYPES = { ".html": "text/html", ".js": "text/javascript", ".gds": "application/octet-stream" };
-
-// Serves dist/webview plus the fixture, so the page can fetch the layout
-// through ?src= exactly as an embedding page would.
-function serve() {
-    const server = http.createServer((req, res) => {
-        const name = decodeURIComponent(req.url.split("?")[0]).replace(/^\/+/, "") || "viewer.html";
-        const file = name === "sample_layout.gds" ? fixture : path.join(webviewDir, name);
-        // Refuse anything that escapes the two locations we mean to serve.
-        if (!file.startsWith(webviewDir) && file !== fixture) {
-            res.writeHead(403).end();
-            return;
-        }
-        fs.readFile(file, (err, data) => {
-            if (err) return res.writeHead(404).end();
-            res.writeHead(200, { "Content-Type": TYPES[path.extname(file)] || "application/octet-stream" });
-            res.end(data);
+// Named so a failure says which payload broke.
+for (const variant of variants.length ? variants : [null]) {
+test(`the ${variant?.name ?? "web"} payload loads a layout as a plain web page`,
+     { skip: !variant || !chromium }, async () => {
+    await withPayload(variant, async (page, port) => {
+        const errors = [];
+        page.on("pageerror", (err) => errors.push(String(err)));
+        const wasmFetches = [];
+        page.on("request", (req) => {
+            if (req.url().endsWith(".wasm")) wasmFetches.push(req.url());
         });
-    });
-    return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
-}
 
-test("the payload loads a layout as a plain web page", { skip: !built || !chromium }, async () => {
-    const server = await serve();
-    const port = server.address().port;
-    // Chromium's SwiftShader fallback: CI has no GPU, and the renderer needs a
-    // real WebGL2 context to upload into.
-    const browser = await chromium.launch({ args: ["--use-gl=angle", "--use-angle=swiftshader"] });
-    const page = await browser.newPage();
-    const errors = [];
-    page.on("pageerror", (err) => errors.push(String(err)));
-
-    try {
         await page.goto(`http://127.0.0.1:${port}/viewer.html?src=sample_layout.gds`);
 
         // The host has to install itself before viewer.js reads it. This is
@@ -129,9 +91,23 @@ test("the payload loads a layout as a plain web page", { skip: !built || !chromi
         }));
         assert.equal(leaked.byId, false, "viewer elements are reachable from the document");
 
+        // The variants have to differ in exactly one observable way, and this
+        // is it. Asserting both directions catches a payload built against the
+        // wrong CMake tree, which otherwise still loads and looks fine.
+        if (variant.separateWasm) {
+            assert.ok(wasmFetches.length > 0,
+                "the web payload should fetch gdstk_wasm.wasm rather than embed it");
+            // Two instantiations, main thread and Worker; the Worker's is the
+            // one that needs locateFile, since it runs from a blob: URL with
+            // no directory of its own to resolve against.
+            assert.ok(wasmFetches.length >= 2,
+                `the Worker should fetch the binary too, saw ${wasmFetches.length} request(s)`);
+        } else {
+            assert.deepEqual(wasmFetches, [],
+                "the inline-wasm payload should not fetch a binary at all");
+        }
+
         assert.deepEqual(errors, [], `uncaught errors on the page: ${errors.join("; ")}`);
-    } finally {
-        await browser.close();
-        server.close();
-    }
+    });
 });
+}

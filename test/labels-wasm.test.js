@@ -14,26 +14,10 @@ import fs from "fs";
 import path from "path";
 
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
+import { loadModule, skip } from "./wasm-build.js";
 
 // ESM has no __dirname; every path below is relative to this file.
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// gdstk_wasm.js is Emscripten output targeting web+node, so it calls
-// require() internally when it detects Node. ESM has none to hand it.
-const require = createRequire(import.meta.url);
-
-const wasmJsPath = path.join(__dirname, "..", "src", "wasm", "build", "gdstk_wasm.js");
-const skip = !fs.existsSync(wasmJsPath) && "src/wasm/build/gdstk_wasm.js not built";
-
-// Same eval-the-bundle trick as marker-wasm.test.js (MODULARIZE + SINGLE_FILE).
-async function loadModule() {
-    const src = fs.readFileSync(wasmJsPath, "utf8");
-    const scope = {};
-    new Function("scope", "require", "__dirname", "__filename",
-        src + "\nscope.createGdstkModule = createGdstkModule;")(
-        scope, require, path.dirname(wasmJsPath), wasmJsPath);
-    return scope.createGdstkModule({});
-}
 
 // ---- minimal GDSII writer ---------------------------------------------------
 // Every record is [uint16 total length][uint8 record type][uint8 data type]

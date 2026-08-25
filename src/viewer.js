@@ -2238,7 +2238,15 @@ function createParseWorker() {
     // the blob: URL rather than against the document, so bare filenames here
     // would silently fail to load.
     const url = (name) => JSON.stringify(new URL(name, document.baseURI).href);
-    const bootstrap = `importScripts(${url("gdstk_wasm.js")}, ${url("wasm-worker.js")});`;
+    // Same reason, one level deeper: in the default build the .wasm is a
+    // separate file, and Emscripten locates it relative to its own script
+    // URL -- which inside a blob Worker is the blob:, not the directory the
+    // scripts actually came from. Handing the worker the real base is what
+    // lets it build a locateFile(); see wasm-worker.js. Harmless for the
+    // inline-wasm build, which never looks a binary up.
+    const bootstrap =
+        `self.gdsLensScriptBase = ${url(".")};\n` +
+        `importScripts(${url("gdstk_wasm.js")}, ${url("wasm-worker.js")});`;
     console.log("[GDS] building worker from document-relative script URLs");
     return new Worker(URL.createObjectURL(new Blob([bootstrap], { type: "application/javascript" })));
 }

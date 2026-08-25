@@ -14,6 +14,13 @@ const vendorGlobals = {
     createGdstkModule: "readonly",
 };
 
+// Substituted at bundle time by esbuild's `define`, one value per payload
+// variant (see scripts/build-webview.mjs). Never assigned in source, and
+// read only behind a typeof guard.
+const buildFlags = {
+    __GDS_LENS_INLINE_WASM__: "readonly",
+};
+
 // The same set for every block: these are the mistakes worth a warning in a
 // codebase this size, not a style guide.
 const rules = {
@@ -46,7 +53,7 @@ export default [
     },
     // The viewer's main thread: browser globals plus the vendored ones.
     module_(["src/viewer.js", "src/gds-lens.js", "src/mount-target.js"],
-        { ...globals.browser, ...vendorGlobals }),
+        { ...globals.browser, ...vendorGlobals, ...buildFlags }),
     // The parse Worker: its own global scope, with no DOM in it.
     module_(["src/wasm-worker.js"], { ...globals.worker, ...vendorGlobals }),
     // Hosts run on the main thread and touch the DOM, but nothing vendored.
