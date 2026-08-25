@@ -1,10 +1,7 @@
 # GDS Lens
 
 GDSII and OASIS chip layouts, parsed and rendered in the browser. A drop-in
-custom element wrapping [gdstk](https://github.com/heitzmann/gdstk) compiled to
-WebAssembly and a WebGL2 renderer.
-
-Reading and rendering only. Writing layouts is deliberately out of scope.
+custom element compiled to pure JS+WASM with a WebGL2 renderer.
 
 ![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](https://raw.githubusercontent.com/EthanLowenthal/GDS-Lens/main/images/example.png)
 
