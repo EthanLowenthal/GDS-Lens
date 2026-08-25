@@ -3,20 +3,25 @@
 // only the CPU-side marker state is exercised) and asserts setMarkers /
 // setMarkerCategoryVisible / setSelectedMarker / clearMarkers transitions via
 // getMarkerStats(). Skipped when the wasm bundle hasn't been built.
-"use strict";
+import test from "node:test";
+import assert from "node:assert";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { DOMParser } from "@xmldom/xmldom";
+import { parseMarkerFile, flattenMarkerModel } from "../src/marker-parsers.js";
 
-const test = require("node:test");
-const assert = require("node:assert");
-const fs = require("fs");
-const path = require("path");
+// ESM has no __dirname; every path below is relative to this file.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// gdstk_wasm.js is Emscripten output targeting web+node, so it calls
+// require() internally when it detects Node. ESM has none to hand it.
+const require = createRequire(import.meta.url);
 
 const wasmJsPath = path.join(__dirname, "..", "src", "wasm", "build", "gdstk_wasm.js");
 const wasmBuilt = fs.existsSync(wasmJsPath);
 
 test("wasm marker state (headless)", { skip: !wasmBuilt && "src/wasm/build/gdstk_wasm.js not built" }, async () => {
-    const { DOMParser } = require("@xmldom/xmldom");
-    const { parseMarkerFile, flattenMarkerModel } = require("../src/marker-parsers.js");
-
     // The bundle is MODULARIZE + SINGLE_FILE: eval its source with `require`
     // in scope and capture the factory (see memory/DEVELOPING.md's headless
     // flow).

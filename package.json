@@ -41,28 +41,28 @@
   },
   "devDependencies": {
     "@xmldom/xmldom": "^0.9.10",
+    "esbuild": "^0.28.2",
     "eslint": "^10.5.0",
     "globals": "^17.11.0",
     "playwright": "^1.62.1"
   },
   "files": [
     "dist/",
-    "src/layout-bytes.js",
-    "src/coord-parse.js",
-    "src/cell-search.js",
-    "src/marker-parsers.js",
-    "src/load-errors.js",
+    "src/",
     "LICENCE.md",
     "THIRD-PARTY-LICENSES.md",
     "README.md"
   ],
   "exports": {
-    "./layout-bytes": "./src/layout-bytes.js",
-    "./coord-parse": "./src/coord-parse.js",
+    ".": "./src/viewer.js",
+    "./parsers": "./src/marker-parsers.js",
     "./cell-search": "./src/cell-search.js",
-    "./marker-parsers": "./src/marker-parsers.js",
+    "./coord-parse": "./src/coord-parse.js",
+    "./layout-bytes": "./src/layout-bytes.js",
     "./load-errors": "./src/load-errors.js",
+    "./hosts/browser": "./src/hosts/browser.js",
     "./webview/*": "./dist/webview/*",
     "./package.json": "./package.json"
-  }
+  },
+  "type": "module"
 }

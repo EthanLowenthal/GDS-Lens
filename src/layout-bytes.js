@@ -137,4 +137,4 @@ async function decodeLayoutBytes(bytes, maxBytes) {
     }
 }
 
-module.exports = { looksGzipped, gzipStoredSize, decodeLayoutBytes };
+export { looksGzipped, gzipStoredSize, decodeLayoutBytes };

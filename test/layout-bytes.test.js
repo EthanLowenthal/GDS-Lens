@@ -3,12 +3,10 @@
 // magic-number detection are the parts worth pinning: one is what keeps a small
 // .gds.gz from expanding past what the 32-bit wasm heap can hold, and the other
 // is what decides whether a file is treated as compressed at all.
-"use strict";
-
-const test = require("node:test");
-const assert = require("node:assert");
-const zlib = require("zlib");
-const { looksGzipped, gzipStoredSize, decodeLayoutBytes } = require("../src/layout-bytes.js");
+import test from "node:test";
+import assert from "node:assert";
+import zlib from "zlib";
+import { looksGzipped, gzipStoredSize, decodeLayoutBytes } from "../src/layout-bytes.js";
 
 // A GDSII header record (length 0x0006, HEADER 0x0002, version 600) followed by
 // filler -- enough that the bytes coming back out are identifiably a layout and

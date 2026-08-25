@@ -657,13 +657,11 @@ function flattenMarkerModel(model) {
     return { categories, itemCategory, itemBBoxes, polyVerts, polyVertCounts, polyItemIds, edgeVerts, edgeItemIds };
 }
 
-if (typeof module !== "undefined" && module.exports) {
-    module.exports = {
-        sniffMarkerFormat,
-        parsePointList,
-        parseLyrdb,
-        parseDrcAscii,
-        parseMarkerFile,
-        flattenMarkerModel,
-    };
-}
+export {
+    sniffMarkerFormat,
+    parsePointList,
+    parseLyrdb,
+    parseDrcAscii,
+    parseMarkerFile,
+    flattenMarkerModel,
+};

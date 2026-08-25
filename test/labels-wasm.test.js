@@ -8,12 +8,19 @@
 // The layout is built here rather than checked in as a fixture -- it's a
 // handful of GDSII records, and writing them out beats a binary blob nothing
 // in the repo can regenerate.
-"use strict";
+import test from "node:test";
+import assert from "node:assert";
+import fs from "fs";
+import path from "path";
 
-const test = require("node:test");
-const assert = require("node:assert");
-const fs = require("fs");
-const path = require("path");
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+
+// ESM has no __dirname; every path below is relative to this file.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// gdstk_wasm.js is Emscripten output targeting web+node, so it calls
+// require() internally when it detects Node. ESM has none to hand it.
+const require = createRequire(import.meta.url);
 
 const wasmJsPath = path.join(__dirname, "..", "src", "wasm", "build", "gdstk_wasm.js");
 const skip = !fs.existsSync(wasmJsPath) && "src/wasm/build/gdstk_wasm.js not built";

@@ -2,11 +2,9 @@
 // `node --test test/`). The parser backs the "GDSLens: Go to Coordinate"
 // command's input box, including its as-you-type validation, so what it
 // accepts and what it refuses are both worth pinning down.
-"use strict";
-
-const test = require("node:test");
-const assert = require("node:assert");
-const { parseCoordinatePair } = require("../src/coord-parse.js");
+import test from "node:test";
+import assert from "node:assert";
+import { parseCoordinatePair } from "../src/coord-parse.js";
 
 test("plain pairs, in microns", () => {
     assert.deepStrictEqual(parseCoordinatePair("12.5, -40"), { x: 12.5, y: -40 });

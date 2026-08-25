@@ -1,32 +1,41 @@
-// Assembles the webview payload consumers load: every file viewer.html pulls
-// in, flattened into one directory so the HTML can use bare relative srcs and
-// a host only has to copy (or serve) a single folder.
+// Builds the webview payload: the files a host copies or serves.
 //
-// gdstk_wasm.js must already be built (npm run build:wasm); it is a build
-// artifact and is never committed.
+// The sources are ES modules, but the payload deliberately is not. A VS Code
+// webview cannot load a module script from inside a Worker -- neither
+// importScripts() nor fetch() reaches its resource protocol -- so the worker
+// has to be one self-contained classic script that can be concatenated with
+// gdstk_wasm.js and handed over as a blob. Bundling the main-thread side the
+// same way keeps one loading story instead of two, and keeps the global
+// factories (createGdstkModule, lil) resolvable from plain <script> tags.
+//
+// Consumers who want modules import the sources directly through the package's
+// exports map; this directory is the ready-to-serve form.
 
 import { mkdir, copyFile, access, rm } from "node:fs/promises";
-import { watch } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { build, context } from "esbuild";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const out = join(root, "dist", "webview");
+const watch = process.argv.includes("--watch");
 
-// Flattened on purpose: viewer.html references these by bare filename, so the
-// directory the host serves is self-contained and position-independent.
-const FILES = [
+// Copied as-is: generated or vendored third-party files that already define
+// the globals the bundles expect.
+const COPY = [
     ["src/viewer.html", "viewer.html"],
-    ["src/viewer.js", "viewer.js"],
-    ["src/cell-search.js", "cell-search.js"],
-    ["src/marker-parsers.js", "marker-parsers.js"],
-    ["src/load-errors.js", "load-errors.js"],
-    // The default ViewerHost. A host with different services (VS Code, say)
-    // replaces this one file and leaves the rest of the payload alone.
-    ["src/hosts/browser.js", "host.js"],
-    ["src/wasm-worker.js", "wasm-worker.js"],
     ["src/vendor/lil-gui.umd.min.js", "lil-gui.umd.min.js"],
     ["src/wasm/build/gdstk_wasm.js", "gdstk_wasm.js"]
+];
+
+// IIFE, not ESM: see the note above. `lil` and `createGdstkModule` stay
+// globals, so they are external to the bundle and resolved at run time.
+const BUNDLES = [
+    ["src/viewer.js", "viewer.js"],
+    ["src/wasm-worker.js", "wasm-worker.js"],
+    // The default host. An embedder with different services replaces this one
+    // file and leaves the rest of the payload alone.
+    ["src/hosts/browser.js", "host.js"]
 ];
 
 const wasm = join(root, "src/wasm/build/gdstk_wasm.js");
@@ -40,39 +49,30 @@ try {
     process.exit(1);
 }
 
-async function build() {
+const options = (entry, name) => ({
+    entryPoints: [join(root, entry)],
+    outfile: join(out, name),
+    bundle: true,
+    format: "iife",
+    target: "es2022",
+    // Defined by the classic scripts loaded before these bundles.
+    external: [],
+    logLevel: "warning"
+});
+
+async function copyStatic() {
     await mkdir(out, { recursive: true });
-    for (const [from, to] of FILES) {
-        await copyFile(join(root, from), join(out, to));
-    }
+    for (const [from, to] of COPY) await copyFile(join(root, from), join(out, to));
 }
 
-await rm(out, { recursive: true, force: true });
-await build();
-console.log(`dist/webview: ${FILES.length} files`);
-
-// --watch is the inner loop for a host consuming this package through a local
-// path dependency: it republishes dist/webview on every source edit, so the
-// host only has to re-copy rather than reinstall. Deliberately not watching
-// gdstk_wasm.js's C++ sources -- rebuilding those means re-running emcc, which
-// is `npm run build:wasm` and far too slow to trigger on keystrokes.
-if (process.argv.includes("--watch")) {
-    let queued = null;
-    const rebuild = () => {
-        clearTimeout(queued);
-        // Editors write in bursts (temp file, rename, chmod); one trailing
-        // rebuild per burst rather than one per event.
-        queued = setTimeout(async () => {
-            try {
-                await build();
-                console.log(`[${new Date().toISOString().slice(11, 19)}] dist/webview rebuilt`);
-            } catch (err) {
-                console.error("rebuild failed:", err.message);
-            }
-        }, 50);
-    };
-    for (const dir of ["src", "src/vendor", "src/wasm/build"]) {
-        watch(join(root, dir), rebuild);
-    }
+if (watch) {
+    await copyStatic();
+    const contexts = await Promise.all(BUNDLES.map(([e, n]) => context(options(e, n))));
+    await Promise.all(contexts.map((c) => c.watch()));
     console.log("watching src/ -> dist/webview (Ctrl-C to stop)");
+} else {
+    await rm(out, { recursive: true, force: true });
+    await copyStatic();
+    await Promise.all(BUNDLES.map(([e, n]) => build(options(e, n))));
+    console.log(`dist/webview: ${COPY.length + BUNDLES.length} files`);
 }

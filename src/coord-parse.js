@@ -47,6 +47,4 @@ function parseCoordinatePair(text) {
     return { x: numbers[0], y: numbers[1] };
 }
 
-if (typeof module !== "undefined" && module.exports) {
-    module.exports = { parseCoordinatePair };
-}
+export { parseCoordinatePair };

@@ -1,3 +1,7 @@
+import { rankCellMatches, cellPathToTarget } from "./cell-search.js";
+import { parseMarkerFile, flattenMarkerModel } from "./marker-parsers.js";
+import { describeLoadFailure } from "./load-errors.js";
+
 // Thin bootstrap: instantiate the wasm module and relay postMessage payloads
 // from the extension host into it. JS never touches GDS/GL data -- that all
 // lives in wasm/renderer.cpp (GL context + shaders + camera + input) and
@@ -2209,12 +2213,12 @@ function createParseWorker() {
         return new Worker(URL.createObjectURL(new Blob([bundleBytes], { type: "application/javascript" })));
     }
 
-    // Ordinary page: pull the same three scripts in by URL. They have to be
+    // Ordinary page: pull the same two scripts in by URL. They have to be
     // absolute -- importScripts() inside a blob Worker resolves relative URLs
     // against the blob: URL rather than against the document, so bare
     // filenames here would silently fail to load.
     const url = (name) => JSON.stringify(new URL(name, document.baseURI).href);
-    const bootstrap = `importScripts(${url("gdstk_wasm.js")}, ${url("load-errors.js")}, ${url("wasm-worker.js")});`;
+    const bootstrap = `importScripts(${url("gdstk_wasm.js")}, ${url("wasm-worker.js")});`;
     console.log("[GDS] building worker from document-relative script URLs");
     return new Worker(URL.createObjectURL(new Blob([bootstrap], { type: "application/javascript" })));
 }

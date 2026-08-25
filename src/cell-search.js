@@ -85,6 +85,4 @@ function cellPathToTarget(cells, roots, target, maxDepth) {
     return null;
 }
 
-if (typeof module !== "undefined" && module.exports) {
-    module.exports = { rankCellMatches, cellPathToTarget };
-}
+export { rankCellMatches, cellPathToTarget };

@@ -31,7 +31,7 @@
 //   viewer.showStale(text)           viewer.goToPoint(x, y)
 //   viewer.toggleDebug()
 
-function createBrowserHost() {
+export function createBrowserHost() {
     // Views are per-layout everywhere else; a plain page has no document
     // identity to key on, so everything in one page shares a bucket. Wrapped
     // because storage throws outright in some privacy modes rather than

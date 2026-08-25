@@ -545,11 +545,12 @@
     <script type="text/plain" id="workerBundle">{{workerBundleBase64}}</script>
 
     <!-- Webview Local Script Injection Pipeline -->
+    <!-- Generated and vendored, loaded as classic scripts for the globals
+         they define (createGdstkModule, lil). The two bundles below are built
+         from ES module sources but emitted as classic scripts, because a
+         webview cannot load a module script inside a Worker. -->
     <script src="gdstk_wasm.js"></script>
     <script src="lil-gui.umd.min.js"></script>
-    <script src="cell-search.js"></script>
-    <script src="marker-parsers.js"></script>
-    <script src="load-errors.js"></script>
     <!-- The embedder's ViewerHost. Must precede viewer.js, which reads
          window.gdsLensHost as it starts. Defaults to the plain-page host;
          a host that needs different services replaces this file. -->

@@ -9,13 +9,16 @@
 // missing or misnamed script in the payload fails here and nowhere else.
 //
 // Skipped unless dist/webview has been built (npm run build).
-"use strict";
+import test from "node:test";
+import assert from "node:assert";
+import fs from "fs";
+import http from "http";
+import path from "path";
 
-const test = require("node:test");
-const assert = require("node:assert");
-const fs = require("fs");
-const http = require("http");
-const path = require("path");
+import { fileURLToPath } from "node:url";
+
+// ESM has no __dirname; every path below is relative to this file.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const webviewDir = path.join(__dirname, "..", "dist", "webview");
 const fixture = path.join(__dirname, "fixtures", "sample_layout.gds");
@@ -23,11 +26,13 @@ const fixture = path.join(__dirname, "fixtures", "sample_layout.gds");
 const built = fs.existsSync(path.join(webviewDir, "viewer.html")) &&
               fs.existsSync(path.join(webviewDir, "gdstk_wasm.js"));
 
-let chromium;
+// Optional: the rest of the suite must still run where playwright's browser
+// download has not happened.
+let chromium = null;
 try {
-    ({ chromium } = require("playwright"));
+    ({ chromium } = await import("playwright"));
 } catch {
-    chromium = null;
+    // left null; the test below skips
 }
 
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".gds": "application/octet-stream" };

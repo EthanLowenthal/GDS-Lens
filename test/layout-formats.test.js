@@ -8,14 +8,21 @@
 // a 10x5um box on layer 1/0 in TOP, plus a 2x1um box on layer 2/0 in CHILD
 // placed twice standalone and once as a 3x2 array (6) -- 8 CHILD placements
 // in all.
-"use strict";
+import test from "node:test";
+import assert from "node:assert";
+import fs from "fs";
+import path from "path";
+import zlib from "zlib";
+import { decodeLayoutBytes } from "../src/layout-bytes.js";
 
-const test = require("node:test");
-const assert = require("node:assert");
-const fs = require("fs");
-const path = require("path");
-const zlib = require("zlib");
-const { decodeLayoutBytes } = require("../src/layout-bytes.js");
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+
+// ESM has no __dirname; every path below is relative to this file.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// gdstk_wasm.js is Emscripten output targeting web+node, so it calls
+// require() internally when it detects Node. ESM has none to hand it.
+const require = createRequire(import.meta.url);
 
 const wasmJsPath = path.join(__dirname, "..", "src", "wasm", "build", "gdstk_wasm.js");
 const wasmBuilt = fs.existsSync(wasmJsPath);

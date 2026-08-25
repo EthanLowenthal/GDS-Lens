@@ -3,11 +3,9 @@
 // "Aborted()" were both observed from the built wasm module by parsing a
 // hierarchy that flattens to ~800M polygons (before and after raising
 // MAXIMUM_MEMORY to 4GB respectively).
-"use strict";
-
-const test = require("node:test");
-const assert = require("node:assert");
-const { describeLoadFailure, isOutOfMemory } = require("../src/load-errors.js");
+import test from "node:test";
+import assert from "node:assert";
+import { describeLoadFailure, isOutOfMemory } from "../src/load-errors.js";
 
 test("classifies the wasm out-of-memory failures", () => {
     const oomErrors = [

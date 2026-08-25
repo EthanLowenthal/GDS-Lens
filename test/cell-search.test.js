@@ -1,10 +1,8 @@
 // Unit tests for cell-search.js: the ranking behind the hierarchy panel's find
 // box, and the walk that finds the branch the tree has to open to show a cell.
-"use strict";
-
-const test = require("node:test");
-const assert = require("node:assert");
-const { rankCellMatches, cellPathToTarget } = require("../src/cell-search.js");
+import test from "node:test";
+import assert from "node:assert";
+import { rankCellMatches, cellPathToTarget } from "../src/cell-search.js";
 
 // The shape build_hierarchy hands back, cut down to what these two functions
 // read: a name, and which cells this one places.

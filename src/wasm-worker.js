@@ -1,3 +1,5 @@
+import { describeLoadFailure } from "./load-errors.js";
+
 // Runs the parse/flatten/triangulate half of loading a layout file (GDSII or
 // OASIS) off the main thread. viewer.js instantiates this via a Blob URL
 // built from THIS file's text with the full gdstk_wasm.js source prepended --

@@ -34,6 +34,4 @@ function isOutOfMemory(err) {
     return OOM_PATTERN.test(err && err.message ? err.message : String(err));
 }
 
-if (typeof module !== "undefined" && module.exports) {
-    module.exports = { describeLoadFailure, isOutOfMemory };
-}
+export { describeLoadFailure, isOutOfMemory };

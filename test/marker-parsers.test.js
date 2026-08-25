@@ -2,21 +2,23 @@
 // `node --test test/`). DOMParser comes from @xmldom/xmldom -- the parser
 // takes the constructor as an argument precisely so these tests don't need a
 // browser (see marker-parsers.js's header).
-"use strict";
-
-const test = require("node:test");
-const assert = require("node:assert");
-const fs = require("fs");
-const path = require("path");
-const { DOMParser } = require("@xmldom/xmldom");
-const {
+import test from "node:test";
+import assert from "node:assert";
+import fs from "fs";
+import path from "path";
+import { DOMParser } from "@xmldom/xmldom";
+import {
     sniffMarkerFormat,
     parsePointList,
     parseLyrdb,
     parseDrcAscii,
     parseMarkerFile,
     flattenMarkerModel,
-} = require("../src/marker-parsers.js");
+} from "../src/marker-parsers.js";
+import { fileURLToPath } from "node:url";
+
+// ESM has no __dirname; every path below is relative to this file.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const fixture = (name) => fs.readFileSync(path.join(__dirname, "fixtures", name), "utf8");
 
