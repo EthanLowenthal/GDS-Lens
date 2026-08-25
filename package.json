@@ -13,7 +13,6 @@
     "layout-viewer",
     "webgl",
     "wasm",
-    "klayout",
     "lyp",
     "vlsi",
     "eda",
@@ -21,9 +20,9 @@
     "chip-design",
     "semiconductor",
     "photonics",
-    "gdsfactory",
     "drc",
-    "lvs"
+    "lvs",
+    "lyrdb"
   ],
   "repository": {
     "type": "git",

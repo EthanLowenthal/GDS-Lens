@@ -1,5 +1,5 @@
-// Parsers for DRC/LVS marker databases: KLayout report databases (.lyrdb,
-// XML) and Calibre DRC ASCII results databases (line-oriented text). This is
+// Parsers for DRC/LVS marker databases: .lyrdb report databases (.lyrdb,
+// XML) and ASCII DRC results databases (line-oriented text). This is
 // a standalone script (no imports): the webview loads it via a <script> tag
 // (see viewer.html / extension.cjs's asWebviewUri replacement), and plain
 // Node unit tests require() it via the module.exports tail. parseLyrdb takes
@@ -8,7 +8,7 @@
 // @xmldom/xmldom's.
 //
 // Both parsers emit the same normalized model. All coordinates are in µm,
-// y-up world space -- the same space renderer.cpp draws in (Calibre integer
+// y-up world space -- the same space renderer.cpp draws in (integer
 // coordinates are divided by the header's precision here, at parse time):
 //
 //   {
@@ -24,7 +24,7 @@
 //         polygons: [Float64Array(x,y,...), ...],  // one array per ring
 //         edges: Float64Array(x0,y0,x1,y1,...),    // packed segments
 //         bbox: {minX,minY,maxX,maxY} | null,      // null = no geometry
-//         waived: false,                     // true = Calibre WE<n> waiver
+//         waived: false,                     // true = WE<n> waiver
 //       }],
 //     }],
 //   }
@@ -35,9 +35,9 @@
 "use strict";
 
 // Decides the format by content, not extension (marker files are named all
-// sorts of things): KLayout writes XML with a <report-database> root; a Calibre
+// sorts of things): the .lyp/.lyrdb tooling writes XML with a <report-database> root; a ASCII DRC
 // ASCII results database starts with a "<top-cell-name> <resolution>" header
-// line, optionally preceded by '//' comment lines. Returns 'lyrdb' | 'calibre'
+// line, optionally preceded by '//' comment lines. Returns 'lyrdb' | 'drc'
 // | null (unrecognized).
 function sniffMarkerFormat(text) {
     if (typeof text !== "string" || text.length === 0) return null;
@@ -59,12 +59,12 @@ function sniffMarkerFormat(text) {
     }
     const header = /^(\S+)\s+(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$/.exec(head[0] || "");
     if (!header) return null;
-    // Resolution is database units per µm; KLayout's sanity range.
+    // Resolution is database units per µm; the format's usual sanity range.
     const resolution = parseFloat(header[2]);
     if (!(resolution >= 0.001 && resolution <= 1e6)) return null;
     // A file that stops after the header is an empty (clean) database.
-    if (head.length < 3) return "calibre";
-    return /^\d+\s+\d+\s+\d+(\s|$)/.test(head[2]) ? "calibre" : null;
+    if (head.length < 3) return "drc";
+    return /^\d+\s+\d+\s+\d+(\s|$)/.test(head[2]) ? "drc" : null;
 }
 
 // "(0,0;1.5,0;1.5,0.2)" (parens optional, whitespace/newlines tolerated) ->
@@ -111,7 +111,7 @@ function parseLyrdbValue(raw, item, unknownTypes) {
             return "";
         }
         if (type === "polygon") {
-            // KLayout hole notation puts '/'-separated rings inside one paren
+            // The .lyrdb hole notation puts '/'-separated rings inside one paren
             // group: (hull/hole1/...). v1 renders every ring as its own
             // outline+fill (holes fill too -- acceptable, outline correct).
             const inner = body.replace(/^\(/, "").replace(/\)$/, "");
@@ -177,14 +177,14 @@ function finalizeModel(model) {
     return model;
 }
 
-// KLayout report database (.lyrdb) XML, written by DRC/LVS report(...).
+// .lyrdb report-database XML, written by DRC/LVS report(...).
 // Units are µm floats already in layout space -- no scaling. domParserCtor
 // is the DOMParser constructor to instantiate (see file header).
 function parseLyrdb(text, domParserCtor) {
     const doc = new domParserCtor().parseFromString(text, "text/xml");
     const root = doc && doc.documentElement;
     if (!root || root.nodeName !== "report-database") {
-        throw new Error("not a KLayout report database (no <report-database> root)");
+        throw new Error("not a .lyrdb report database (no <report-database> root)");
     }
 
     const childElements = (node, name) => {
@@ -204,7 +204,7 @@ function parseLyrdb(text, domParserCtor) {
     const model = { topCell, warnings, categories: [] };
 
     // Category defs can be nested (path components '.'-joined) and are
-    // emitted lazily by KLayout -- an item may reference a category with no
+    // emitted lazily by writers -- an item may reference a category with no
     // def at all, so ensureCategory also derives categories from item refs.
     const catByPath = new Map();
     const ensureCategory = (path, description) => {
@@ -279,7 +279,7 @@ function parseLyrdb(text, domParserCtor) {
     return finalizeModel(model);
 }
 
-// Calibre DRC ASCII results database, a.k.a. an RVE database (SVRF's "DRC
+// ASCII DRC results database, a.k.a. an RVE database (rule-file's "DRC
 // RESULTS DATABASE <file> ASCII"). Line-oriented, and rigidly counted -- the
 // counts line says how many description lines and how many results follow, and
 // those counts, not the shape of later lines, are what delimit a block:
@@ -299,13 +299,13 @@ function parseLyrdb(text, domParserCtor) {
 // it counts *edges*, each edge being four numbers on one line. '//' comment
 // lines may appear anywhere.
 //
-// Grammar and semantics follow Calibre's writer as decoded by KLayout's reader
+// Grammar and semantics follow the common ASCII writer as decoded by open implementations's reader
 // (src/rdb/rdb/rdbRVEReader.cc), including the trailing-'.' strip on check
 // names and the CN 'c' flag. Never throws on malformed interior lines -- skips
 // and records a warning instead. Not handled: the sibling "<file>.waived"
-// database KLayout looks for alongside the results file (the webview only ever
+// database the .lyp/.lyrdb tooling looks for alongside the results file (the webview only ever
 // receives one file's text).
-function parseCalibreAscii(text) {
+function parseDrcAscii(text) {
     if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
     const lines = text.split(/\r?\n/);
     const warnings = [];
@@ -331,12 +331,12 @@ function parseCalibreAscii(text) {
 
     const headerLine = peek();
     const header = /^(\S+)\s+(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$/.exec((headerLine || "").trim());
-    if (!header) throw new Error("not a Calibre ASCII results database (bad header line)");
+    if (!header) throw new Error("not a ASCII DRC results database (bad header line)");
     model.topCell = header[1];
     // Resolution is database units per µm, and is a float in the grammar even
-    // though every real file writes an integer. KLayout's sanity range.
+    // though every real file writes an integer. the format's usual sanity range.
     const resolution = parseFloat(header[2]);
-    if (!(resolution >= 0.001 && resolution <= 1e6)) throw new Error("bad precision in Calibre header");
+    if (!(resolution >= 0.001 && resolution <= 1e6)) throw new Error("bad precision in ASCII DRC header");
     i++;
 
     // "<results> <original> <desc lines> <timestamp>". The third count is
@@ -376,7 +376,7 @@ function parseCalibreAscii(text) {
             strayCoords++;
             continue;
         }
-        // Calibre writes some check names with a trailing period; one is
+        // Some writers write some check names with a trailing period; one is
         // stripped so the name matches the rule as written in the deck.
         name = name.trim().replace(/\.$/, "");
         const cat = { name, description: "", items: [] };
@@ -429,7 +429,7 @@ function parseCalibreAscii(text) {
         cat.description = descParts.join("\n");
 
         // Results. Coordinates are top-cell space unless a CN record says
-        // otherwise; the state persists across the records of a check (Calibre
+        // otherwise; the state persists across the records of a check (ASCII DRC
         // writes one CN per cell, not per result) and resets at the next check.
         let cellName = "";
         let xf = null; // {m11,m21,m12,m22,tx,ty} in DB units, or null = identity
@@ -452,7 +452,7 @@ function parseCalibreAscii(text) {
                     strayCoords++;
                     continue;
                 }
-                // Anything else is the next check's name. Calibre's counts are
+                // Anything else is the next check's name. ASCII DRC's counts are
                 // trustworthy, so reaching this early means the file is
                 // truncated or the count is wrong.
                 if (resultCount !== null && shape < resultCount) {
@@ -492,7 +492,7 @@ function parseCalibreAscii(text) {
                     // Without the 'c' flag the coordinates are already in
                     // top-cell space and the matrix only says where the cell
                     // sits; with it they are cell-local and the matrix places
-                    // them (KLayout: shape_trans vs. its inverse).
+                    // them (some tools use shape_trans, others its inverse).
                     xf = cn[2].trim() === "" ? null
                         : { m11: m[0], m21: m[1], m12: m[2], m22: m[3], tx: m[4], ty: m[5] };
                     continue;
@@ -504,7 +504,7 @@ function parseCalibreAscii(text) {
                     continue;
                 }
                 // Any other word-leading line is a property record in a format
-                // we don't read (Calibre has several); consumed so it can't be
+                // we don't read (several variants exist); consumed so it can't be
                 // mistaken for the next check name, counted for one warning.
                 if (/^[A-Za-z_]/.test(trimmed)) {
                     i++;
@@ -591,8 +591,8 @@ function parseCalibreAscii(text) {
 function parseMarkerFile(text, domParserCtor) {
     const format = sniffMarkerFormat(text);
     if (format === "lyrdb") return parseLyrdb(text, domParserCtor);
-    if (format === "calibre") return parseCalibreAscii(text);
-    throw new Error("Unrecognized marker file format (expected KLayout .lyrdb XML or Calibre DRC ASCII results)");
+    if (format === "drc") return parseDrcAscii(text);
+    throw new Error("Unrecognized marker file format (expected .lyrdb XML or ASCII DRC results)");
 }
 
 // Concatenates a normalized model's geometry into the flat typed-array
@@ -662,7 +662,7 @@ if (typeof module !== "undefined" && module.exports) {
         sniffMarkerFormat,
         parsePointList,
         parseLyrdb,
-        parseCalibreAscii,
+        parseDrcAscii,
         parseMarkerFile,
         flattenMarkerModel,
     };

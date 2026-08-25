@@ -4,7 +4,7 @@
 // both formats, asserting the format is sniffed from the file header and that
 // the two produce identical flattened geometry.
 //
-// fixtures/sample_layout.{gds,oas} are two writes of one KLayout-built layout:
+// fixtures/sample_layout.{gds,oas} are two writes of one tool-built layout:
 // a 10x5um box on layer 1/0 in TOP, plus a 2x1um box on layer 2/0 in CHILD
 // placed twice standalone and once as a 3x2 array (6) -- 8 CHILD placements
 // in all.

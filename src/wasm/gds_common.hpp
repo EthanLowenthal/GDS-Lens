@@ -86,7 +86,7 @@ inline bool is_fatal(gdstk::ErrorCode error_code) {
     return error_code >= gdstk::ErrorCode::ChecksumError;
 }
 
-// Some tools (e.g. KLayout) emit a "$$$CONTEXT_INFO$$$" cell holding
+// Some tools (e.g. the .lyp/.lyrdb tooling) emit a "$$$CONTEXT_INFO$$$" cell holding
 // editor-state metadata as a sibling top-level cell. It's not part of the
 // design and shouldn't be rendered.
 inline bool is_metadata_cell(const gdstk::Cell* cell) {

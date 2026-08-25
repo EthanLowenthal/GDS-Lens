@@ -17,8 +17,8 @@ Reading and rendering only. Writing layouts is deliberately out of scope.
 - **Rendering** - a WebGL2 renderer with layer-batched vertex buffers, GPU
   instancing for repeated cells, camera, measurement and a stroke font, written
   in C++ and compiled alongside the parser.
-- **KLayout `.lyp`** colour/style support.
-- **DRC/LVS markers** - KLayout `.lyrdb` and Calibre ASCII databases.
+- **`.lyp`** colour/style support.
+- **DRC/LVS markers** - `.lyrdb` and ASCII DRC databases.
 
 ## Building
 

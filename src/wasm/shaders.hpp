@@ -42,7 +42,7 @@ inline const char* const kVertexShaderSrc =
 // gaps -- a flat semi-transparent fill makes stacked layers blur into mud
 // once you have more than two or three on screen. Several pattern *kinds*
 // (not just one hatch angle) exist because two adjacent layers both doing
-// 45-degree lines are still hard to tell apart at a glance; KLayout's .lyp
+// 45-degree lines are still hard to tell apart at a glance; the .lyp
 // stipple patterns solve the same problem the same way. Patterns are
 // computed in screen space (gl_FragCoord) rather than world space so the
 // pitch stays a constant pixel cadence regardless of zoom; world-space

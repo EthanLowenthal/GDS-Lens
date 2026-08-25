@@ -579,7 +579,7 @@ uint64_t g_total_labels = 0;
 uint64_t g_labels_drawn = 0;
 
 // ---- DRC/LVS marker overlay -------------------------------------------------
-// Violation markers from a KLayout .lyrdb / Calibre DRC results database
+// Violation markers from a .lyrdb / ASCII DRC results database
 // (parsed and flattened in JS -- see src/marker-parsers.js), drawn as a fixed
 // red highlight after every layer, unaffected by layer visibility / infill /
 // merge modes. Geometry is retained CPU-side (unlike layers) because
@@ -4154,10 +4154,10 @@ void loadAndRenderGds(const std::string& path) {
 // Parse one leaf .lyp block -- the region covering a single layer, containing
 // exactly one <source> -- and insert it into g_lyp_info under `category`. A
 // no-op when the block has no numeric <source> (e.g. a subgroup header, or
-// KLayout's catch-all "*/*") or is bound to a layout other than the first.
+// the .lyp/.lyrdb tooling's catch-all "*/*") or is bound to a layout other than the first.
 // An entry without colors is still kept (its name and visibility apply; the
 // colors fall back to the hash defaults in apply_layer_colors). group_visible
-// carries the enclosing group node's <visible> flag: KLayout hides every
+// carries the enclosing group node's <visible> flag: the format hides every
 // child of an invisible group regardless of the child's own flag.
 void parse_lyp_leaf(const std::string& block, const std::string& category, bool group_visible) {
     // <source> is "layer/datatype@layout-index" (e.g. "250/9@1"). Split off the
@@ -4241,7 +4241,7 @@ void loadLypText(const std::string& xml_text_in) {
     std::string xml_text = lyp_util::strip_xml_comments(xml_text_in);
 
     // Multi-tab files: <layer-properties-tabs> wraps one <layer-properties>
-    // element per tab. Parse only the first tab -- mirroring KLayout's initial
+    // element per tab. Parse only the first tab -- mirroring the .lyp/.lyrdb tooling's initial
     // view -- instead of letting later tabs' entries overwrite earlier ones.
     // (find_open_tag can't match "<layer-properties-tabs" for the "<layer-
     // properties" prefix search below since '-' follows the name, so the first
@@ -4256,7 +4256,7 @@ void loadLypText(const std::string& xml_text_in) {
         }
     }
 
-    // KLayout .lyp: the root <layer-properties> holds top-level <properties>
+    // .lyp: the root <layer-properties> holds top-level <properties>
     // blocks. A <properties> block is either a single layer (has <source>
     // directly) or a group -- a <name> (the category, e.g. "Metals") plus one
     // or more <group-members>, each itself a layer or a further nested subgroup.
@@ -4316,7 +4316,7 @@ void loadLypText(const std::string& xml_text_in) {
 // visibility) for building the sidebar layer list in JS -- no per-polygon
 // geometry crosses this boundary, just one short string/bool/number tuple
 // per layer. Ordered with .lyp-defined layers first (in the order they
-// appeared in the file, matching KLayout's own layer panel), then any
+// appeared in the file, matching the .lyp/.lyrdb tooling's own layer panel), then any
 // .lyp-less layers present in the GDS, sorted numerically.
 val getLayers() {
     std::vector<const LayerBuffer*> ordered;

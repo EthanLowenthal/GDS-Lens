@@ -20,7 +20,7 @@ const webviewScriptGlobals = {
     sniffMarkerFormat: "readonly",
     parsePointList: "readonly",
     parseLyrdb: "readonly",
-    parseCalibreAscii: "readonly",
+    parseDrcAscii: "readonly",
     parseMarkerFile: "readonly",
     flattenMarkerModel: "readonly",
     // src/load-errors.js

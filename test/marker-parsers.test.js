@@ -13,7 +13,7 @@ const {
     sniffMarkerFormat,
     parsePointList,
     parseLyrdb,
-    parseCalibreAscii,
+    parseDrcAscii,
     parseMarkerFile,
     flattenMarkerModel,
 } = require("../src/marker-parsers.js");
@@ -21,19 +21,19 @@ const {
 const fixture = (name) => fs.readFileSync(path.join(__dirname, "fixtures", name), "utf8");
 
 const lyrdbText = fixture("sample.lyrdb");
-const calibreText = fixture("sample_calibre.txt");
-const hierText = fixture("sample_calibre_hier.txt");
-const ruleTextText = fixture("sample_calibre_ruletext.txt");
+const drcText = fixture("sample_drc.txt");
+const hierText = fixture("sample_drc_hier.txt");
+const ruleTextText = fixture("sample_drc_ruletext.txt");
 
 const catByName = (model, name) => model.categories.find((c) => c.name === name);
 
 test("sniffMarkerFormat", () => {
     assert.strictEqual(sniffMarkerFormat(lyrdbText), "lyrdb");
     assert.strictEqual(sniffMarkerFormat("﻿ \n" + lyrdbText), "lyrdb");
-    assert.strictEqual(sniffMarkerFormat(calibreText), "calibre");
-    assert.strictEqual(sniffMarkerFormat("﻿TOP 1000\r\nRULE\n"), "calibre"); // header only = clean db
-    assert.strictEqual(sniffMarkerFormat("// written by some tool\nTOP 1000\nRULE\n1 1 1 Jul\n"), "calibre");
-    assert.strictEqual(sniffMarkerFormat("TOP 0.001\nRULE\n2 2 0 Jul\n"), "calibre"); // float resolution
+    assert.strictEqual(sniffMarkerFormat(drcText), "drc");
+    assert.strictEqual(sniffMarkerFormat("﻿TOP 1000\r\nRULE\n"), "drc"); // header only = clean db
+    assert.strictEqual(sniffMarkerFormat("// written by some tool\nTOP 1000\nRULE\n1 1 1 Jul\n"), "drc");
+    assert.strictEqual(sniffMarkerFormat("TOP 0.001\nRULE\n2 2 0 Jul\n"), "drc"); // float resolution
     // A word and a number, but no counts line under the second line.
     assert.strictEqual(sniffMarkerFormat("chapter 4\nsome prose\nmore prose\n"), null);
     assert.strictEqual(sniffMarkerFormat("<html><body>nope</body></html>"), null);
@@ -118,8 +118,8 @@ test("lyrdb: rejects non-report XML", () => {
     assert.throws(() => parseLyrdb("<root><report-database/></root>", DOMParser), /report-database/);
 });
 
-test("calibre: rulechecks, scaling, descriptions", () => {
-    const model = parseCalibreAscii(calibreText);
+test("drc: rulechecks, scaling, descriptions", () => {
+    const model = parseDrcAscii(drcText);
     assert.strictEqual(model.topCell, "TOPCELL");
     assert.deepStrictEqual(
         model.categories.map((c) => c.name),
@@ -157,7 +157,7 @@ test("calibre: rulechecks, scaling, descriptions", () => {
 // A record that writes more points than it declared would otherwise leave bare
 // coordinate lines where the next check's name belongs -- which is how a check
 // called "3000 700" (and a vertex line read as its counts line) gets invented.
-test("calibre: coordinate lines past the declared count don't invent checks", () => {
+test("drc: coordinate lines past the declared count don't invent checks", () => {
     const text = [
         "TOP 1000",
         "M1.WIDTH",
@@ -177,7 +177,7 @@ test("calibre: coordinate lines past the declared count don't invent checks", ()
         "2000 2000",
         "",
     ].join("\n");
-    const model = parseCalibreAscii(text);
+    const model = parseDrcAscii(text);
     assert.deepStrictEqual(
         model.categories.map((c) => c.name),
         ["M1.WIDTH", "M2.WIDTH"]
@@ -187,17 +187,17 @@ test("calibre: coordinate lines past the declared count don't invent checks", ()
     assert.ok(model.warnings.some((w) => /1 coordinate line\(s\) past the declared point counts/.test(w)));
 });
 
-test("calibre: CRLF + blank lines tolerated", () => {
-    const crlf = calibreText.replace(/\n/g, "\r\n").replace("p 1 4", "\r\np 1 4");
-    const model = parseCalibreAscii(crlf);
+test("drc: CRLF + blank lines tolerated", () => {
+    const crlf = drcText.replace(/\n/g, "\r\n").replace("p 1 4", "\r\np 1 4");
+    const model = parseDrcAscii(crlf);
     assert.strictEqual(catByName(model, "M2.SPACING.1").items.length, 2);
 });
 
-// Calibre echoes the SVRF source of each check as the counts line's
+// Some writers echo the rule-file source of each check as the counts line's
 // description lines. Those lines are unquoted, so without honouring the count
 // each one starts a bogus rulecheck -- the closing "}" became a category name.
-test("calibre: echoed SVRF rule text, waivers, properties", () => {
-    const model = parseCalibreAscii(ruleTextText);
+test("drc: echoed rule text, waivers, properties", () => {
+    const model = parseDrcAscii(ruleTextText);
     assert.deepStrictEqual(
         model.categories.map((c) => c.name),
         ["SPACE.CHECK.1", "WAIVED.CHECK", "TRUNCATED.CHECK", "BAD.COUNT", "DENSITY.OUT", "DENSITY_PRINT_FILES"]
@@ -245,8 +245,8 @@ test("calibre: echoed SVRF rule text, waivers, properties", () => {
 // Hierarchical databases place results with a CN record. Only the 'c' (cell
 // space) form needs transforming -- without it the coordinates are already
 // absolute and the matrix just says where the cell sits.
-test("calibre: hierarchical CN placements applied", () => {
-    const model = parseCalibreAscii(hierText);
+test("drc: hierarchical CN placements applied", () => {
+    const model = parseDrcAscii(hierText);
     assert.strictEqual(model.categories.length, 1);
     const [translated, absolute, rotated] = model.categories[0].items;
 
@@ -265,7 +265,7 @@ test("calibre: hierarchical CN placements applied", () => {
 
 test("parseMarkerFile dispatches by content", () => {
     assert.strictEqual(parseMarkerFile(lyrdbText, DOMParser).topCell, "TOP");
-    assert.strictEqual(parseMarkerFile(calibreText, DOMParser).topCell, "TOPCELL");
+    assert.strictEqual(parseMarkerFile(drcText, DOMParser).topCell, "TOPCELL");
 });
 
 test("flattenMarkerModel packs geometry per item id", () => {

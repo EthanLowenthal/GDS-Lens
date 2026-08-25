@@ -1,4 +1,4 @@
-// String and color primitives for reading KLayout .lyp layer-property files.
+// String and color primitives for reading .lyp layer-property files.
 //
 // .lyp is XML, but the viewer scans it at the string level rather than pulling
 // in a parser: the format is shallow and the handful of tags loadLypText()
@@ -41,7 +41,7 @@ std::string trim(const std::string& s);
 // hexToRgb() returning null); the requested alpha is otherwise always > 0.
 std::array<float, 4> hex_to_rgba(const std::string& hex_in, float alpha);
 
-// KLayout's <frame-brightness>/<fill-brightness>: -255..255 shifts the color
+// the .lyp/.lyrdb tooling's <frame-brightness>/<fill-brightness>: -255..255 shifts the color
 // toward black (negative) or white (positive), with +-255 reaching full
 // white/black. Alpha is left alone.
 void apply_brightness(std::array<float, 4>& color, long brightness);

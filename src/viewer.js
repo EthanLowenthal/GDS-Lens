@@ -186,7 +186,7 @@ gridController.domElement.title = "Show the background grid, spaced at a round s
 // used in over a session: the render toggles are a preference, and a .lyp or a
 // marker database is loaded once (and then remembered across reopens by the
 // extension host, so most sessions never touch these rows at all).
-const lypController = displayFolder.add(actions, "loadLypFile").name("Load KLayout .lyp File");
+const lypController = displayFolder.add(actions, "loadLypFile").name("Load .lyp File");
 const markerController = displayFolder.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
 displayFolder.add(actions, "resetView").name("Reset View");
 
@@ -334,8 +334,8 @@ function setFileChip(controller, name, { idleLabel, idleTitle, unloadTitle, onUn
 
 function setLypChip(name) {
     setFileChip(lypController, name, {
-        idleLabel: "Load KLayout .lyp File",
-        idleTitle: "Load a KLayout .lyp layer-properties file",
+        idleLabel: "Load .lyp File",
+        idleTitle: "Load a .lyp layer-properties file",
         unloadTitle: "Unload .lyp",
         onUnload: () => {
             modulePromise.then((Module) => {
@@ -352,7 +352,7 @@ function setLypChip(name) {
 function setMarkerChip(name) {
     setFileChip(markerController, name, {
         idleLabel: "Load Marker File (.lyrdb / DRC)",
-        idleTitle: "Load a KLayout report database (.lyrdb) or Calibre DRC ASCII results database",
+        idleTitle: "Load a .lyrdb report database or ASCII DRC results database",
         unloadTitle: "Unload marker file",
         onUnload: () => {
             modulePromise.then((Module) => Module.clearMarkers());
@@ -2278,7 +2278,7 @@ function applyMarkers(name, text) {
     modulePromise.then((Module) => {
         let model;
         try {
-            // Format sniffed by content (lyrdb XML vs Calibre ASCII) --
+            // Format sniffed by content (lyrdb XML vs ASCII DRC) --
             // see marker-parsers.js, loaded via its own <script> tag.
             model = parseMarkerFile(text, DOMParser);
         } catch (err) {
