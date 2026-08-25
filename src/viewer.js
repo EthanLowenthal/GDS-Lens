@@ -4,6 +4,7 @@ import { describeLoadFailure } from "./load-errors.js";
 // Inlined at build time (esbuild's text loader), because a component has to
 // carry its own markup and styles: there is no separate document for a host
 // page to load them from.
+import { takeMountTarget } from "./mount-target.js";
 import shellHtml from "./viewer-shell.html";
 import viewerCss from "./viewer.css";
 // lil-gui as a real dependency rather than a vendored UMD file: it publishes
@@ -36,10 +37,12 @@ import guiCss from "lil-gui-css";
 
 // ---- Mounting ----
 // The viewer lives in a shadow root so it can be dropped into a page that has
-// its own styles: nothing here escapes, and nothing outside reaches in. The
-// host element is created here if the page has not placed a <gds-lens>
-// itself, so opening the payload as a plain page still works.
-const hostElement = document.querySelector("gds-lens") ||
+// its own styles: nothing here escapes, and nothing outside reaches in.
+//
+// The element is handed over by <gds-lens>'s connectedCallback (gds-lens.js),
+// which is what defers everything in this module until one connects. The
+// fallbacks keep the payload usable when it is loaded as a plain page.
+const hostElement = takeMountTarget() || document.querySelector("gds-lens") ||
     document.body.appendChild(document.createElement("gds-lens"));
 const shadow = hostElement.shadowRoot || hostElement.attachShadow({ mode: "open" });
 shadow.innerHTML = `<style>${guiCss}</style><style>${viewerCss}</style>${shellHtml}`;
@@ -2386,6 +2389,8 @@ Promise.resolve(hostCall("loadViews")).then((views) => {
 });
 
 hostCall("connect", viewer);
+
+export { viewer };
 
 function startWorker(worker, fileData) {
     activeWorker = worker;

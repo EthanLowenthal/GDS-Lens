@@ -41,7 +41,7 @@ const COPY = [
 // IIFE, not ESM: see the note above. `lil` and `createGdstkModule` stay
 // globals, so they are external to the bundle and resolved at run time.
 const BUNDLES = [
-    ["src/viewer.js", "viewer.js"],
+    ["src/gds-lens.js", "gds-lens.js"],
     ["src/wasm-worker.js", "wasm-worker.js"],
     // The default host. An embedder with different services replaces this one
     // file and leaves the rest of the payload alone.
@@ -69,6 +69,11 @@ const options = (entry, name) => ({
     // document for a host page to load them from, so they are inlined as
     // strings and injected into the shadow root at mount.
     loader: { ".html": "text", ".css": "text" },
+    // Escape non-ASCII rather than emitting UTF-8 bytes, so these bundles do
+    // not care what encoding the embedding page declares. Note this cannot
+    // save gdstk_wasm.js, which is Emscripten's output and embeds the wasm
+    // binary as a raw string: see the UTF-8 note in gds-lens.js.
+    charset: "ascii",
     alias: { "lil-gui-css": lilGuiCss },
     // Defined by the classic scripts loaded before these bundles.
     external: [],

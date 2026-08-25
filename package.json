@@ -55,7 +55,7 @@
     "README.md"
   ],
   "exports": {
-    ".": "./src/viewer.js",
+    ".": "./src/gds-lens.js",
     "./parsers": "./src/marker-parsers.js",
     "./cell-search": "./src/cell-search.js",
     "./coord-parse": "./src/coord-parse.js",
@@ -63,7 +63,8 @@
     "./load-errors": "./src/load-errors.js",
     "./hosts/browser": "./src/hosts/browser.js",
     "./webview/*": "./dist/webview/*",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./viewer": "./src/viewer.js"
   },
   "type": "module"
 }

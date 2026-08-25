@@ -45,7 +45,8 @@ export default [
         ignores: ["src/wasm/build/**", "dist/**", ".vscode-test-web/**"],
     },
     // The viewer's main thread: browser globals plus the vendored ones.
-    module_(["src/viewer.js"], { ...globals.browser, ...vendorGlobals }),
+    module_(["src/viewer.js", "src/gds-lens.js", "src/mount-target.js"],
+        { ...globals.browser, ...vendorGlobals }),
     // The parse Worker: its own global scope, with no DOM in it.
     module_(["src/wasm-worker.js"], { ...globals.worker, ...vendorGlobals }),
     // Hosts run on the main thread and touch the DOM, but nothing vendored.
@@ -59,10 +60,10 @@ export default [
          "src/layout-bytes.js", "src/coord-parse.js"],
         { ...globals.worker }),
     {
-        // The browser smoke test straddles both: the file runs in Node, but
-        // the bodies it hands to page.evaluate() are serialized and run inside
+        // The browser tests straddle both: the files run in Node, but the
+        // bodies they hand to page.evaluate() are serialized and run inside
         // Chromium, so `window` and `document` in them are real.
-        files: ["test/browser-smoke.test.js"],
+        files: ["test/browser-smoke.test.js", "test/custom-element.test.js"],
         languageOptions: {
             globals: { ...globals.node, ...globals.browser },
             ecmaVersion: 2022,
