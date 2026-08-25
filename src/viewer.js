@@ -1948,7 +1948,13 @@ export function createViewer(mountTarget) {
         // on it), zooming or panning the layout out from under it, and leaving the
         // webview. Escape is handled with the other keys below.
         window.addEventListener("pointerdown", (event) => {
-            if (!canvasMenuEl.contains(event.target)) hideCanvasMenu();
+            // composedPath() rather than event.target: this listener sits on
+            // window, outside the shadow root, so by the time a pointerdown
+            // inside the viewer arrives here it has been retargeted to the
+            // <gds-lens> host -- the menu never "contains" it. That closed the
+            // menu (display: none) on the press that was landing on the menu
+            // item, so the button never got a click and the copy never ran.
+            if (!event.composedPath().includes(canvasMenuEl)) hideCanvasMenu();
         }, true);
         window.addEventListener("wheel", hideCanvasMenu, { passive: true });
         window.addEventListener("resize", hideCanvasMenu);
@@ -1967,7 +1973,11 @@ export function createViewer(mountTarget) {
         if (!hasKeyboard()) return;
         // Don't hijack typing in lil-gui's text/number inputs -- but focused
         // checkboxes and buttons must not block marker stepping.
-        const t = event.target;
+        // composedPath()[0], for the same retargeting reason as the canvas
+        // menu's dismissal above: event.target here is the <gds-lens> host, so
+        // this guard used to see "GDS-LENS" for every keystroke and let m/h//
+        // through while someone was typing in a lil-gui text box.
+        const t = event.composedPath()[0] || event.target;
         const tag = t && t.tagName;
         if (tag === "TEXTAREA" || (tag === "INPUT" && t.type !== "checkbox")) return;
         if (event.key === "[") stepMarker(-1);

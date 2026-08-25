@@ -7,6 +7,24 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [1.0.2] - 2026-08-25
+
+### Fixed
+
+- Right-click -> "Copy coordinate" did nothing. The menu is dismissed by a
+  `pointerdown` listener on `window`, which asked whether the menu contained
+  `event.target` -- but the viewer moved into a shadow root in 1.0.0, and an
+  event from inside one is retargeted to the `<gds-lens>` host by the time it
+  reaches `window`. The menu therefore hid itself (`display: none`) on the very
+  press that was landing on its own item, so the button never became a click.
+  The menu opened and showed the right coordinate throughout, which is what
+  made it look alive.
+- The keyboard guard that keeps `m`, `h` and `/` from reaching the viewer while
+  someone is typing in one of lil-gui's text boxes, broken by the same
+  retargeting: it saw the host element rather than the focused input for every
+  keystroke, so typing in a filter box could switch modes, toggle the hierarchy
+  tree, or move focus.
+
 ## [1.0.1] - 2026-08-25
 
 ### Fixed
@@ -302,7 +320,8 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.1...v1.0.0
 [0.1.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.0...v0.1.1

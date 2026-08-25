@@ -253,6 +253,44 @@ test("the hierarchy panel and its find box are keyboard-operable", { skip }, asy
     });
 });
 
+// ---- The canvas right-click menu survives the click that operates it ----
+
+test("the canvas menu copies the coordinate it is showing", { skip }, async () => {
+    await withLoadedViewer(async (page) => {
+        // The menu is dismissed by a window-level pointerdown in the capture
+        // phase, which used to ask whether the menu contained event.target.
+        // Outside the shadow root that target is the <gds-lens> host, never the
+        // menu -- so the press landing on "Copy coordinate" hid the menu
+        // (display: none) before it could become a click, and nothing was ever
+        // copied. Driving it with real mouse events is the point: a synthetic
+        // click() on the button skips the pointerdown that broke it.
+        const canvas = page.locator("#glCanvas");
+        const box = await canvas.boundingBox();
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.mouse.down({ button: "right" });
+        await page.mouse.up({ button: "right" });
+
+        const menu = page.locator("#canvasMenu");
+        assert.ok(await menu.isVisible(), "right-click did not open the menu");
+        const shown = (await page.locator("#canvasMenu .menu-value").textContent()).trim();
+        assert.match(shown, /-?\d/, "the menu is offering no coordinate");
+
+        // A short timeout, because the regression this guards makes the item
+        // vanish mid-click: without it the click would sit out playwright's full
+        // default wait before failing.
+        await page.locator("#canvasMenuCopy").click({ timeout: 5000 });
+
+        // The toast is written by the click handler on both the clipboard's
+        // success and its failure path, so this says the click was delivered
+        // without depending on clipboard permissions in headless Chromium.
+        const toast = page.locator("#copyToast");
+        await toast.waitFor({ state: "visible", timeout: 2000 });
+        assert.ok((await toast.textContent()).includes(shown),
+                  "the toast did not carry the coordinate that was clicked");
+        assert.ok(!(await menu.isVisible()), "the menu stayed open after copying");
+    });
+});
+
 // ---- A reload leaves the GL state a frame can be drawn from ----
 
 test("a reload draws a clean frame, background grid included", { skip }, async () => {
