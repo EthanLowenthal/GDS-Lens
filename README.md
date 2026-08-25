@@ -81,8 +81,7 @@ CI rather than committed.
 | `setMarkers(name, text)` | `Promise<void>` | Applies a marker database. Format is sniffed from the content. |
 | `showError(message)` | `Promise<void>` | Replaces the view with an error message. |
 
-Sizing is yours: the element is `display: block` with no intrinsic height, so
-give it one.
+The element is `display: block` with no intrinsic height, so give it one.
 
 ### One per page
 
@@ -183,11 +182,11 @@ A VS Code webview is the case it was built for. Nothing else differs.
 | Binary cached separately from the JS | yes | no |
 | Sensitive to the page's encoding | no | yes |
 
-On the last row: the embedded binary is a raw string, so
-`gdstk_wasm.js` has to be *decoded* as UTF-8 or it is corrupted, and the module
-fails with a `WebAssembly.instantiate()` error about section lengths that says
-nothing about the cause. Either `Content-Type: text/javascript; charset=utf-8`
-or `<meta charset="UTF-8">` on the page satisfies it; only the absence of both
+On the last row: the embedded binary is a raw string, so `gdstk_wasm.js` has to
+be *decoded* as UTF-8 or it is corrupted, and the module fails with a
+`WebAssembly.instantiate()` error about section lengths that says nothing about
+the cause. Either `Content-Type: text/javascript; charset=utf-8` or
+`<meta charset="UTF-8">` on the page satisfies it; only the absence of both
 breaks. This payload warns in the console when the document is not UTF-8.
 
 ```js
