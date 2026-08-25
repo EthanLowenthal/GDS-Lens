@@ -9,6 +9,14 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [1.0.2] - 2026-08-25
 
+### Changed
+
+- Marker-file warnings are spelled out rather than counted. The `⚠ N warnings`
+  row is a folder now, with one wrapping row per warning inside it. The
+  sentences used to live only in a hover title and a `?gdsDebug=1` console
+  line, so the one thing the row existed to report -- a marker may be in the
+  wrong place, a value was not drawn -- was the one thing it did not say.
+
 ### Fixed
 
 - Right-click -> "Copy coordinate" did nothing. The menu is dismissed by a

@@ -333,3 +333,39 @@ test("a reload draws a clean frame, background grid included", { skip }, async (
         assert.equal(await glError(), 0, "the frame after a reload raised a GL error");
     });
 });
+
+// ---- Marker-file warnings say what they are ----
+
+test("the marker browser spells out its warnings, not just a count", { skip }, async () => {
+    await withLoadedViewer(async (page) => {
+        // The warnings used to be a single inert row reading "⚠ 2 warnings",
+        // with the text itself only in a hover title and a console line that is
+        // off unless ?gdsDebug=1 -- so the one thing the row existed to say (a
+        // marker may be in the wrong place; a value was not drawn) was the one
+        // thing it did not say. fixtures/sample.lyrdb raises exactly two.
+        await page.evaluate(async () => {
+            const text = await (await fetch("sample.lyrdb")).text();
+            await window.gdsLens.setMarkers("sample.lyrdb", text);
+        });
+
+        const folder = page.locator(".lil-gui .lil-title", { hasText: "warning" });
+        await folder.waitFor({ timeout: 10_000 });
+        assert.match((await folder.textContent()).trim(), /^⚠ 2 warnings$/);
+
+        // Closed to start with: the file parsed, and the panel's first job is
+        // the violations. Opening it is what produces the sentences.
+        await folder.click();
+        const rows = page.locator(".lil-gui .marker-warning-row");
+        assert.equal(await rows.count(), 2, "the folder is not listing one row per warning");
+        const texts = (await rows.allTextContents()).map((t) => t.trim());
+        assert.ok(texts.some((t) => /non-top cells/.test(t)), `no non-top-cell warning in ${texts}`);
+        assert.ok(texts.some((t) => /unsupported type/.test(t)), `no unsupported-type warning in ${texts}`);
+
+        // A warning is a sentence: it has to wrap rather than be clipped to
+        // lil-gui's one-line row, or the panel is back to saying nothing.
+        const clipped = await page.evaluate(() => [...document.querySelector("gds-lens").shadowRoot
+            .querySelectorAll(".marker-warning-row .lil-name")]
+            .filter((el) => el.scrollHeight > el.clientHeight + 1).length);
+        assert.equal(clipped, 0, "a warning row is clipping its text");
+    });
+});

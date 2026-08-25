@@ -1776,9 +1776,20 @@ export function createViewer(mountTarget) {
 
         if (model.warnings.length > 0) {
             fail("[GDS] marker warnings:", model.warnings.join(" | "));
-            const row = markersFolder.add({ w: () => {} }, "w")
-                .name(`⚠ ${model.warnings.length} warning${model.warnings.length === 1 ? "" : "s"}`);
-            row.domElement.title = model.warnings.join("\n");
+            // A count on its own is a dead end -- "2 warnings" does not say
+            // whether the file lost half its results or merely used a value
+            // type we draw as text. So the count is a folder and the sentences
+            // are inside it, rather than living only in a hover title and a
+            // console line nobody has open.
+            const warningsFolder = markersFolder.addFolder(
+                `⚠ ${model.warnings.length} warning${model.warnings.length === 1 ? "" : "s"}`);
+            warningsFolder.close();
+            warningsFolder.domElement.title = model.warnings.join("\n");
+            for (const warning of model.warnings) {
+                const row = warningsFolder.add({ w: () => {} }, "w").name(warning);
+                row.domElement.classList.add("marker-warning-row");
+                row.domElement.title = warning;
+            }
         }
 
         const opacityController = markersFolder.add(markerUiState, "opacity", 0, 1, 0.05).name("Opacity")

@@ -267,6 +267,17 @@
         .lil-gui .lil-controller.marker-selected button { background: var(--select-bg) !important; }
         .lil-gui .lil-controller.marker-selected .lil-name { color: var(--select-fg); }
         .lil-gui .lil-controller.marker-more-row { opacity: 0.55; pointer-events: none; }
+        /* Warning rows inside the marker browser's "⚠ N warnings" folder.
+           A warning is a sentence, not a value, so the row drops lil-gui's
+           fixed widget height and single line and wraps instead -- a clipped
+           warning is no more use than the bare count was. Inert: there is
+           nothing to click. */
+        .lil-gui .lil-controller.marker-warning-row { pointer-events: none; }
+        .lil-gui .lil-controller.marker-warning-row button { height: auto; min-height: var(--widget-height);
+                                                             padding: 4px 7px; text-align: left;
+                                                             color: var(--danger-dim); background: none; }
+        .lil-gui .lil-controller.marker-warning-row .lil-name { white-space: normal; overflow-wrap: anywhere;
+                                                                line-height: 1.35; }
         /* ---- Hierarchy tree (see renderHierarchy in viewer.js) ----
            The design's cell tree, down the left edge. Like the lil-gui panel
            on the right it floats over the canvas rather than taking width
