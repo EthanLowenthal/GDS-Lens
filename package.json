@@ -47,8 +47,22 @@
   },
   "files": [
     "dist/",
+    "src/layout-bytes.js",
+    "src/coord-parse.js",
+    "src/cell-search.js",
+    "src/marker-parsers.js",
+    "src/load-errors.js",
     "LICENCE.md",
     "THIRD-PARTY-LICENSES.md",
     "README.md"
-  ]
+  ],
+  "exports": {
+    "./layout-bytes": "./src/layout-bytes.js",
+    "./coord-parse": "./src/coord-parse.js",
+    "./cell-search": "./src/cell-search.js",
+    "./marker-parsers": "./src/marker-parsers.js",
+    "./load-errors": "./src/load-errors.js",
+    "./webview/*": "./dist/webview/*",
+    "./package.json": "./package.json"
+  }
 }
