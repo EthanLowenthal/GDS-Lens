@@ -119,9 +119,10 @@ at roughly 8 to 16 — past that the browser starts dropping the oldest. A page
 showing a dozen layouts at once wants one viewer swapping layouts rather than a
 dozen elements.
 
-[`examples/multi-view.html`](examples/multi-view.html) is a working page of six:
-three loading a layout from `src`, three waiting for a button, one of them
-created and released on demand to keep a context free.
+[`examples/multi-view.html`](https://github.com/EthanLowenthal/GDS-Lens/blob/main/examples/multi-view.html)
+is a working page of six: three loading a layout from `src`, three waiting for a
+button, one of them created and released on demand to keep a context free. It is
+in the repository rather than in the package, which is why that link leaves.
 
 #### Removal parks the viewer
 

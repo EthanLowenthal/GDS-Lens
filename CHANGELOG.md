@@ -17,6 +17,10 @@ version. Before that, `0.x` releases changed it freely.
   pointing at an enabled array with no buffer behind it, which WebGL rejects
   and skips. Only the grid was affected (the layer draws rebind every frame),
   and it stayed missing until the next frame was requested.
+- The link to `examples/multi-view.html` in the README and in
+  `docs/embedding.md`. The example lives in the repository rather than in the
+  package, so a relative link to it was broken for anyone reading the docs
+  from an installed copy; both now point at GitHub and say why.
 
 ## [1.0.0] - 2026-08-25
 

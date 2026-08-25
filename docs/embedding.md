@@ -7,6 +7,14 @@ cannot do.
 For the element's own API, see [the README](../README.md#the-gds-lens-element).
 React specifically is covered in [React integration](react.md).
 
+[`examples/multi-view.html`][example] is a working page of six viewers on the
+default host: layouts arriving from `src` and from a button, a `.lyp` and a
+marker database applied to one of them alone, and a viewer created and released
+on demand. It is in the repository rather than in the package, so that link
+goes to GitHub.
+
+[example]: https://github.com/EthanLowenthal/GDS-Lens/blob/main/examples/multi-view.html
+
 ## The `ViewerHost` interface
 
 The viewer never touches the environment directly. Anything only an embedder
