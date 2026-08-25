@@ -1,11 +1,12 @@
 import globals from "globals";
 
-// This repo is three JavaScript environments in one tree, so the config is
-// three blocks rather than one: the webview's <script> files (browser, one
-// shared global scope), the parse Worker (no DOM), and the extension host plus
-// unit tests (CommonJS under Node). One block covering all of them can only be
-// the union of their globals, which is the same as not checking `no-undef` at
-// all -- a `document` reference in the extension host would pass.
+// This repo is several JavaScript environments in one tree, so the config is
+// several blocks rather than one: the webview's <script> files (browser, one
+// shared global scope), the parse Worker (no DOM), the pure modules that must
+// run anywhere, and the unit tests (CommonJS under Node). One block covering
+// all of them can only be the union of their globals, which is the same as not
+// checking `no-undef` at all: a `document` reference in a pure module would
+// pass.
 
 // The globals this repo's own files hand each other. Each of these is loaded
 // into the webview as a plain <script> (see the load order at the bottom of
@@ -105,20 +106,29 @@ export default [
         rules,
     },
     {
-        // The extension host and the modules it requires. Pointedly *not*
-        // Node's global set: one bundle serves both the desktop host and the
-        // Web Worker host vscode.dev runs extensions in (see "Running on the
-        // web" in DEVELOPING.md), so the globals here are the ones both
-        // provide -- the web platform's, minus the DOM, plus CommonJS's
+        // The pure modules this package exports for use outside a browser
+        // (a VS Code extension host, a worker, plain Node). Pointedly *not*
+        // Node's global set: they have to run anywhere, so the globals here
+        // are the web platform's minus the DOM, plus CommonJS's
         // module/require. Declaring it this way is what turns a `Buffer`,
-        // `process` or `__dirname` creeping back into the host into a lint
-        // warning rather than a crash that only happens on the web. `vscode`
-        // is a require() away rather than a global, so it needs nothing here.
-        files: ["src/**/*.cjs", "src/layout-bytes.js", "src/coord-parse.js"],
+        // `process` or `__dirname` creeping into them into a lint warning
+        // rather than a crash that only happens in a browser.
+        files: ["src/layout-bytes.js", "src/coord-parse.js"],
         languageOptions: {
             globals: { ...globals.worker, ...globals.commonjs },
             ecmaVersion: 2022,
             sourceType: "commonjs",
+        },
+        rules,
+    },
+    {
+        // Build tooling. Real Node, ESM, runs on a developer's machine and
+        // never ships.
+        files: ["scripts/**/*.mjs"],
+        languageOptions: {
+            globals: { ...globals.node },
+            ecmaVersion: 2022,
+            sourceType: "module",
         },
         rules,
     },
