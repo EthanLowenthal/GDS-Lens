@@ -552,6 +552,10 @@
     <script src="cell-search.js"></script>
     <script src="marker-parsers.js"></script>
     <script src="load-errors.js"></script>
+    <!-- The embedder's ViewerHost. Must precede viewer.js, which reads
+         window.gdsLensHost as it starts. Defaults to the plain-page host;
+         a host that needs different services replaces this file. -->
+    <script src="host.js"></script>
     <script src="viewer.js"></script>
 </body>
 </html>

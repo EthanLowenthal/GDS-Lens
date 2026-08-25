@@ -88,15 +88,28 @@ window.addEventListener("unhandledrejection", (event) => {
     console.error("[GDS] unhandled promise rejection on main thread:", event.reason);
 });
 
-const vscode = acquireVsCodeApi();
-console.log("[GDS] acquireVsCodeApi() OK, typeof createGdstkModule:", typeof createGdstkModule, "typeof lil:", typeof lil, "typeof Worker:", typeof Worker, "typeof Blob:", typeof Blob);
+// Everything this file needs from whatever is embedding it. hosts/browser.js
+// installs a default implementation for a plain page; an embedder replaces it
+// by setting window.gdsLensHost before this script runs. Nothing below knows
+// which host it has -- see hosts/browser.js for the interface.
+const host = (typeof window !== "undefined" && window.gdsLensHost) || {};
+// Every method is optional, so calls go through these rather than being
+// guarded one by one at each site. A missing service is not an error: it means
+// the embedder does not offer it, and the control for it is hidden.
+const hostCan = (name) => typeof host[name] === "function";
+const hostCall = (name, ...args) => (hostCan(name) ? host[name](...args) : undefined);
+console.log("[GDS] host ready, typeof createGdstkModule:", typeof createGdstkModule, "typeof lil:", typeof lil, "typeof Worker:", typeof Worker, "typeof Blob:", typeof Blob);
 
 const gui = new lil.GUI({ width: 260 });
 const actions = {
     // Clicking the row always opens the file dialog (load, or replace the
     // current file); the injected ✕ (see setFileChip) handles unloading.
-    loadLypFile: () => vscode.postMessage({ command: "loadLypFile" }),
-    loadMarkerFile: () => vscode.postMessage({ command: "loadMarkerFile" }),
+    loadLypFile: () => Promise.resolve(hostCall("pickLyp")).then((picked) => {
+        if (picked) applyLyp(picked.name, picked.text);
+    }),
+    loadMarkerFile: () => Promise.resolve(hostCall("pickMarkers")).then((picked) => {
+        if (picked) applyMarkers(picked.name, picked.text);
+    }),
     resetView: () => modulePromise.then((Module) => Module.resetView()),
     showInfill: false,
     showText: false,
@@ -293,7 +306,7 @@ function setLypChip(name) {
                 Module.loadLypText("");
                 renderLayerList(Module.getLayers());
             });
-            vscode.postMessage({ command: "unloadLypFile" });
+            hostCall("unloadLyp");
             setLypChip(null);
         }
     });
@@ -306,7 +319,7 @@ function setMarkerChip(name) {
         unloadTitle: "Unload marker file",
         onUnload: () => {
             modulePromise.then((Module) => Module.clearMarkers());
-            vscode.postMessage({ command: "unloadMarkerFile" });
+            hostCall("unloadMarkers");
             removeMarkerBrowser();
             currentMarkers = null;
             setMarkerChip(null);
@@ -1773,7 +1786,7 @@ function showStaleBanner(show, text) {
 if (staleReloadBtn) {
     staleReloadBtn.addEventListener("click", () => {
         showStaleBanner(false);
-        vscode.postMessage({ command: "reloadFile" });
+        hostCall("requestReload");
     });
 }
 if (staleAlwaysBtn) {
@@ -1784,8 +1797,8 @@ if (staleAlwaysBtn) {
     // Auto-Reload on Change" command (and the Settings UI).
     staleAlwaysBtn.addEventListener("click", () => {
         showStaleBanner(false);
-        vscode.postMessage({ command: "setAutoReload", value: true });
-        vscode.postMessage({ command: "reloadFile" });
+        hostCall("setAutoReload", true);
+        hostCall("requestReload");
     });
 }
 if (staleDismiss) {
@@ -1862,7 +1875,7 @@ saveViewController.domElement.title =
     "Name the current camera and layer visibility, and keep it with this layout";
 
 function persistNamedViews() {
-    vscode.postMessage({ command: "saveNamedViews", views: namedViews });
+    hostCall("saveViews", namedViews);
 }
 
 // The name is asked for by the extension host rather than in the page: a
@@ -1874,10 +1887,11 @@ function requestSaveView() {
         // Null means nothing is drawn yet -- there's no camera worth naming.
         if (!captured) return;
         pendingViewCapture = captured;
-        vscode.postMessage({
-            command: "promptViewName",
-            names: namedViews.map((view) => view.name)
-        });
+        Promise.resolve(hostCall("promptViewName", namedViews.map((view) => view.name)))
+            .then((name) => {
+                if (name) saveNamedView(name);
+                else pendingViewCapture = null;
+            });
     });
 }
 
@@ -2126,146 +2140,184 @@ new MutationObserver(applyTheme).observe(document.body, { attributes: true, attr
 lightMediaQuery.addEventListener("change", applyTheme);
 applyTheme();
 
-window.addEventListener("message", (event) => {
-    const message = event.data;
-    console.log("[GDS] window message received, type:", message.type);
-    if (message.type === "init") {
-        console.log("[GDS] init payload: fileData byteLength =", message.fileData && message.fileData.byteLength,
-                    "reload:", !!message.reload);
-        // A reload supersedes any load still running (the file can change
-        // again while a slow one is in flight) -- drop the old worker rather
-        // than letting two of them race to upload geometry.
-        if (activeWorker) {
-            console.log("[GDS] superseding an in-flight load");
-            activeWorker.terminate();
-            activeWorker = null;
-        }
-        showStaleBanner(false);
+// The parse Worker runs its own copy of the wasm module (see wasm-worker.js).
+// How its script is assembled is the host's business, because it is exactly
+// where embedders differ: an ordinary page can fetch the scripts by URL, while
+// a sandboxed webview often cannot reach its own asset URLs from inside a
+// Worker and has to inline them instead.
+function createParseWorker() {
+    if (hostCan("createWorker")) return host.createWorker();
 
-        // Only meaningful on a reload: on first open there's nothing to keep,
-        // and framing the view on the design is exactly what we want.
-        // Captured synchronously off resolvedModule rather than through
-        // modulePromise: the geometry has to be read *before* the new parse
-        // lands, and a .then() would run after this handler returns.
-        pendingViewState = null;
-        if (message.reload && resolvedModule) {
-            try {
-                pendingViewState = captureViewState(resolvedModule);
-            } catch (err) {
-                // Nothing loaded yet, or the module is wedged -- reload as if
-                // it were a first open (framed on the design) rather than
-                // failing the reload outright.
-                console.error("[GDS] could not capture view state, reloading framed:", err);
-            }
-        }
+    // Inlined bundle: a host that cannot serve URLs to a Worker drops the
+    // whole script text, base64'd, into #workerBundle -- an inert
+    // type="text/plain" tag, so the bundle's own text can safely contain a
+    // literal "</script>".
+    const inline = document.getElementById("workerBundle");
+    if (inline && inline.textContent.trim()) {
+        // atob() yields a "binary string" -- one JS char per raw byte
+        // (0-255), NOT real UTF-16 text. gdstk_wasm.js contains genuine
+        // non-ASCII bytes (its embedded wasm binary), so passing that string
+        // straight to `new Blob([...])` would have the Blob constructor
+        // UTF-8-*encode* it as if it were text, expanding every byte >=128
+        // into a 2-byte sequence and corrupting the wasm binary (surfaced as
+        // a WebAssembly.instantiate() "section was shorter than expected
+        // size" CompileError inside the worker). Converting to a Uint8Array
+        // first makes the Blob use the raw bytes as-is.
+        const bundleBytes = Uint8Array.from(atob(inline.textContent), (c) => c.charCodeAt(0));
+        console.log("[GDS] decoded inline worker bundle, length =", bundleBytes.length);
+        return new Worker(URL.createObjectURL(new Blob([bundleBytes], { type: "application/javascript" })));
+    }
 
-        // Captured state doubles as the test for "is there a view worth
-        // keeping on screen": it's null exactly when nothing is drawn yet, and
-        // an empty viewport behind a hairline bar reads as a hung viewer.
-        beginProgress(pendingViewState !== null);
+    // Ordinary page: pull the same three scripts in by URL. They have to be
+    // absolute -- importScripts() inside a blob Worker resolves relative URLs
+    // against the blob: URL rather than against the document, so bare
+    // filenames here would silently fail to load.
+    const url = (name) => JSON.stringify(new URL(name, document.baseURI).href);
+    const bootstrap = `importScripts(${url("gdstk_wasm.js")}, ${url("load-errors.js")}, ${url("wasm-worker.js")});`;
+    console.log("[GDS] building worker from document-relative script URLs");
+    return new Worker(URL.createObjectURL(new Blob([bootstrap], { type: "application/javascript" })));
+}
 
-        let worker;
+// ---- The surface a host drives the viewer through ----
+// Each of these was a branch of a postMessage handler. They are plain
+// functions now, so the transport (VS Code's RPC, a page calling them
+// directly, a test) is the host's business rather than this file's.
+
+function loadLayout(bytes, { reload = false } = {}) {
+    console.log("[GDS] init payload: fileData byteLength =", bytes && bytes.byteLength,
+                "reload:", !!reload);
+    // A reload supersedes any load still running (the file can change
+    // again while a slow one is in flight) -- drop the old worker rather
+    // than letting two of them race to upload geometry.
+    if (activeWorker) {
+        console.log("[GDS] superseding an in-flight load");
+        activeWorker.terminate();
+        activeWorker = null;
+    }
+    showStaleBanner(false);
+
+    // Only meaningful on a reload: on first open there's nothing to keep,
+    // and framing the view on the design is exactly what we want.
+    // Captured synchronously off resolvedModule rather than through
+    // modulePromise: the geometry has to be read *before* the new parse
+    // lands, and a .then() would run after this handler returns.
+    pendingViewState = null;
+    if (reload && resolvedModule) {
         try {
-            // atob() yields a "binary string" -- one JS char per raw byte
-            // (0-255), NOT real UTF-16 text. gdstk_wasm.js contains genuine
-            // non-ASCII bytes (its embedded wasm binary), so passing that
-            // string straight to `new Blob([...])` would have the Blob
-            // constructor UTF-8-*encode* it as if it were text, expanding
-            // every byte >=128 into a 2-byte sequence and corrupting the
-            // wasm binary (surfaced as a WebAssembly.instantiate()
-            // "section was shorter than expected size" CompileError inside
-            // the worker). Converting to a Uint8Array first makes the Blob
-            // use the raw bytes as-is.
-            const binaryString = atob(document.getElementById("workerBundle").textContent);
-            const bundleBytes = Uint8Array.from(binaryString, (c) => c.charCodeAt(0));
-            console.log("[GDS] decoded worker bundle, length =", bundleBytes.length);
-            const blobUrl = URL.createObjectURL(new Blob([bundleBytes], { type: "application/javascript" }));
-            console.log("[GDS] created worker blob URL:", blobUrl);
-            worker = new Worker(blobUrl);
-            console.log("[GDS] new Worker() constructor returned OK");
+            pendingViewState = captureViewState(resolvedModule);
         } catch (err) {
-            console.error("[GDS] failed to build/start worker:", err);
-            showFatalError(`Failed to create worker: ${err.message || err}`);
+            // Nothing loaded yet, or the module is wedged -- reload as if
+            // it were a first open (framed on the design) rather than
+            // failing the reload outright.
+            console.error("[GDS] could not capture view state, reloading framed:", err);
+        }
+    }
+
+    // Captured state doubles as the test for "is there a view worth
+    // keeping on screen": it's null exactly when nothing is drawn yet, and
+    // an empty viewport behind a hairline bar reads as a hung viewer.
+    beginProgress(pendingViewState !== null);
+
+    let worker;
+    try {
+        worker = createParseWorker();
+        console.log("[GDS] new Worker() constructor returned OK");
+    } catch (err) {
+        console.error("[GDS] failed to build/start worker:", err);
+        showFatalError(`Failed to create worker: ${err.message || err}`);
+        return;
+    }
+    startWorker(worker, bytes);
+}
+
+function applyLyp(name, text) {
+    modulePromise.then((Module) => {
+        Module.loadLypText(text);
+        renderLayerList(Module.getLayers());
+    });
+    setLypChip(name || null);
+}
+
+function applyMarkers(name, text) {
+    modulePromise.then((Module) => {
+        let model;
+        try {
+            // Format sniffed by content (lyrdb XML vs Calibre ASCII) --
+            // see marker-parsers.js, loaded via its own <script> tag.
+            model = parseMarkerFile(text, DOMParser);
+        } catch (err) {
+            console.error("[GDS] marker parse failed:", err);
+            removeMarkerBrowser();
+            currentMarkers = null;
+            Module.clearMarkers();
+            setMarkerChip(name || null);
+            markerController.domElement.title = `Failed to parse ${name}: ${err.message || err}`;
             return;
         }
-        startWorker(worker, message.fileData);
-    } else if (message.type === "loadError") {
-        // The extension host gave up before it could send any bytes (file too
-        // large, unreadable, ...) -- without this the overlay would spin
-        // forever waiting for an 'init' that never comes.
-        showFatalError(message.message);
-    } else if (message.type === "lypLoaded") {
-        modulePromise.then((Module) => {
-            Module.loadLypText(message.text);
-            renderLayerList(Module.getLayers());
-        });
-        setLypChip(message.name || null);
-    } else if (message.type === "markersLoaded") {
-        modulePromise.then((Module) => {
-            let model;
-            try {
-                // Format sniffed by content (lyrdb XML vs Calibre ASCII) --
-                // see marker-parsers.js, loaded via its own <script> tag.
-                model = parseMarkerFile(message.text, DOMParser);
-            } catch (err) {
-                console.error("[GDS] marker parse failed:", err);
-                removeMarkerBrowser();
-                currentMarkers = null;
-                Module.clearMarkers();
-                setMarkerChip(message.name || null);
-                markerController.domElement.title = `Failed to parse ${message.name}: ${err.message || err}`;
-                return;
-            }
-            currentMarkers = model;
-            Module.setMarkers(flattenMarkerModel(model));
-            // The slider state outlives marker swaps; wasm resets selection
-            // on setMarkers but keeps opacity, so re-assert both explicitly.
-            Module.setMarkerOpacity(markerUiState.opacity);
-            selectedMarkerId = -1;
-            renderMarkerBrowser(model);
-            setMarkerChip(message.name || null);
-        });
-    } else if (message.type === "namedViews") {
-        // This layout's saved views, read back from the host's storage when the
-        // editor opens (and after every change, which the host echoes nothing
-        // back for -- this side already holds what it just sent).
-        setNamedViews(message.views);
-    } else if (message.type === "saveViewName") {
-        // The name typed into the host's input box (see promptViewName).
-        saveNamedView(message.name);
-    } else if (message.type === "fileChanged") {
-        // The file changed on disk and auto-reload is off, so offer it.
-        showStaleBanner(true, message.text || "A newer version of this file is on disk.");
-    } else if (message.type === "goToPoint") {
-        // "GDSLens: Go to Coordinate". The host has already read the typed text
-        // into a µm pair (see coord-parse.js), so all that's left here is the
-        // pan -- the zoom is deliberately untouched, since a pasted coordinate
-        // doesn't say how much around it you want to see (see goToPoint in
-        // renderer.cpp). Only this side knows whether the point is inside the
-        // layout, so the answer goes back for the host to report.
-        modulePromise.then((Module) => {
-            const onScreen = Module.goToPoint(message.x, message.y);
-            // A crosshair on the coordinate itself, which fades out after a
-            // couple of seconds (see draw_goto_flash in renderer.cpp). Panning
-            // alone leaves you looking at a screen of layout with nothing
-            // saying which part of it is the coordinate you pasted -- and when
-            // clamp_pan has to hold the camera inside the design, it isn't even
-            // the middle of the screen.
-            Module.flashPoint(message.x, message.y);
-            vscode.postMessage({
-                command: "gotoResult",
-                ok: !!onScreen,
-                x: message.x,
-                y: message.y
-            });
-        });
-    } else if (message.type === "toggleDebugTools") {
-        // "GDSLens: Toggle Debug Tools" command -- show/hide the debug entry
-        // point (the button that opens #debugPanel, which holds both the
-        // engine readout and the log), hidden by default, see viewer.html.
-        document.body.classList.toggle("debug");
-    }
+        currentMarkers = model;
+        Module.setMarkers(flattenMarkerModel(model));
+        // The slider state outlives marker swaps; wasm resets selection
+        // on setMarkers but keeps opacity, so re-assert both explicitly.
+        Module.setMarkerOpacity(markerUiState.opacity);
+        selectedMarkerId = -1;
+        renderMarkerBrowser(model);
+        setMarkerChip(name || null);
+    });
+}
+
+function goToPointFromHost(x, y) {
+    // "GDSLens: Go to Coordinate". The host has already read the typed text
+    // into a µm pair (see coord-parse.js), so all that's left here is the
+    // pan -- the zoom is deliberately untouched, since a pasted coordinate
+    // doesn't say how much around it you want to see (see goToPoint in
+    // renderer.cpp). Only this side knows whether the point is inside the
+    // layout, so the answer goes back for the host to report.
+    modulePromise.then((Module) => {
+        const onScreen = Module.goToPoint(x, y);
+        // A crosshair on the coordinate itself, which fades out after a
+        // couple of seconds (see draw_goto_flash in renderer.cpp). Panning
+        // alone leaves you looking at a screen of layout with nothing
+        // saying which part of it is the coordinate you pasted -- and when
+        // clamp_pan has to hold the camera inside the design, it isn't even
+        // the middle of the screen.
+        Module.flashPoint(x, y);
+        hostCall("onGotoResult", { ok: !!onScreen, x, y });
+    });
+}
+
+function toggleDebug() {
+    // "Toggle Debug Tools" -- show/hide the debug entry point (the button
+    // that opens #debugPanel, which holds both the engine readout and the
+    // log), hidden by default, see viewer.html.
+    document.body.classList.toggle("debug");
+}
+
+const viewer = {
+    load: loadLayout,
+    showError: showFatalError,
+    setLyp: applyLyp,
+    setMarkers: applyMarkers,
+    showStale: (text) => showStaleBanner(true, text),
+    goToPoint: goToPointFromHost,
+    toggleDebug,
+    // For a host whose stored views can change after open (another editor on
+    // the same layout saving one, say) rather than only being read once.
+    setNamedViews
+};
+
+// Controls whose host service is missing have nothing behind them, so they
+// are removed rather than left to do nothing when clicked.
+if (!hostCan("pickLyp")) lypController.domElement.closest(".controller")?.remove();
+if (!hostCan("pickMarkers")) markerController.domElement.closest(".controller")?.remove();
+if (!hostCan("saveViews") && !hostCan("promptViewName")) {
+    saveViewController.domElement.closest(".controller")?.remove();
+}
+
+Promise.resolve(hostCall("loadViews")).then((views) => {
+    if (views) setNamedViews(views);
 });
+
+hostCall("connect", viewer);
 
 function startWorker(worker, fileData) {
     activeWorker = worker;

@@ -26,9 +26,10 @@ const webviewScriptGlobals = {
     // src/load-errors.js
     describeLoadFailure: "readonly",
     isOutOfMemory: "readonly",
-    // Not ours: injected by VS Code, by the wasm build, and by the vendored
-    // copy of lil-gui respectively.
-    acquireVsCodeApi: "readonly",
+    // src/hosts/*.js
+    gdsLensHost: "readonly",
+    // Not ours: produced by the wasm build and by the vendored copy of
+    // lil-gui respectively.
     createGdstkModule: "readonly",
     lil: "readonly",
 };
@@ -81,7 +82,7 @@ export default [
         // get both sets: the module.exports tail each one ends with is only
         // reachable in the second case (see the comment at the top of
         // load-errors.js).
-        files: ["src/cell-search.js", "src/marker-parsers.js", "src/load-errors.js"],
+        files: ["src/cell-search.js", "src/marker-parsers.js", "src/load-errors.js", "src/hosts/*.js"],
         languageOptions: {
             globals: { ...globals.browser, ...globals.commonjs },
             ecmaVersion: 2022,

@@ -21,6 +21,9 @@ const FILES = [
     ["src/cell-search.js", "cell-search.js"],
     ["src/marker-parsers.js", "marker-parsers.js"],
     ["src/load-errors.js", "load-errors.js"],
+    // The default ViewerHost. A host with different services (VS Code, say)
+    // replaces this one file and leaves the rest of the payload alone.
+    ["src/hosts/browser.js", "host.js"],
     ["src/wasm-worker.js", "wasm-worker.js"],
     ["src/vendor/lil-gui.umd.min.js", "lil-gui.umd.min.js"],
     ["src/wasm/build/gdstk_wasm.js", "gdstk_wasm.js"]
