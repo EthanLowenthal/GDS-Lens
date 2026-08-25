@@ -2089,24 +2089,24 @@ modulePromise.then(
     }
 );
 
-// ---- Theme (follows VS Code's light/dark theme) ----
-// VS Code stamps the active theme kind onto <body> as vscode-light /
-// vscode-dark / vscode-high-contrast[-light] and rewrites it live when the
-// user switches themes, so the page chrome themes itself off that class in
-// CSS alone (see the token block in viewer.html). What's left for JS is the
-// half CSS can't reach: the canvas is drawn by renderer.cpp, which owns the
+// ---- Theme ----
+// The page chrome themes itself off a `theme-light` class on <body> in CSS
+// alone (see the token block in viewer.html). What's left for JS is the half
+// CSS can't reach: the canvas is drawn by renderer.cpp, which owns the
 // background it clears to, the ruler/selection ink, and the fallback layer
-// palette (all three assume a near-black background otherwise) -- plus the
-// fallback for running this page outside a webview, where there is no
-// vscode-* class and the OS preference is the only signal.
+// palette, all three of which assume a near-black background otherwise.
+//
+// Which theme is current is the embedder's to say, since an embedder usually
+// has a better answer than the OS does: a host implementing isLightTheme()
+// decides, and calls the viewer's applyTheme() when its answer changes.
+// Without one, the OS preference is the only signal there is.
 const lightMediaQuery = window.matchMedia("(prefers-color-scheme: light)");
 
 function detectLightTheme() {
-    const kinds = document.body.classList;
-    // High-contrast light carries both vscode-high-contrast and
-    // vscode-high-contrast-light, so the light check has to come first.
-    if (kinds.contains("vscode-high-contrast-light") || kinds.contains("vscode-light")) return true;
-    if (kinds.contains("vscode-high-contrast") || kinds.contains("vscode-dark")) return false;
+    if (hostCan("isLightTheme")) return !!host.isLightTheme();
+    // A host may instead just set the class itself, which is cheaper than
+    // implementing a method when it is already rewriting <body> anyway.
+    if (document.body.classList.contains("theme-light")) return true;
     return lightMediaQuery.matches;
 }
 
@@ -2118,9 +2118,8 @@ function applyTheme() {
     const light = detectLightTheme();
     if (light === lightTheme) return;
     lightTheme = light;
-    // The same class VS Code's own vscode-light would have set, so the OS
-    // fallback lands on exactly the rules a webview gets for free. Toggling it
-    // re-triggers the observer below, which then no-ops on this early return.
+    // Toggling this re-triggers the observer below, which then no-ops on the
+    // early return above.
     document.body.classList.toggle("theme-light", light);
     modulePromise.then((Module) => {
         Module.setTheme(light);
@@ -2133,9 +2132,9 @@ function applyTheme() {
     });
 }
 
-// A theme switch rewrites <body>'s class list rather than posting a message,
-// so this is the only notification there is. (It also fires for the debug
-// command's own class toggle, which applyTheme ignores.)
+// A host that signals a theme switch by rewriting <body>'s class list rather
+// than calling applyTheme() gets picked up here. (This also fires for the
+// debug command's own class toggle, which applyTheme ignores.)
 new MutationObserver(applyTheme).observe(document.body, { attributes: true, attributeFilter: ["class"] });
 lightMediaQuery.addEventListener("change", applyTheme);
 applyTheme();
@@ -2300,6 +2299,8 @@ const viewer = {
     showStale: (text) => showStaleBanner(true, text),
     goToPoint: goToPointFromHost,
     toggleDebug,
+    // For a host whose theme can change after load, to re-ask isLightTheme().
+    applyTheme,
     // For a host whose stored views can change after open (another editor on
     // the same layout saving one, say) rather than only being read once.
     setNamedViews

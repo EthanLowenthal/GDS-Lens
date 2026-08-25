@@ -3,21 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; style-src 'unsafe-inline'; script-src {{cspSource}} 'wasm-unsafe-eval'; worker-src blob:;">
+        content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:;">
     <style>
         /* ---- Theme tokens ----
            Every color in this file comes from here, because the viewer follows
-           VS Code's light/dark theme and each one needs a counterpart.
+           the embedder's light/dark theme and each one needs a counterpart.
            Dark is the default: it's what the page paints as before any script
            runs, and it's the far more common editor theme.
 
-           The light values ride on VS Code's own body class -- the host stamps
-           vscode-light / vscode-dark / vscode-high-contrast[-light] onto <body>
-           and rewrites it live when the theme changes, so the chrome follows
-           along with no script involved. .theme-light is what viewer.js's theme
-           block sets: the same decision, plus an OS-preference fallback for
-           when this page runs outside a webview (see applyTheme there). The
-           canvas is not covered by any of this -- what the renderer draws is
+           The light values ride on a single .theme-light class, which viewer.js's
+           theme block sets: it asks the host which theme is current and falls
+           back to the OS preference when the host has no opinion (see
+           applyTheme there). An embedder can also just set the class itself.
+           The canvas is not covered by any of this -- what the renderer draws is
            themed in renderer.cpp (see setTheme). */
         :root {
             --bg: #0c0c0d;
@@ -58,7 +56,7 @@
             --panel-widget-hover: #4f4f4f;
             --panel-widget-focus: #595959;
         }
-        body.vscode-light, body.vscode-high-contrast-light, body.theme-light {
+        body.theme-light {
             --bg: #fafafb;
             --fg: #17171a;
             --fg-dim: #56565c;
