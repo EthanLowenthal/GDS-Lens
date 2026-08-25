@@ -79,6 +79,41 @@ function createBrowserHost() {
                 // they just will not outlive it. Not worth interrupting for.
             }
         },
+        // A plain page has to be told which layout to show. Three ways in,
+        // covering the three situations a page is actually in: a URL for an
+        // embed, a drop for a scratch look at a local file, and a direct call
+        // for a page driving the viewer itself (or a test).
+        connect: (viewer) => {
+            window.gdsLens = viewer;
+
+            const loadBytes = (bytes) => viewer.load(bytes, { reload: false });
+
+            const src = new URLSearchParams(location.search).get("src");
+            if (src) {
+                fetch(src)
+                    .then((response) => {
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        return response.arrayBuffer();
+                    })
+                    .then((buffer) => loadBytes(new Uint8Array(buffer)))
+                    .catch((err) => viewer.showError(`Could not fetch ${src}: ${err.message || err}`));
+            }
+
+            // Both handlers are required: without preventDefault on dragover
+            // the browser navigates away to the dropped file instead of
+            // handing it over.
+            window.addEventListener("dragover", (event) => event.preventDefault());
+            window.addEventListener("drop", (event) => {
+                event.preventDefault();
+                const file = event.dataTransfer && event.dataTransfer.files[0];
+                if (!file) return;
+                file.arrayBuffer().then(
+                    (buffer) => loadBytes(new Uint8Array(buffer)),
+                    (err) => viewer.showError(`Could not read ${file.name}: ${err.message || err}`)
+                );
+            });
+        },
+
         promptViewName: async (existingNames) => {
             const name = window.prompt(
                 existingNames.length

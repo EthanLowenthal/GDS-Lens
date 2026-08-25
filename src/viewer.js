@@ -2188,8 +2188,13 @@ function createParseWorker() {
     // whole script text, base64'd, into #workerBundle -- an inert
     // type="text/plain" tag, so the bundle's own text can safely contain a
     // literal "</script>".
-    const inline = els.workerBundle;
-    if (inline && inline.textContent.trim()) {
+    // The tag ships holding a {{workerBundleBase64}} placeholder for a host
+    // that substitutes into it. Left unsubstituted it is still non-empty, so
+    // "has any content" is not the test: an unfilled placeholder means there
+    // is no inline bundle, and atob() on it throws a decode error that looks
+    // nothing like the missing substitution it actually is.
+    const inlineText = els.workerBundle ? els.workerBundle.textContent.trim() : "";
+    if (inlineText && !inlineText.startsWith("{{")) {
         // atob() yields a "binary string" -- one JS char per raw byte
         // (0-255), NOT real UTF-16 text. gdstk_wasm.js contains genuine
         // non-ASCII bytes (its embedded wasm binary), so passing that string
@@ -2199,7 +2204,7 @@ function createParseWorker() {
         // a WebAssembly.instantiate() "section was shorter than expected
         // size" CompileError inside the worker). Converting to a Uint8Array
         // first makes the Blob use the raw bytes as-is.
-        const bundleBytes = Uint8Array.from(atob(inline.textContent), (c) => c.charCodeAt(0));
+        const bundleBytes = Uint8Array.from(atob(inlineText), (c) => c.charCodeAt(0));
         console.log("[GDS] decoded inline worker bundle, length =", bundleBytes.length);
         return new Worker(URL.createObjectURL(new Blob([bundleBytes], { type: "application/javascript" })));
     }
@@ -2440,9 +2445,23 @@ function startWorker(worker, fileData) {
         }
     };
     console.log("[GDS] posting 'parse' message to worker...");
+    // A host may hand in either an ArrayBuffer or a typed-array view over
+    // one, and the transfer list accepts only the buffer itself. Normalize
+    // here rather than making every host care, but do not transfer a buffer
+    // we only partially own: a view with an offset, or shorter than its
+    // buffer, would hand the worker neighbouring bytes as though they were
+    // part of the layout, so that case is copied out first.
+    let transfer;
+    if (fileData instanceof ArrayBuffer) {
+        transfer = fileData;
+    } else if (fileData.byteOffset === 0 && fileData.byteLength === fileData.buffer.byteLength) {
+        transfer = fileData.buffer;
+    } else {
+        transfer = fileData.slice().buffer;
+    }
     worker.postMessage(
-        { type: "parse", fileData: fileData },
-        [fileData]
+        { type: "parse", fileData: transfer },
+        [transfer]
     );
     console.log("[GDS] worker.postMessage('parse') call returned");
 }
