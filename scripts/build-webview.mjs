@@ -4,8 +4,7 @@
 // GDS_LENS_INLINE_WASM in src/wasm/CMakeLists.txt):
 //
 //   dist/web/          gdstk_wasm.js + a separate gdstk_wasm.wasm it fetches.
-//                      The default: the browser stream-compiles the binary
-//                      while it downloads and caches it apart from the JS.
+//                      The default.
 //
 //   dist/inline-wasm/  the binary embedded in gdstk_wasm.js. For hosts that
 //                      cannot fetch their own assets -- a VS Code webview

@@ -169,18 +169,12 @@ cleanly into Node, a worker, or an extension host.
 
 ### The two payloads
 
-`dist/web/` is what you want. `gdstk_wasm.js` fetches a separate
-`gdstk_wasm.wasm` beside it, which is how WebAssembly is normally shipped: the
-browser stream-compiles the binary as it downloads, and caches it apart from
-the JavaScript, so a JS-only release does not re-download 400 KB of module.
+Use `dist/web/`. `gdstk_wasm.js` fetches `gdstk_wasm.wasm` from beside it, so
+serve the two together.
 
-`dist/inline-wasm/` embeds the binary in `gdstk_wasm.js` instead. It exists for
-one situation: a host that cannot fetch a file next to its own scripts. A VS
-Code webview is the case this was built for -- its resource URLs are
-unreachable from a Worker and from the main thread alike, so there is nothing
-to fetch the binary with. Everything else in the two payloads is identical.
-
-Reach for it only if fetching genuinely does not work, because it costs:
+`dist/inline-wasm/` is the same payload with the binary embedded in
+`gdstk_wasm.js`, for hosts that cannot fetch a file next to their own scripts.
+A VS Code webview is the case it was built for. Nothing else differs.
 
 |  | `web` | `inline-wasm` |
 |---|---|---|
@@ -189,14 +183,12 @@ Reach for it only if fetching genuinely does not work, because it costs:
 | Binary cached separately from the JS | yes | no |
 | Sensitive to the page's encoding | no | yes |
 
-That last row is the sharp edge. Emscripten embeds the binary as a raw string,
-so `gdstk_wasm.js` has to be *decoded* as UTF-8 or the binary is corrupted and
-the module fails with a `WebAssembly.instantiate()` error about section
-lengths, which says nothing about the real cause. Either the server sending
-`Content-Type: text/javascript; charset=utf-8` (which essentially every static
-host does) or `<meta charset="UTF-8">` on the page satisfies it; it only breaks
-when neither is present. This build warns in the console if it sees a document
-that is not UTF-8.
+The last row is the one that bites. The embedded binary is a raw string, so
+`gdstk_wasm.js` has to be *decoded* as UTF-8 or it is corrupted, and the module
+fails with a `WebAssembly.instantiate()` error about section lengths that says
+nothing about the cause. Either `Content-Type: text/javascript; charset=utf-8`
+or `<meta charset="UTF-8">` on the page satisfies it; only the absence of both
+breaks. This payload warns in the console when the document is not UTF-8.
 
 ```js
 import { decodeLayoutBytes } from "gds-lens/layout-bytes";

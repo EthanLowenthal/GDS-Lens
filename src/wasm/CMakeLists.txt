@@ -28,16 +28,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 99)
 
 # OFF (the default) emits gdstk_wasm.js plus a sibling gdstk_wasm.wasm, which
-# the JS fetches. This is the normal way to ship WebAssembly: the browser
-# stream-compiles the binary while it downloads, and caches it separately from
-# the JS, so a JS-only change doesn't re-download 500KB of module.
+# the JS fetches.
 #
 # ON embeds the binary inside the JS instead (-sSINGLE_FILE), for hosts that
 # cannot fetch it: a VS Code webview cannot reach its own asset URLs, neither
 # from inside a Worker nor from the main thread. That costs streaming
 # compilation and the separate cache entry, and makes the .js
-# encoding-sensitive (see the SINGLE_FILE note further down), so it is opt-in
-# rather than the default.
+# encoding-sensitive (see the note further down), so it is opt-in.
 option(GDS_LENS_INLINE_WASM
     "Embed the .wasm binary inside gdstk_wasm.js instead of fetching it" OFF)
 
