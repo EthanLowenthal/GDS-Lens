@@ -2050,6 +2050,17 @@ void draw_grid() {
     glUniform4f(g_grid_loc_color, g_ink_color[0], g_ink_color[1], g_ink_color[2],
                 g_light_theme ? kGridAlphaLight : kGridAlphaDark);
     glUniform1f(g_grid_loc_half_width, kGridHalfWidthPx);
+    // The fullscreen triangle comes from gl_VertexID, so a_position must not be
+    // left enabled as an array (same rule as the merge composite pass below).
+    // The previous frame's layer draws leave it enabled and pointing at a layer
+    // VBO, and uploadLayers deletes those buffers -- deleting a buffer clears it
+    // from the bound VAO's attribute bindings, so the first frame after a reload
+    // would reach this draw with an enabled array and no buffer behind it. That
+    // is an INVALID_OPERATION and the draw is dropped, i.e. the grid vanishes
+    // until something else forces a redraw. The layer paths re-enable and
+    // re-point it before each of their own draws, so turning it off here costs
+    // them nothing.
+    glDisableVertexAttribArray(g_loc_position);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

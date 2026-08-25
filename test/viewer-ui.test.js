@@ -252,3 +252,46 @@ test("the hierarchy panel and its find box are keyboard-operable", { skip }, asy
         assert.equal(state.hideExpanded, "false");
     });
 });
+
+// ---- A reload leaves the GL state a frame can be drawn from ----
+
+test("a reload draws a clean frame, background grid included", { skip }, async () => {
+    await withLoadedViewer(async (page) => {
+        // The grid is one attribute-less fullscreen triangle (see draw_grid),
+        // drawn first in the frame from a VAO the layer draws left their own
+        // a_position array enabled on. uploadLayers deletes those buffers, and
+        // deleting a buffer clears it out of the bound VAO's attribute
+        // bindings -- so on the first frame after a reload that draw used to
+        // hit an enabled array with nothing behind it, which WebGL rejects
+        // with INVALID_OPERATION and skips. The layers still drew (they rebind
+        // and re-point every frame); only the grid went missing, and it stayed
+        // missing until something else asked for a frame.
+        //
+        // getContext returns the viewer's own context rather than a second
+        // one, so this reads the errors its draws actually raised.
+        const glError = () => page.evaluate(() => {
+            const canvas = document.querySelector("gds-lens").shadowRoot
+                .getElementById("glCanvas");
+            return canvas.getContext("webgl2").getError();
+        });
+
+        // Also clears the error flag, so what is read after the reload is the
+        // reload's doing and not something left over from the first load.
+        assert.equal(await glError(), 0, "the first load raised a GL error");
+
+        await page.evaluate(async () => {
+            const bytes = await (await fetch("sample_layout.gds")).arrayBuffer();
+            await window.gdsLens.load(bytes, { reload: true });
+        });
+        // The reload's own frame has to have been drawn before the error flag
+        // says anything about it.
+        await page.waitForFunction(
+            () => document.querySelector("gds-lens")?.shadowRoot
+                ?.getElementById("loadingOverlay")?.classList.contains("hidden"),
+            { timeout: 60_000 });
+        await page.evaluate(() => new Promise((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
+        assert.equal(await glError(), 0, "the frame after a reload raised a GL error");
+    });
+});

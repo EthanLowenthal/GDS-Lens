@@ -7,6 +7,17 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [1.0.1] - 2026-08-25
+
+### Fixed
+
+- The background grid vanished after a reload. Reloading deletes the old
+  file's vertex buffers, which also clears them out of the bound VAO's
+  attribute bindings -- leaving the grid's attribute-less fullscreen draw
+  pointing at an enabled array with no buffer behind it, which WebGL rejects
+  and skips. Only the grid was affected (the layer draws rebind every frame),
+  and it stayed missing until the next frame was requested.
+
 ## [1.0.0] - 2026-08-25
 
 ### Added
@@ -287,7 +298,8 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.1...v1.0.0
 [0.1.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/EthanLowenthal/GDS-Lens/releases/tag/v0.1.0
