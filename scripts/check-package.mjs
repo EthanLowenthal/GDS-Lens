@@ -7,10 +7,13 @@
 // them, at 2 MB. Nothing warned, because as far as npm was concerned that was
 // all requested.
 //
-// The fix is the "!src/wasm/build" negation in `files`. This is what stops the
-// fix silently regressing -- if the negation is dropped, or a new generated
-// directory appears under a shipped one, publishing fails here instead of
-// putting object files on the registry.
+// The fix is the "!src/wasm" negation in `files`, which now excludes the whole
+// wasm directory rather than just its build tree: a consumer imports the
+// compiled payload and never compiles the C++, so ~285 KB of renderer.cpp and
+// headers was unpacking into every install for nobody to read. This is what
+// stops either fix silently regressing -- if the negation is dropped, or a new
+// generated directory appears under a shipped one, publishing fails here
+// instead of putting object files on the registry.
 //
 // Reads the file list from `npm pack --dry-run`, so it checks what npm will
 // actually do rather than re-implementing its rules. Safe to call from
@@ -42,6 +45,11 @@ const FORBIDDEN = [
     [/(^|\/)node_modules\//, "dependencies"],
     [/\.(log|tmp|bak|orig)$/, "scratch file"],
     [/(^|\/)\.DS_Store$/, "macOS metadata"],
+    // The C++ and its CMake build. Not droppings -- real sources -- but
+    // nothing a consumer can use: they get the compiled payload, and the
+    // toolchain to rebuild it is not something an install provides. The
+    // repository is where to read these.
+    [/^src\/wasm\//, "wasm sources (consumers get the compiled payload)"],
 ];
 
 // Anything that could carry a path from this machine. The wasm binary is
@@ -97,7 +105,7 @@ if (problems.length) {
     for (const problem of problems) console.error(`  - ${problem}`);
     console.error(
         "\n`files` in package.json is an allowlist that overrides .gitignore, so an\n"
-        + "unwanted path has to be excluded there -- see the \"!src/wasm/build\" entry.\n");
+        + "unwanted path has to be excluded there -- see the \"!src/wasm\" entry.\n");
     process.exit(1);
 }
 

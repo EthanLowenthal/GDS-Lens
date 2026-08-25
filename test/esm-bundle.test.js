@@ -41,6 +41,24 @@ test("the package's main entry resolves to the bundled module", { skip }, async 
                   "gds-lens/viewer is still exported but cannot be loaded");
 });
 
+// Importing in Node, with no DOM at all. This is what an SSR framework does on
+// the server before a browser is ever involved, and it threw
+// "HTMLElement is not defined" until the element stopped extending HTMLElement
+// directly -- a class declaration is evaluated at import time, so the throw
+// came from loading the module rather than from using it. Nothing here can
+// render; the whole claim is that importing does not throw.
+test("the main entry imports where there is no DOM", { skip }, async () => {
+    assert.equal(typeof globalThis.HTMLElement, "undefined",
+                 "this test proves nothing if the runner provides a DOM");
+
+    const module = await import("gds-lens");
+    assert.equal(typeof module.GdsLens, "function", "GdsLens is not exported");
+
+    // And registers nothing, since there is nothing to register into. The
+    // element is defined on the client, when the same module loads there.
+    assert.equal(typeof globalThis.customElements, "undefined");
+});
+
 test("the bundled module carries everything it needs", { skip }, async () => {
     const text = await fs.promises.readFile(bundle, "utf8");
 

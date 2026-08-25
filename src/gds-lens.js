@@ -57,7 +57,18 @@ let mounted = null;
 // module body cannot be re-run.
 let engine = null;
 
-export class GdsLens extends HTMLElement {
+// Importing this module must not need a DOM. `import "gds-lens"` is the
+// documented entry point, and every SSR framework -- Next, Nuxt, Astro,
+// SvelteKit -- evaluates that import on the server first, where there is no
+// HTMLElement. A class declaration is evaluated at import time, so extending
+// it directly threw a ReferenceError before anything had even tried to use the
+// component. Extending a stub instead moves the failure to the only place it
+// can matter -- constructing an element, which nothing but a browser does --
+// and leaves the import a no-op on the server, which is what a consumer's
+// bundler and framework both expect of a custom element.
+const ElementBase = typeof HTMLElement === "undefined" ? class {} : HTMLElement;
+
+export class GdsLens extends ElementBase {
     #ready = null;
 
     connectedCallback() {

@@ -60,7 +60,7 @@
     "types/",
     "dist/",
     "src/",
-    "!src/wasm/build",
+    "!src/wasm",
     "LICENCE.md",
     "THIRD-PARTY-LICENSES.md",
     "CHANGELOG.md",
