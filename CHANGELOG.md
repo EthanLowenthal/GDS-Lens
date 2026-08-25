@@ -9,6 +9,67 @@ status note at the top of the README.
 
 ## [Unreleased]
 
+### Added
+
+- Several `<gds-lens>` elements can now be live on one page. Each drives its
+  own viewer, with its own WebAssembly instance and WebGL2 context, so a `.lyp`
+  or marker database applied to one leaves the others alone. A second element
+  used to refuse visibly rather than contend for the renderer's state.
+- `destroy()` on the element, releasing a viewer's WebAssembly instance and GL
+  context for good. Rarely needed -- an ordinary unmount parks the viewer
+  instead, which is what makes a framework remount free.
+- `docs/react.md`: a wrapper component, the JSX type declaration for React 18
+  and 19, server rendering, and what remounting does. The examples are covered
+  by `test/react.test.js`, and the type declaration by
+  `test/types/jsx-smoke.tsx`.
+- `docs/embedding.md`, which is where the `ViewerHost` interface, the three
+  builds, the subpath exports and the WebAssembly limits moved to. The README
+  keeps the quick start and the element's own API and is a third of its previous
+  length.
+
+### Fixed
+
+- `import "gds-lens"` shipped no default host. `sideEffects` in package.json
+  did not list `src/hosts/browser.js`, whose whole purpose is the side effect
+  of installing `window.gdsLensHost`, so every bundler dropped it -- including
+  the one that builds `dist/esm`. The documented entry point therefore came up
+  with no `.lyp` or marker pickers, no saved views, no drag-and-drop, no
+  `window.gdsLens`, and a console error claiming no layout would ever appear on
+  pages whose layout had loaded perfectly well. The served payloads were never
+  affected, since they load `gds-lens-host.js` as a separate script.
+
+  The `esm-bundle` test that was meant to catch this asserted on the string
+  `gdsLensHost`, which viewer.js contains anyway; it now looks for the host's
+  own implementation.
+- A viewer adopted while its WebAssembly module was still starting failed to
+  come up at all, reporting `Cannot set properties of null (setting 'width')`.
+  `ready` resolves as soon as the viewer is built, which is well before `main()`
+  creates the GL context, so an element could be removed and its viewer adopted
+  inside that window -- and `adopt` re-pointed the module's DOM root on the next
+  turn of the module promise, which is after `main()` has already read it. It
+  now writes through the object Emscripten uses *as* the Module, so the new root
+  is in place immediately.
+- An element whose parked viewer had been adopted by another element went on
+  driving it, so a stray `load()` or `src` change on a detached element wrote
+  into whatever was on screen. Such an element now rejects instead.
+- Removing a `<gds-lens>` before its engine finished loading raised an unhandled
+  promise rejection, which reached the embedding app's error reporting.
+- An element removed and re-added before its engine arrived built two viewers,
+  orphaning the first one's WebAssembly instance and WebGL context behind the
+  second's shadow tree.
+- The viewer no longer assigns `window.onerror`, which clobbered the embedding
+  page's handler. Page-level failures are reported through an added listener
+  and fanned out to whichever debug panels are open.
+
+### Changed
+
+- `src/viewer.js` exports `createViewer(element)` instead of doing its work in
+  its module body, which is what allows more than one viewer. `window.gdsLensHost`
+  is consequently read when each viewer mounts rather than once at import, so an
+  app can install a host any time before its first `<gds-lens>` renders.
+- `src/mount-target.js` is gone. It existed only to hand an element to
+  viewer.js's module body, which is now a parameter.
+
 ## [0.1.1] - 2026-08-25
 
 Nothing shipped in this release behaves differently. It exists because 0.1.0
