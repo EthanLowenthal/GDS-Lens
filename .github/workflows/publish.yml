@@ -70,11 +70,16 @@ jobs:
           # NODE_AUTH_TOKEN, which is unset here, and an empty auth token is
           # worse than none. The default registry is npmjs.org already.
 
-      # See the note at the top. The floor is 11.5.1; taking the latest keeps
-      # this from being a version to remember.
+      # See the note at the top. The floor is 11.5.1, but this is pinned to a
+      # major rather than tracking latest: `npm@latest` walked from 11 to 12
+      # here and changed `npm pack --json` from an array to an object, which
+      # broke check:package in the publish job while it kept passing on a
+      # workstation still on 11. A release is the worst place to discover that
+      # a tool changed its output. Bump this deliberately, and read npm's
+      # release notes when you do.
       - name: Upgrade npm for trusted publishing
         run: |
-          npm install -g npm@latest
+          npm install -g 'npm@^12'
           npm --version
 
       # Pinned to match ci.yml and the local toolchain. See the note there:

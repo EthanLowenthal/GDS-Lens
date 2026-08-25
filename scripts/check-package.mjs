@@ -65,7 +65,23 @@ const { stdout } = await execFileAsync("npm", ["pack", "--dry-run", "--json"], {
     maxBuffer: 32 * 1024 * 1024,
 });
 
-const [packed] = JSON.parse(stdout);
+// npm 11 returns an array of packed-package objects; npm 12 returns them keyed
+// by package name. The fields inside are the same, and this only ever packs one
+// package, so take the first value either way. Checked rather than assumed
+// because the array form worked locally and the object form failed only in the
+// publish job, which had upgraded npm to reach trusted publishing -- a
+// destructure against the wrong shape fails as "object is not iterable", which
+// says nothing about npm's output changing.
+const parsed = JSON.parse(stdout);
+const [packed] = Array.isArray(parsed) ? parsed : Object.values(parsed);
+
+if (!packed || !Array.isArray(packed.files)) {
+    console.error(
+        "could not read a file list from `npm pack --dry-run --json`. Its output "
+        + `shape may have changed again; npm here is ${process.env.npm_config_user_agent || "unknown"}.`);
+    process.exit(1);
+}
+
 const paths = packed.files.map((file) => file.path);
 const problems = [];
 
