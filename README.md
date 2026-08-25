@@ -6,7 +6,7 @@ WebAssembly and a WebGL2 renderer.
 
 Reading and rendering only. Writing layouts is deliberately out of scope.
 
-> **Status: pre-release, not yet published to npm.** The API is unstable and
+> **Status**: pre-release, not yet published to npm. The API is unstable and
 > will change.
 
 ## Quick start
@@ -25,8 +25,8 @@ import "gds-lens";   // registers <gds-lens>
 
 That's the whole thing. Pan with the mouse, zoom with the wheel. The import
 pulls in one self-contained module — the parser, the renderer, the WebAssembly
-binary and the control panel — so there is nothing to copy and nothing else to
-serve.
+binary, and the control panel — so there is nothing to copy and nothing
+else to serve.
 
 Or drive it from JavaScript:
 
@@ -38,10 +38,10 @@ viewer.style.cssText = "width: 100%; height: 600px";
 document.body.append(viewer);
 
 await viewer.load("chip.gds");        // a URL, or bytes you already have
-await viewer.goToPoint(120.5, -40);   // centre on a coordinate, in microns
+await viewer.goToPoint(120.5, -40);   // center on a coordinate, in microns
 ```
 
-### Or serve the files instead
+### Serve the files instead of bundling
 
 If you would rather serve a payload than bundle one — for a smaller download
 and a streaming WebAssembly compile — copy `dist/web/` and load its scripts in
@@ -58,20 +58,20 @@ it starts.
 
 #### What each file is
 
-Six files, of which four are load-bearing:
+The payload is six files, four of which are required:
 
-| File | | What it is |
+| File | Status | What it is |
 |---|---|---|
-| `gds-lens.js` | required | The element, the viewer and the control panel. This is the package. Load it **last**. |
-| `gds-lens-engine.js` | required | gdstk's GDSII/OASIS reader and the WebGL2 renderer, compiled to WebAssembly. Defines the `createGdstkModule` global `gds-lens.js` looks for, which is why it goes first. The parse worker loads it too. |
+| `gds-lens.js` | required | The element, the viewer, and the control panel. This is the package. Load it last. |
+| `gds-lens-engine.js` | required | gdstk's GDSII and OASIS reader and the WebGL2 renderer, compiled to WebAssembly. Defines the `createGdstkModule` global `gds-lens.js` looks for, which is why it goes first. The parse worker loads it too. |
 | `gds-lens-engine.wasm` | required | The binary, fetched by `gds-lens-engine.js` from beside it. `inline-wasm` embeds it instead. |
 | `gds-lens-worker.js` | required | The parse worker: reads and triangulates off the main thread so the canvas stays responsive. Fetched by the worker, never by your page. |
-| `gds-lens-host.js` | optional | The default `ViewerHost` (below). Omit it if you set `window.gdsLensHost` yourself before `gds-lens.js` runs. |
-| `gds-lens.html` | optional | A working reference page. Read it for the script order; no need to deploy it. |
+| `gds-lens-host.js` | optional | The default `ViewerHost`, described in [The ViewerHost interface](#the-viewerhost-interface). If you set `window.gdsLensHost` yourself before `gds-lens.js` runs, omit it. |
+| `gds-lens.html` | optional | A working reference page. For the script order, read this file; there is no need to deploy it. |
 
 Every name carries the package prefix because these get copied into someone
-else's web root, where a bare `host.js` or `wasm-worker.js` is a collision
-waiting to happen. Serve them from one directory, in the order above.
+else's web root, where a bare `host.js` or `wasm-worker.js` is a likely
+collision. Serve them from one directory, in the preceding order.
 
 `dist/web/gds-lens.html` is a working page doing exactly this. Everything in the
 payload must be on the same origin as the page: the WebAssembly binary and the
@@ -79,60 +79,73 @@ parse worker are both fetched relative to the scripts.
 
 ## What it does
 
-- **Parses GDSII and OASIS.** Format and gzip are both detected from the
+- **Parses GDSII and OASIS**. Format and gzip are both detected from the
   leading bytes rather than the filename. The reader is gdstk itself, which is
   what other implementations validate against.
-- **Renders with WebGL2.** Layer-batched vertex buffers, GPU instancing for
-  repeated cells, and a stroke font, all in C++ compiled alongside the parser.
-- **Reads `.lyp` layer properties** for colours, fill styles and layer names.
-- **Browses DRC/LVS markers** from `.lyrdb` report databases and ASCII DRC
-  results.
-- **Navigates hierarchy**, searches cells and labels, and measures distances.
+- **Renders with WebGL2**. Layer-batched vertex buffers, GPU instancing for
+  repeated cells, and a stroke font all live in C++ compiled alongside the
+  parser.
+- **Reads layer properties**. A `.lyp` file supplies colors, fill styles, and
+  layer names.
+- **Browses DRC and LVS markers**. The viewer reads `.lyrdb` report databases
+  and ASCII DRC results.
+- **Navigates hierarchy**. You can search cells and labels, and measure
+  distances.
 
-## Installing
+## Installation
 
 The package ships prebuilt: no Emscripten toolchain is required to consume it.
-Installing straight from a git URL will not work, because `dist/` is built in
+Installing straight from a git URL does not work, because `dist/` is built in
 CI rather than committed.
 
 ---
 
-# Reference
+## Reference
 
-## `<gds-lens>`
+The following sections describe the element, the `ViewerHost` interface an
+embedder implements, the package's subpath exports, and the limits of the
+WebAssembly module.
 
-### Attributes
+### The `<gds-lens>` element
+
+The element is `display: block` with no intrinsic height, so give it one. It
+takes one attribute, exposes a handful of methods, and only one instance can be
+live at a time.
+
+#### Attributes
+
+The element takes one attribute:
 
 | Attribute | Description |
 |---|---|
 | `src` | URL of a layout to fetch and display. Setting it later reloads. |
 
-### Properties and methods
+#### Properties and methods
+
+The element exposes the following members:
 
 | Member | Returns | Description |
 |---|---|---|
-| `ready` | `Promise<Viewer>` | Resolves once the engine has mounted. Every method below awaits this, so you rarely need it directly. |
+| `ready` | `Promise<Viewer>` | Resolves once the engine has mounted. Every method in the following table awaits this, so you rarely need it directly. |
 | `load(source, options?)` | `Promise<void>` | `source` is a URL string, a `Uint8Array`, or an `ArrayBuffer`. `options.reload` keeps the current camera and layer visibility instead of framing the design. |
-| `goToPoint(x, y)` | `Promise<boolean>` | Centres on a coordinate in microns and flashes a crosshair. Resolves `true` if the point is inside the layout. |
+| `goToPoint(x, y)` | `Promise<boolean>` | Centers on a coordinate in microns and flashes a crosshair. Resolves `true` if the point is inside the layout. |
 | `setLyp(name, text)` | `Promise<void>` | Applies a `.lyp` layer-properties file. Pass `""` to clear. |
-| `setMarkers(name, text)` | `Promise<void>` | Applies a marker database. Format is sniffed from the content. |
+| `setMarkers(name, text)` | `Promise<void>` | Applies a marker database. The viewer detects the format from the content. |
 | `showError(message)` | `Promise<void>` | Replaces the view with an error message. |
 
-The element is `display: block` with no intrinsic height, so give it one.
-
-### One at a time
+#### Only one live element at a time
 
 The renderer keeps its state in module-scope globals, so only one `<gds-lens>`
 can be *live* at a time. A second one alongside the first refuses visibly
-rather than fighting it for the same WebGL context.
+rather than contending for the same WebGL context.
 
 Removing one and adding another is fine, though, which is what matters in a
 framework: React and friends recreate the node on re-render, and an SPA route
 change destroys and rebuilds it. The engine is not torn down when the element
 leaves the DOM — the next `<gds-lens>` to connect has it moved into it, keeping
-the WebGL context, the parsed design and the camera. Nothing reloads.
+the WebGL context, the parsed design, and the camera. Nothing reloads.
 
-## Embedding: the `ViewerHost` interface
+### The `ViewerHost` interface
 
 The viewer never touches the environment directly. Anything only an embedder
 can do goes through a host object, which you install as `window.gdsLensHost`
@@ -148,7 +161,8 @@ from a script tag or the console; and it binds drag-and-drop to the
 page's own drop targets alone.
 
 Every method is optional. The viewer hides the control for anything a host
-does not implement, so a read-only embed can supply almost none of it.
+does not implement, so a read-only embed can supply almost none of it. A host
+can implement any of the following methods:
 
 | Method | Returns | Called when |
 |---|---|---|
@@ -161,12 +175,12 @@ does not implement, so a read-only embed can supply almost none of it.
 | `promptViewName(existing)` | `Promise<string \| null>` | A view is being saved. `existing` is the names already used. |
 | `requestReload()` | `void` | The user asks to re-read the layout. |
 | `setAutoReload(on)` | `void` | The user asks to always reload on change. |
-| `onGotoResult({ok, x, y})` | `void` | A `goToPoint` finished, reporting whether it landed inside. |
+| `onGotoResult({ok, x, y})` | `void` | A `goToPoint` call finished, reporting whether it landed inside. |
 | `isLightTheme()` | `boolean` | The viewer needs to know the theme. Defaults to the OS preference. |
-| `createWorker()` | `Worker` | The parse Worker is needed. Override where the scripts cannot be fetched by URL. |
-| `connect(viewer)` | `void` | At mount, handing you the surface below. |
+| `createWorker()` | `Worker` | The parse Worker is needed. Where the scripts cannot be fetched by URL, override this. |
+| `connect(viewer)` | `void` | At mount, handing you the surface described in the following section. |
 
-### The viewer surface
+#### The viewer surface
 
 `connect(viewer)` gives you the other direction, for pushing into the viewer
 rather than answering it:
@@ -178,13 +192,13 @@ rather than answering it:
 | `setLyp(name, text)` | Apply layer properties. |
 | `setMarkers(name, text)` | Apply a marker database. |
 | `showStale(text)` | Offer a reload, for when the file changed underneath. |
-| `goToPoint(x, y)` | Centre on a coordinate. |
+| `goToPoint(x, y)` | Center on a coordinate. |
 | `toggleDebug()` | Show or hide the debug panel. |
 | `setNamedViews(views)` | Replace the saved-view set. |
 | `applyTheme()` | Re-ask `isLightTheme()` after a theme change. |
 | `element` | The `<gds-lens>` the viewer is mounted in. Bind anything of your own to this rather than to `window`, so it stays inside the component. |
 
-### Example
+#### Example: a custom host
 
 ```js
 window.gdsLensHost = {
@@ -199,10 +213,11 @@ window.gdsLensHost = {
 };
 ```
 
-## Subpath exports
+### Subpath exports
 
 The parsers are pure JavaScript with no DOM and no WebAssembly, so they import
-cleanly into Node, a worker, or an extension host.
+cleanly into Node, a worker, or an extension host. The package exposes the
+following entry points:
 
 | Import | Exports |
 |---|---|
@@ -219,16 +234,17 @@ cleanly into Node, a worker, or an extension host.
 
 TypeScript declarations ship for all of these.
 
-### The three builds
+#### The three builds
 
 `import "gds-lens"` gets you `dist/esm/`, and that is the right default. The
-other two are there for cases it cannot cover.
+other two are there for cases it cannot cover. The following table compares
+them:
 
-|  | `esm` | `web` | `inline-wasm` |
+| Property | `esm` | `web` | `inline-wasm` |
 |---|---|---|---|
 | How it arrives | `import "gds-lens"` | scripts you serve | scripts you serve |
 | Files to serve | none | 4 (+2 optional) | 3 (+2 optional) |
-| Bundler configuration | none | n/a | n/a |
+| Bundler configuration | none | N/A | N/A |
 | Total transfer, gzipped | 252 KB | 235 KB | 243 KB |
 | Streaming WebAssembly compile | no | yes | no |
 | Binary cached separately from the JS | no | yes | no |
@@ -236,17 +252,17 @@ other two are there for cases it cannot cover.
 | Needs `blob:` in `script-src` | yes | no | no |
 
 **`esm`** is one file with everything inside it: the markup, the styles,
-lil-gui, the default host, the WebAssembly binary and the parse worker's whole
+lil-gui, the default host, the WebAssembly binary, and the parse worker's whole
 script. Nothing is fetched, so nothing has to be served or copied, and no
 bundler needs configuring. It costs the streaming compile and about 17 KB over
 the payload.
 
 Both the main thread and the parse worker need Emscripten's module, and a
-worker cannot share the main thread's copy. Rather than inline it twice — which
-would add ~190 KB gzipped for nothing — it is inlined once as text and loaded
-from a `blob:` URL by both. That is the one thing this build asks of a page's
-CSP that the others do not: `blob:` in `script-src`, on top of the `worker-src
-blob:` all three need.
+worker cannot share the main thread's copy. Rather than inline it twice —
+which would add about 190 KB gzipped for nothing — it is inlined once as text
+and loaded from a `blob:` URL by both. That is the one thing this build asks
+of a page's CSP that the others do not: `blob:` in `script-src`, on top of
+the `worker-src blob:` all three need.
 
 **`web`** is the payload to serve if you can. `gds-lens-engine.js` fetches
 `gds-lens-engine.wasm` from beside it, so serve the two together; the binary
@@ -264,13 +280,13 @@ charset=utf-8` or `<meta charset="UTF-8">` on the page satisfies it; only the
 absence of both breaks. That payload warns in the console when the document is
 not UTF-8. `esm` escapes its non-ASCII, so it does not care.
 
-### Compressed layouts
+#### Compressed layouts
 
 Gzip is handled for you: `<gds-lens src="chip.gds.gz">` works, and so does a
 plain `.gds` that is secretly gzipped, because the format is decided by magic
 number rather than by filename. Expansion happens in JavaScript rather than
-inside the WebAssembly heap, which is the one address space that can least
-afford a second copy of the file, and it is capped at 2 GB.
+inside the WebAssembly heap, which is where a second copy of the
+file is most expensive, and it is capped at 2 GB.
 
 The same decoder is exported if you want it separately — to check a file before
 handing it over, say:
@@ -283,33 +299,36 @@ if (result.ok) await viewer.load(result.bytes);
 else console.error(result.reason);   // "too-large" | "corrupt"
 ```
 
-## Limits
+### Limits
 
-Parsing, flattening and triangulating all happen inside a 32-bit WebAssembly
-module, so everything has to fit in one 4 GB address space.
+Parsing, flattening, and triangulating all happen inside a 32-bit WebAssembly
+module, so everything has to fit in one 4 GB address space. Two cases bound
+what fits:
 
-- **Flat geometry is the expensive case**, at roughly 1 KB per polygon end to
-  end, so a couple of million top-level polygons is the practical ceiling.
-- **Hierarchy is nearly free.** A cell placed eight or more times becomes a GPU
+- **Flat geometry is the expensive case**. It costs roughly 1 KB per polygon
+  end to end, so a couple of million top-level polygons is the practical
+  ceiling.
+- **Hierarchy is nearly free**. A cell placed eight or more times becomes a GPU
   instance batch: 24 bytes per placement rather than a full geometry copy. A
-  design that flattens to 115M polygons loads in about 2 GB.
+  design that flattens to 115 million polygons loads in about 2 GB.
 
-Past that the module aborts, and the error is turned into an explanation rather
-than an engine string.
+Past that the module aborts, and the viewer turns the error into an explanation
+rather than an engine string.
 
-## Building from source
+## Build from source
 
-Requires the [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html)
-(`emcc`/`emcmake` on `PATH`) and Python 3.10+ for its driver scripts. macOS's
-system `python3` is 3.9 and fails with a `TypeError` on `list[str] | None`;
-with [uv](https://docs.astral.sh/uv/):
+Building from source requires the
+[Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html)
+(`emcc`/`emcmake` on `PATH`) and Python 3.10 or later for its driver scripts.
+macOS's system `python3` is 3.9 and fails with a `TypeError` on
+`list[str] | None`; with [uv](https://docs.astral.sh/uv/):
 
 ```sh
 uv python install 3.13
 export EMSDK_PYTHON="$(uv python find 3.13)"
 ```
 
-Then:
+Then build the payloads and run the tests:
 
 ```sh
 git submodule update --init --recursive
@@ -319,7 +338,7 @@ npm run build          # -> dist/{web,inline-wasm,esm}/
 npm test
 ```
 
-`npm run build:wasm:web`, `:inline` and `:esm` build one variant each; `npm run
+`npm run build:wasm:web`, `:inline`, and `:esm` build one variant each; `npm run
 build` then produces whichever outputs it finds the wasm for, and says which it
 skipped. The three differ only in link flags, but CMake caches those, so each
 gets its own build tree.
@@ -332,21 +351,21 @@ Before publishing, `npm run check:dist` and `npm run check:package` verify that
 the payloads are present and no newer than their sources, and that the tarball
 carries nothing it should not. `prepublishOnly` runs both.
 
-## Licence
+## License
 
 MIT, see [`LICENCE.md`](LICENCE.md).
 
 The payload carries third-party code in two places. Statically linked into the
 WebAssembly: [gdstk](https://github.com/heitzmann/gdstk) (BSL-1.0), Clipper
-(BSL-1.0), [Qhull](http://www.qhull.org) (Qhull licence),
-[earcut.hpp](https://github.com/mapbox/earcut.hpp) (ISC) and
-[zlib](https://github.com/madler/zlib) (zlib licence) - and `gds-lens-engine.js` is
+(BSL-1.0), [Qhull](http://www.qhull.org) (Qhull license),
+[earcut.hpp](https://github.com/mapbox/earcut.hpp) (ISC), and
+[zlib](https://github.com/madler/zlib) (zlib license) — and `gds-lens-engine.js` is
 itself [Emscripten](https://github.com/emscripten-core/emscripten)'s output
 (MIT/NCSA). Bundled into the JavaScript beside it:
 [lil-gui](https://github.com/georgealways/lil-gui) (MIT).
 
 Every notice is reproduced in
-[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md). Qhull's licence in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md). Qhull's license in
 particular requires its notice to accompany any distribution that includes it,
 and its original source can be obtained from
-[qhull.org](http://www.qhull.org).
+[the Qhull website](http://www.qhull.org).
