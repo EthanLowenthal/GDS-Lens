@@ -29,10 +29,10 @@ const NAMES = ["web", "inline-wasm"];
 export const variants = NAMES
     .map((name) => ({ name, dir: path.join(__dirname, "..", "dist", name) }))
     .filter((v) => fs.existsSync(path.join(v.dir, "gds-lens.js")) &&
-                   fs.existsSync(path.join(v.dir, "gdstk_wasm.js")))
+                   fs.existsSync(path.join(v.dir, "gds-lens-engine.js")))
     // Read off the payload rather than the name, so this says what the files
     // are rather than what they are called.
-    .map((v) => ({ ...v, separateWasm: fs.existsSync(path.join(v.dir, "gdstk_wasm.wasm")) }));
+    .map((v) => ({ ...v, separateWasm: fs.existsSync(path.join(v.dir, "gds-lens-engine.wasm")) }));
 
 // The one every test that isn't specifically about loading uses.
 export const defaultVariant = variants[0] || null;
@@ -57,10 +57,10 @@ const TYPES = {
 //
 // `routes` supplies generated files, keyed by request path, either as a body
 // string or as `{ type, body }`. A route wins over a file of the same name,
-// which is how a test substitutes its own host.js for the payload's.
+// which is how a test substitutes its own gds-lens-host.js for the payload's.
 export function serve(dir, routes = {}) {
     const server = http.createServer((req, res) => {
-        const name = decodeURIComponent(req.url.split("?")[0]).replace(/^\/+/, "") || "viewer.html";
+        const name = decodeURIComponent(req.url.split("?")[0]).replace(/^\/+/, "") || "gds-lens.html";
         if (routes[name]) {
             const route = routes[name];
             const { type = TYPES[path.extname(name)] || "text/html", body } =

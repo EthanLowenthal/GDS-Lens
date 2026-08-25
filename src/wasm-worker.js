@@ -6,20 +6,19 @@ import { describeLoadFailure } from "./load-errors.js";
 // on the host (see createParseWorker in viewer.js):
 //
 // On an ordinary page the worker is a small blob that importScripts() both
-// gdstk_wasm.js and this file by absolute URL, and the wasm binary is a
+// gds-lens-engine.js and this file by absolute URL, and the wasm binary is a
 // separate file the module fetches for itself.
 //
-// A VS Code webview can do neither. Its resource protocol (vscode-cdn.net)
-// serves `<script src>` tags in the main document fine, but a Worker (even a
-// blob one) can't reach it at all: importScripts against that URL fails with
-// a NetworkError before it even gets to CSP, and `fetch()` fails the same way
-// even from the main thread -- so the binary can't be fetched either. That
-// host uses the inline-wasm build (-sSINGLE_FILE=1, binary embedded in the
-// .js) and prepends its full text to this file's, no network involved. The
-// concatenated text itself reaches viewer.js embedded as base64 in
-// viewer.html's #workerBundle element (see extension.cjs) rather than via
-// postMessage, since a ~270KB string sent that way reliably broke opening
-// the editor at all (a VS Code-internal RPC assertion).
+// Some hosts can do neither. A VS Code webview is the worked example: its
+// resource protocol serves `<script src>` tags in the main document fine, but
+// a Worker (even a blob one) can't reach it at all -- importScripts against
+// that URL fails with a NetworkError before it even gets to CSP, and fetch()
+// fails the same way even from the main thread, so the binary can't be
+// fetched either. Such a host uses the inline-wasm build (-sSINGLE_FILE=1,
+// binary embedded in the .js), concatenates its full text with this file's,
+// and returns a Worker built from the result through the ViewerHost's
+// createWorker() hook -- no network involved. See createWorker in
+// hosts/browser.js for the ordinary case this replaces.
 //
 // createGdstkModule() instantiates the *same* wasm module used on the main
 // thread. Its main() calls init_gl(), which fails harmlessly here (no
@@ -78,7 +77,7 @@ self.addEventListener("unhandledrejection", (event) => {
     console.error("[GDS worker] unhandled promise rejection inside worker:", event.reason);
 });
 
-// Where to fetch gdstk_wasm.wasm from, for the build that keeps it separate.
+// Where to fetch gds-lens-engine.wasm from, for the build that keeps it separate.
 // Emscripten would resolve it against this worker's own script URL, which is
 // a blob: with no directory to speak of, so viewer.js passes the real one in.
 // Absent (the inline-wasm build, or a host that assembles the worker itself)

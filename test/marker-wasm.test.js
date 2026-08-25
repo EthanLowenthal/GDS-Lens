@@ -1,5 +1,5 @@
 // Headless smoke test for renderer.cpp's marker bindings: evals the built
-// gdstk_wasm.js in plain Node (no GL context -- g_gl_ready stays false, so
+// gds-lens-engine.js in plain Node (no GL context -- g_gl_ready stays false, so
 // only the CPU-side marker state is exercised) and asserts setMarkers /
 // setMarkerCategoryVisible / setSelectedMarker / clearMarkers transitions via
 // getMarkerStats(). Skipped when the wasm bundle hasn't been built.

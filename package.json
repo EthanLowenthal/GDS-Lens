@@ -1,6 +1,6 @@
 {
   "name": "gds-lens",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "GDSII & OASIS layout parsing and WebGL2 rendering for the browser",
   "license": "MIT",
   "author": "Ethan Lowenthal",
@@ -33,41 +33,81 @@
     "url": "https://github.com/EthanLowenthal/GDS-Lens/issues"
   },
   "scripts": {
-    "build:wasm": "npm run build:wasm:web && npm run build:wasm:inline",
+    "build:wasm": "npm run build:wasm:web && npm run build:wasm:inline && npm run build:wasm:esm",
     "build:wasm:web": "emcmake cmake -S src/wasm -B src/wasm/build/web -DGDS_LENS_INLINE_WASM=OFF && cmake --build src/wasm/build/web",
     "build:wasm:inline": "emcmake cmake -S src/wasm -B src/wasm/build/inline -DGDS_LENS_INLINE_WASM=ON && cmake --build src/wasm/build/inline",
     "build": "node scripts/build-webview.mjs",
     "watch": "node scripts/build-webview.mjs --watch",
     "test": "node --test test/*.test.js",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "check:dist": "node scripts/check-dist.mjs",
+    "check:types": "tsc --noEmit -p test/types/tsconfig.json",
+    "prepublishOnly": "npm run lint && npm test && npm run check:dist && npm run check:package",
+    "check:package": "node scripts/check-package.mjs",
+    "build:wasm:esm": "emcmake cmake -S src/wasm -B src/wasm/build/esm -DGDS_LENS_ESM=ON && cmake --build src/wasm/build/esm"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@xmldom/xmldom": "^0.9.10",
     "esbuild": "^0.28.2",
     "eslint": "^10.5.0",
     "globals": "^17.11.0",
     "lil-gui": "^0.21.0",
-    "playwright": "^1.62.1"
+    "playwright": "^1.62.1",
+    "typescript": "^7.0.2"
   },
   "files": [
+    "types/",
     "dist/",
     "src/",
+    "!src/wasm/build",
     "LICENCE.md",
     "THIRD-PARTY-LICENSES.md",
+    "CHANGELOG.md",
     "README.md"
   ],
+  "types": "./types/gds-lens.d.ts",
   "exports": {
-    ".": "./src/gds-lens.js",
-    "./parsers": "./src/marker-parsers.js",
-    "./cell-search": "./src/cell-search.js",
-    "./coord-parse": "./src/coord-parse.js",
-    "./layout-bytes": "./src/layout-bytes.js",
-    "./load-errors": "./src/load-errors.js",
-    "./hosts/browser": "./src/hosts/browser.js",
+    ".": {
+      "types": "./types/gds-lens.d.ts",
+      "default": "./dist/esm/gds-lens.js"
+    },
+    "./parsers": {
+      "types": "./types/parsers.d.ts",
+      "default": "./src/marker-parsers.js"
+    },
+    "./cell-search": {
+      "types": "./types/cell-search.d.ts",
+      "default": "./src/cell-search.js"
+    },
+    "./coord-parse": {
+      "types": "./types/coord-parse.d.ts",
+      "default": "./src/coord-parse.js"
+    },
+    "./layout-bytes": {
+      "types": "./types/layout-bytes.d.ts",
+      "default": "./src/layout-bytes.js"
+    },
+    "./load-errors": {
+      "types": "./types/load-errors.d.ts",
+      "default": "./src/load-errors.js"
+    },
+    "./hosts/browser": {
+      "types": "./types/hosts-browser.d.ts",
+      "default": "./src/hosts/browser.js"
+    },
     "./web/*": "./dist/web/*",
     "./inline-wasm/*": "./dist/inline-wasm/*",
     "./package.json": "./package.json",
-    "./viewer": "./src/viewer.js"
+    "./esm/*": "./dist/esm/*"
   },
-  "type": "module"
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": [
+    "./dist/esm/gds-lens.js",
+    "./src/gds-lens.js",
+    "./dist/**"
+  ]
 }

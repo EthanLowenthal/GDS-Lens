@@ -23,8 +23,8 @@ const BARE = `<!DOCTYPE html><html><head>
     <meta http-equiv="Content-Security-Policy"
       content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self';">
     </head><body>
-    <script src="gdstk_wasm.js"></script>
-    <script src="host.js"></script>
+    <script src="gds-lens-engine.js"></script>
+    <script src="gds-lens-host.js"></script>
     <script src="gds-lens.js"></script>
     </body></html>`;
 

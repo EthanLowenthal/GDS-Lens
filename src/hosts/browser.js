@@ -29,7 +29,7 @@
 //   viewer.load(bytes, { reload })   viewer.showError(message)
 //   viewer.setLyp(name, text)        viewer.setMarkers(name, text)
 //   viewer.showStale(text)           viewer.goToPoint(x, y)
-//   viewer.toggleDebug()
+//   viewer.toggleDebug()             viewer.element  (the mounted element)
 
 export function createBrowserHost() {
     // Views are per-layout everywhere else; a plain page has no document
@@ -39,7 +39,11 @@ export function createBrowserHost() {
     const VIEWS_KEY = "gds-lens:named-views";
     const readViews = () => {
         try {
-            return JSON.parse(localStorage.getItem(VIEWS_KEY) || "[]");
+            // Array-checked, not just parse-guarded: the catch only covers a
+            // throw, and `null` or `5` parse perfectly well while being
+            // nothing the caller can iterate.
+            const parsed = JSON.parse(localStorage.getItem(VIEWS_KEY) || "[]");
+            return Array.isArray(parsed) ? parsed : [];
         } catch {
             return [];
         }
@@ -84,6 +88,10 @@ export function createBrowserHost() {
         // embed, a drop for a scratch look at a local file, and a direct call
         // for a page driving the viewer itself (or a test).
         connect: (viewer) => {
+            // Published for a plain page (and the test suite) to drive the
+            // viewer from the console or a script tag. This is the default
+            // host's doing, not the element's: an embedder that replaces
+            // gds-lens-host.js gets no such global unless it sets one.
             window.gdsLens = viewer;
 
             const loadBytes = (bytes) => viewer.load(bytes, { reload: false });
@@ -99,19 +107,34 @@ export function createBrowserHost() {
                     .catch((err) => viewer.showError(`Could not fetch ${src}: ${err.message || err}`));
             }
 
+            // Bound to the viewer's own element, not to window. On window,
+            // the preventDefault below fires for every drag anywhere in the
+            // embedding page, which silently disables the host application's
+            // own drop targets -- a component has no business doing that. The
+            // fallback keeps a plain page working if the surface predates
+            // `element`.
             // Both handlers are required: without preventDefault on dragover
             // the browser navigates away to the dropped file instead of
             // handing it over.
-            window.addEventListener("dragover", (event) => event.preventDefault());
-            window.addEventListener("drop", (event) => {
-                event.preventDefault();
-                const file = event.dataTransfer && event.dataTransfer.files[0];
-                if (!file) return;
-                file.arrayBuffer().then(
-                    (buffer) => loadBytes(new Uint8Array(buffer)),
-                    (err) => viewer.showError(`Could not read ${file.name}: ${err.message || err}`)
-                );
-            });
+            const bindDrop = (target) => {
+                if (!target) return;
+                target.addEventListener("dragover", (event) => event.preventDefault());
+                target.addEventListener("drop", (event) => {
+                    event.preventDefault();
+                    const file = event.dataTransfer && event.dataTransfer.files[0];
+                    if (!file) return;
+                    file.arrayBuffer().then(
+                        (buffer) => loadBytes(new Uint8Array(buffer)),
+                        (err) => viewer.showError(`Could not read ${file.name}: ${err.message || err}`)
+                    );
+                });
+            };
+
+            bindDrop(viewer.element || document.querySelector("gds-lens"));
+            // The viewer can move to a different element (a framework
+            // re-render recreates the node), which leaves the listeners above
+            // on something detached. Rebind on the new one.
+            if (typeof viewer.onAdopt === "function") viewer.onAdopt(bindDrop);
         },
 
         promptViewName: async (existingNames) => {

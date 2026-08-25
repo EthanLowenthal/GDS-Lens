@@ -40,13 +40,13 @@ window.gdsLensHost = {
 };
 `;
 
-// Substituting host.js is the whole setup: the payload's own default host
+// Substituting gds-lens-host.js is the whole setup: the payload's own default host
 // never runs, so nothing else has to be stubbed.
 async function mounted(fn) {
     await withPayload(defaultVariant, async (page, port) => {
         const pageErrors = [];
         page.on("pageerror", (e) => pageErrors.push(String(e)));
-        await page.goto(`http://127.0.0.1:${port}/viewer.html`);
+        await page.goto(`http://127.0.0.1:${port}/gds-lens.html`);
         // Getting a layout in is the host's job, and this mock replaces the
         // default host that would otherwise handle ?src=. Driving it through
         // the surface connect() hands over is the point: it is the same call
@@ -62,7 +62,7 @@ async function mounted(fn) {
             { timeout: 60_000 });
         await fn(page);
         assert.deepEqual(pageErrors, [], `uncaught page errors: ${pageErrors.join("; ")}`);
-    }, { "host.js": HOST_SCRIPT });
+    }, { "gds-lens-host.js": HOST_SCRIPT });
 }
 
 const calls = (page) => page.evaluate(() => window.__calls.map((c) => c.name));

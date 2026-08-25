@@ -1,5 +1,5 @@
 // Headless test for label (TEXT element) handling in renderer.cpp: evals the
-// built gdstk_wasm.js in plain Node (no GL context needed -- this only
+// built gds-lens-engine.js in plain Node (no GL context needed -- this only
 // exercises parseGdsToLayers's CPU half) and asserts labels are flattened out
 // of the hierarchy onto the right layers, including the two paths that carry
 // them: cells walked directly, and cells reused often enough to be GPU
@@ -44,8 +44,8 @@ function int4(...values) {
     return buf;
 }
 
-function ascii(text) {
-    const bytes = Buffer.from(text, "ascii");
+function ascii(str) {
+    const bytes = Buffer.from(str, "ascii");
     return bytes.length % 2 === 0 ? bytes : Buffer.concat([bytes, Buffer.alloc(1)]);
 }
 

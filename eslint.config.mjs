@@ -1,3 +1,4 @@
+import js from "@eslint/js";
 import globals from "globals";
 
 // Every source file here is an ES module now, but they still run in four
@@ -19,21 +20,30 @@ const vendorGlobals = {
 // read only behind a typeof guard.
 const buildFlags = {
     __GDS_LENS_INLINE_WASM__: "readonly",
+    __GDS_LENS_WORKER_SOURCE__: "readonly",
 };
 
-// The same set for every block: these are the mistakes worth a warning in a
-// codebase this size, not a style guide.
+// eslint:recommended, as errors, plus the handful worth adding on top. Errors
+// rather than warnings on purpose: `eslint .` exits 0 on a warning, so a
+// warn-only config cannot gate anything -- CI would go green on a real fault.
+// Anything genuinely intended gets a disable comment at its own line, where a
+// reader can see the reasoning, rather than being switched off repo-wide.
 const rules = {
-    "no-const-assign": "warn",
-    "no-this-before-super": "warn",
-    "no-undef": "warn",
-    "no-unreachable": "warn",
+    ...js.configs.recommended.rules,
     // A leading underscore is this codebase's "required by the signature, not
     // used here" marker, and dropping such a parameter would change the ones
     // that follow.
-    "no-unused-vars": ["warn", { argsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" }],
-    "constructor-super": "warn",
-    "valid-typeof": "warn",
+    "no-unused-vars": ["error", { argsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" }],
+    // Not in recommended, and all four have caught real faults in code like
+    // this: coordinate maths that compares mixed types, event handlers that
+    // shadow an outer element ref, and loops over parser state.
+    eqeqeq: ["error", "smart"],
+    "no-shadow": "error",
+    "no-unmodified-loop-condition": "error",
+    "no-unused-private-class-members": "error",
+    "prefer-const": "error",
+    "no-var": "error",
+    "no-throw-literal": "error",
 };
 
 const module_ = (files, globalSet) => ({
@@ -45,14 +55,11 @@ const module_ = (files, globalSet) => ({
 export default [
     {
         // Generated, vendored and built output, none of it ours to fix.
-        // .vscode-test-web/ is a whole VS Code web distribution: flat config
-        // doesn't skip dot-directories on its own, and its multi-megabyte
-        // single-line bundles run the linter out of memory rather than merely
-        // slowing it down.
-        ignores: ["src/wasm/build/**", "dist/**", ".vscode-test-web/**"],
+        ignores: ["src/wasm/build/**", "dist/**"],
     },
     // The viewer's main thread: browser globals plus the vendored ones.
-    module_(["src/viewer.js", "src/gds-lens.js", "src/mount-target.js"],
+    module_(["src/viewer.js", "src/gds-lens.js", "src/mount-target.js",
+             "src/engine-source.js", "src/engine-source.esm.js"],
         { ...globals.browser, ...vendorGlobals, ...buildFlags }),
     // The parse Worker: its own global scope, with no DOM in it.
     module_(["src/wasm-worker.js"], { ...globals.worker, ...vendorGlobals }),
@@ -60,7 +67,7 @@ export default [
     module_(["src/hosts/*.js"], { ...globals.browser }),
     // The pure modules: no DOM, no wasm, importable from Node, a worker or an
     // extension host. Deliberately *not* Node's global set, so a `Buffer`,
-    // `process` or `__dirname` creeping in is a warning rather than a crash
+    // `process` or `__dirname` creeping in is an error rather than a crash
     // that only happens in a browser.
     module_(
         ["src/cell-search.js", "src/marker-parsers.js", "src/load-errors.js",
@@ -71,7 +78,8 @@ export default [
         // bodies they hand to page.evaluate() are serialized and run inside
         // Chromium, so `window` and `document` in them are real.
         files: ["test/browser-smoke.test.js", "test/custom-element.test.js",
-            "test/host-contract.test.js"],
+            "test/host-contract.test.js", "test/viewer-ui.test.js",
+            "test/esm-bundle.test.js"],
         languageOptions: {
             globals: { ...globals.node, ...globals.browser },
             ecmaVersion: 2022,

@@ -7,11 +7,11 @@
 // a Worker instantiated from this same module (see wasm-worker.js) so large
 // files don't block the main thread; its result crosses back over
 // postMessage and uploadLayers() (GL upload only) applies it on the main
-// thread, which owns the canvas. loadAndRenderGds() still does both in one
-// synchronous call for callers that don't need a Worker.
+// thread, which owns the canvas.
 //
-// GDS bytes still arrive via MEMFS (see bindings.cpp's parseGds, which is
-// kept around for non-graphical testing of the parse path in isolation).
+// GDS bytes arrive via MEMFS: gdstk's read_gds()/read_oas() take a filename
+// and do FILE* I/O internally, so staging the bytes there is the simplest way
+// to hand them something that started as a postMessage payload.
 //
 // Three self-contained pieces sit in their own files, since none of them
 // touch any of the renderer state below: the GLSL sources (shaders.hpp), the
@@ -406,7 +406,7 @@ constexpr float kMinZoomRatio = 0.05f;
 
 // Zoom-in is bounded absolutely instead, in pixels per micron. It can be:
 // every file's coordinates are normalized to microns at parse time (unit=1e-6
-// in bindings.cpp -- see update_scale_bar), so a pixels-per-micron number
+// in read_layout -- see update_scale_bar), so a pixels-per-micron number
 // means the same thing in every layout, which a ratio against the fit zoom
 // does not. A fit-relative ceiling let you in ~1nm deep on a small cell and
 // only ~50nm deep on a full die, purely because the die's bbox is bigger.
@@ -692,8 +692,8 @@ GLuint link_program(const char* vs_src, const char* fs_src) {
 }
 
 // False in environments with no real WebGL2-capable canvas -- notably plain
-// Node, which is how parseGds() (bindings.cpp) is exercised for headless
-// parse-path testing (see RENDERING_REWRITE.md's phase-1 verification).
+// Node, which is how parseGdsToLayers()'s CPU half is exercised for headless
+// parse-path testing (see test/wasm-build.js).
 // main() checks this before touching any further GL/DOM state so that
 // non-graphical testing still works after this file's GL init runs
 // automatically at module load.
@@ -1058,7 +1058,12 @@ PolygonRange make_range(const std::vector<float>& verts, GLint first, GLsizei co
     return range;
 }
 
-void set_inner_html(const char* id, const std::string& html) {
+// Named for what it requires of the caller: the markup must be ours. Every
+// current caller passes a snprintf of numbers plus static tags. Anything
+// carrying a filename, a gdstk string or a host-supplied message is not
+// trusted and must not come through here -- see set_labelled_text below,
+// which exists because that distinction was missed once already.
+void set_inner_html_trusted(const char* id, const std::string& html) {
     val el = dom_root().call<val>("getElementById", std::string(id));
     if (!el.isNull() && !el.isUndefined()) el.set("innerHTML", html);
 }
@@ -1068,9 +1073,36 @@ void set_inner_text(const char* id, const std::string& text) {
     if (!el.isNull() && !el.isUndefined()) el.set("innerText", text);
 }
 
+// A bold label, a line break, then `text` as an actual text node.
+//
+// Built node by node rather than by concatenating into innerHTML because
+// `text` is untrusted: it carries filenames, gdstk error strings and messages
+// handed in by the host, and the host's own can come straight from a ?src=
+// query parameter. Concatenated into innerHTML that is an injection sink, and
+// the panel being display:none does not help -- innerHTML parses and inserts
+// regardless, so an <img onerror> in it still runs. createTextNode cannot
+// produce an element no matter what the string contains.
+//
+// createElement comes off `document`, not dom_root(): the root here is
+// usually a ShadowRoot, which has no createElement of its own, and nodes made
+// by the document insert into a shadow root perfectly well.
+void set_labelled_text(const char* id, const char* label, const std::string& text) {
+    val el = dom_root().call<val>("getElementById", std::string(id));
+    if (el.isNull() || el.isUndefined()) return;
+
+    val document = val::global("document");
+    el.set("textContent", std::string(""));
+
+    val bold = document.call<val>("createElement", std::string("b"));
+    bold.set("textContent", std::string(label));
+    el.call<void>("appendChild", bold);
+    el.call<void>("appendChild", document.call<val>("createElement", std::string("br")));
+    el.call<void>("appendChild", document.call<val>("createTextNode", text));
+}
+
 // dbuPerMicron is always 1.0 now -- gdstk's read_gds()/read_oas() are called
 // with unit=1e-6, which normalizes every file's coordinates to microns at
-// parse time (see bindings.cpp), so the old per-file scale factor the JS
+// parse time (see parseGdsToLayers), so the old per-file scale factor the JS
 // scale bar used to divide by no longer varies.
 void update_scale_bar() {
     const double target_pixel_width = 120.0;
@@ -1610,7 +1642,7 @@ void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers
         snprintf(buf + len, sizeof(buf) - (size_t)len, "<br>Frame: %.1f ms (%.0f fps)", g_frame_ms_ema,
                  1000.0f / g_frame_ms_ema);
     }
-    set_inner_html("renderStats", buf);
+    set_inner_html_trusted("renderStats", buf);
 }
 
 // Upper bound on labels drawn in one frame. Text is only legible a few
@@ -2787,8 +2819,8 @@ void collect_instanced(Cell* cell, const Affine2D& current,
     }
 }
 
-// Fresh JS-owned Float32Array copied out of a wasm-heap vector -- mirrors
-// bindings.cpp's to_float64_array. The returned array doesn't alias wasm
+// Fresh JS-owned Float32Array copied out of a wasm-heap vector. It doesn't
+// alias wasm
 // memory, so it's safe for a caller (e.g. the Worker script) to hold onto or
 // postMessage-transfer after this call returns.
 val to_float32_array(const std::vector<float>& data) {
@@ -3961,7 +3993,7 @@ val parseGdsToLayers(const std::string& path) {
     return result;
 }
 
-// GL-upload half of the old loadAndRenderGds: takes the plain per-layer
+// The GL-upload half of a load: takes the plain per-layer
 // vertex data produced by parseGdsToLayers() (either called directly, or
 // reconstructed from a Worker's 'gdsResult' postMessage) and turns it into
 // VBOs + camera framing. Must run on the main thread (owns the GL context).
@@ -4131,7 +4163,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     // update_render_stats) with the live visible-polygon-count / rendering-
     // mode readout -- kept as a separate span so draw_frame's per-frame
     // update doesn't have to re-set the static title/count text above it.
-    set_inner_html("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons) +
+    set_inner_html_trusted("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons) +
                               "<br>Labels: " + std::to_string(total_labels) +
                               "<br><span id=\"renderStats\"></span>");
     update_scale_bar();
@@ -4142,8 +4174,14 @@ void showLoadError(const std::string& message) {
     // Write the visible panel FIRST and unconditionally: #ui below sits inside
     // the debug panel, which is closed unless the debug command opened it, and
     // a failure early enough to leave GL uninitialized is exactly when the user
-    // most needs to see why. set_inner_text, not html -- the message can
-    // carry a filename or a gdstk string we don't control.
+    // most needs to see why.
+    //
+    // Neither sink here takes `message` as markup: it can carry a filename, a
+    // gdstk string, or a message the host built from a ?src= parameter. This
+    // one uses set_inner_text; #ui below goes through set_labelled_text for
+    // the same reason. #ui used to concatenate it into innerHTML, which made
+    // a crafted ?src= link an injection vector -- being inside a display:none
+    // panel does not help, since innerHTML parses and inserts either way.
     set_inner_text("loadError", std::string("Could not open this layout\n\n") + message);
 
     if (!g_gl_ready) return;
@@ -4154,27 +4192,11 @@ void showLoadError(const std::string& message) {
     g_measure_pending = false;
     g_snap_active = false;
     update_measure_labels();
-    set_inner_html("ui", std::string("<b>Error</b><br>") + message);
+    set_labelled_text("ui", "Error", message);
     request_redraw();
 }
 
 // Synchronous single-call path kept for callers that don't need progress
-// reporting -- parseGdsToLayers()/uploadLayers() are what viewer.js actually
-// drives via the Worker now.
-void loadAndRenderGds(const std::string& path) {
-    if (!g_gl_ready) {
-        // No WebGL2-capable canvas (e.g. running under plain Node) -- use
-        // parseGds() instead for headless parse-path testing.
-        return;
-    }
-    val r = parseGdsToLayers(path);
-    if (!r["ok"].as<bool>()) {
-        showLoadError(r["error"].as<std::string>());
-        return;
-    }
-    uploadLayers(r["layers"], r["instanceGroups"], r["bbox"]);
-}
-
 // Parse one leaf .lyp block -- the region covering a single layer, containing
 // exactly one <source> -- and insert it into g_lyp_info under `category`. A
 // no-op when the block has no numeric <source> (e.g. a subgroup header, or
@@ -4523,7 +4545,8 @@ void clearMeasurements() {
     g_measurements.clear();
     g_measure_pending = false;
     g_snap_active = false;
-    // No DOM in headless (plain Node) runs -- mirror loadAndRenderGds's guard.
+    // No DOM in headless (plain Node) runs -- same guard as everywhere else
+    // that touches GL state.
     if (!g_gl_ready) return;
     // draw_frame early-returns with no layers, so it can't take the labels down
     // itself in the load-error path -- do it directly.
@@ -4766,7 +4789,6 @@ int main() {
 }
 
 EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
-    function("loadAndRenderGds", &loadAndRenderGds);
     function("parseGdsToLayers", &parseGdsToLayers);
     function("uploadLayers", &uploadLayers);
     function("showLoadError", &showLoadError);

@@ -1,7 +1,7 @@
 // The GLSL sources for every pass renderer.cpp draws. Kept apart from the
 // renderer itself because they are pure data with no dependency on any of its
 // state, and because having them in one small file makes the whole shader set
-// readable at once -- and easy to feed to a validator (see DEVELOPING.md).
+// readable at once -- and easy to feed to a validator (see README.md).
 //
 // Each constant is a #version 300 es (WebGL2 / GLSL ES 3.0) source string. The
 // uniform and attribute names are bound by init_gl() in renderer.cpp, which is

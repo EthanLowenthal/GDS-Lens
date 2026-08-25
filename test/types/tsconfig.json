@@ -1,0 +1,14 @@
+{
+    "//": "Type-checks types/*.d.ts against smoke.ts. Emits nothing, and lives here rather than in types/ so it stays out of the published tarball.",
+    "compilerOptions": {
+        "strict": true,
+        "noEmit": true,
+        "target": "ES2022",
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "lib": ["ES2022", "DOM"],
+        "skipLibCheck": false,
+        "types": []
+    },
+    "include": ["../../types/*.d.ts", "smoke.ts"]
+}

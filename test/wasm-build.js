@@ -1,4 +1,4 @@
-// Locates a built gdstk_wasm.js for the tests that run the reader headlessly
+// Locates a built gds-lens-engine.js for the tests that run the reader headlessly
 // in Node.
 //
 // Two builds exist (see src/wasm/CMakeLists.txt) and either will do here:
@@ -14,15 +14,15 @@ import { createRequire } from "node:module";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// gdstk_wasm.js is Emscripten output targeting web+node, so it calls
+// gds-lens-engine.js is Emscripten output targeting web+node, so it calls
 // require() internally when it detects Node. ESM has none to hand it.
 const require = createRequire(import.meta.url);
 
 const candidates = ["web", "inline"].map(
-    (name) => path.join(__dirname, "..", "src", "wasm", "build", name, "gdstk_wasm.js"));
+    (name) => path.join(__dirname, "..", "src", "wasm", "build", name, "gds-lens-engine.js"));
 
 export const wasmJsPath = candidates.find((p) => fs.existsSync(p)) || null;
-export const skip = wasmJsPath ? false : "src/wasm/build/*/gdstk_wasm.js not built";
+export const skip = wasmJsPath ? false : "src/wasm/build/*/gds-lens-engine.js not built";
 
 // MODULARIZE puts createGdstkModule in the script's own scope rather than
 // exporting it, and this is a classic script, so it is eval'd with the four

@@ -1,0 +1,121 @@
+# Two lanes, split by whether they need the Emscripten toolchain.
+#
+# `check` is the one that runs on every push in about a minute: lint plus the
+# tests that need nothing built. `build-wasm` is the slow, complete one -- it
+# builds both payloads and runs the browser tests against them.
+#
+# The split exists because the suite degrades gracefully by design: with no
+# dist/ and no Chromium, the browser and wasm tests skip rather than fail (see
+# test/payload.js and test/wasm-build.js). That is right for a fast lane and
+# actively dangerous for a slow one, so build-wasm asserts that nothing
+# skipped -- a green run that quietly tested nothing is worse than a red one.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: lint + pure tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      # No dist/ and no Chromium here, so the browser and wasm suites skip.
+      # That is expected in this lane; build-wasm is where they must run.
+      - name: Test (pure modules)
+        run: npm test
+
+      - name: Check types
+        run: npm run check:types
+
+  build-wasm:
+    name: wasm build + full suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Caches the whole SDK against the pinned version, which is most of the
+      # runtime on a warm run.
+      #
+      # Pinned, not "latest": the payload is a compiled artifact, and a
+      # toolchain that moves on its own turns an unrelated push into a
+      # different binary. Keep this in step with what the payload is built
+      # with locally -- `emcc --version` -- and bump the two together.
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.1
+          actions-cache-folder: emsdk-cache
+
+      - run: npm ci
+
+      - run: npx playwright install --with-deps chromium
+
+      # All three variants: web, inline-wasm, and the EXPORT_ES6 one dist/esm
+      # is built from.
+      - run: npm run build:wasm
+
+      - run: npm run build
+
+      # The publish guards, run here rather than only at publish time: this is
+      # the lane that has a payload to check. check:package is what stops the
+      # Emscripten build tree being shipped again -- `files` in package.json
+      # overrides .gitignore, so nothing else would notice.
+      - run: npm run check:dist
+
+      - run: npm run check:package
+
+      # Fails if anything skipped. Without this the suite would report success
+      # on a run where the payload never built and every browser test opted
+      # out -- exactly the failure this lane exists to catch.
+      #
+      # The reporter is pinned because the summary wording depends on it: the
+      # default one writes "\u2139 skipped N" and tap writes "# skipped N", so a
+      # pattern written for either silently matches nothing under the other and
+      # the guard reports zero skips forever.
+      - name: Test (full, no skips allowed)
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap 'test/*.test.js' 2>&1 | tee test-output.txt
+          skipped=$(sed -n 's/^# skipped \([0-9]\{1,\}\)$/\1/p' test-output.txt)
+          if [ -z "$skipped" ]; then
+            echo "::error::could not read a skip count from the test output; the guard is broken."
+            exit 1
+          fi
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::$skipped test(s) skipped in the wasm lane; the payload or Chromium is missing."
+            exit 1
+          fi
+          echo "no tests skipped"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

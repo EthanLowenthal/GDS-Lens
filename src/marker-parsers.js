@@ -1,11 +1,11 @@
 // Parsers for DRC/LVS marker databases: .lyrdb report databases (.lyrdb,
-// XML) and ASCII DRC results databases (line-oriented text). This is
-// a standalone script (no imports): the webview loads it via a <script> tag
-// (see viewer.html / extension.cjs's asWebviewUri replacement), and plain
-// Node unit tests require() it via the module.exports tail. parseLyrdb takes
-// the DOMParser *constructor* as an argument so the file itself stays
-// environment-free -- the webview passes the browser global, tests pass
-// @xmldom/xmldom's.
+// XML) and ASCII DRC results databases (line-oriented text).
+//
+// No imports, no DOM and no wasm, so this runs wherever it is put: the
+// viewer, a Worker, or a Node test. parseLyrdb takes the DOMParser
+// *constructor* as an argument rather than importing one, which is what keeps
+// it environment-free -- the viewer passes the browser global, tests pass
+// @xmldom/xmldom's. It is also published on its own as `gds-lens/parsers`.
 //
 // Both parsers emit the same normalized model. All coordinates are in µm,
 // y-up world space -- the same space renderer.cpp draws in (integer
@@ -435,6 +435,10 @@ function parseDrcAscii(text) {
         let cellName = "";
         let xf = null; // {m11,m21,m12,m22,tx,ty} in DB units, or null = identity
         let shape = 0;
+        // resultCount is the sentinel here, not the counter: null means "no
+        // declared count, read until the next record wins". `shape` is what
+        // advances, further down the loop body.
+        // eslint-disable-next-line no-unmodified-loop-condition
         while (resultCount === null || shape < resultCount) {
             const line = take();
             if (line === null) {

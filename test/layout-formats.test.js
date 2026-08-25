@@ -1,5 +1,5 @@
 // Headless test for the GDSII/OASIS reader dispatch in gds_common.hpp: evals
-// the built gdstk_wasm.js in plain Node (no GL context needed -- this only
+// the built gds-lens-engine.js in plain Node (no GL context needed -- this only
 // exercises parseGdsToLayers's CPU half) and parses the same design saved in
 // both formats, asserting the format is sniffed from the file header and that
 // the two produce identical flattened geometry.
@@ -23,7 +23,7 @@ import { loadModule, skip } from "./wasm-build.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Stages bytes into MEMFS under an extension-less name (exactly like
-// wasm-worker.js does) so nothing but the file's own header can decide the
+// gds-lens-worker.js does) so nothing but the file's own header can decide the
 // format, and parses them.
 function parseBytes(Module, bytes) {
     Module.FS.writeFile("/input.layout", new Uint8Array(bytes));
@@ -200,7 +200,11 @@ test("describes the cell hierarchy, collapsing an AREF into one child entry", { 
 // covers both formats rather than just GDSII.
 test("parses a gzipped layout identically to the same file uncompressed", { skip }, async () => {
     const Module = await loadModule();
-    const MAX = 2 * 1024 * 1024 * 1024;  // MAX_LAYOUT_BYTES in extension.cjs
+    // A 2 GB expansion cap: generous next to any real layout, and well under
+    // the 4 GB the wasm module can address at all (see MAXIMUM_MEMORY in
+    // src/wasm/CMakeLists.txt). A host picks its own; decodeLayoutBytes only
+    // enforces whatever it is handed.
+    const MAX = 2 * 1024 * 1024 * 1024;
 
     for (const [fixture, expectedFormat] of [["sample_layout.gds", "GDSII"],
                                              ["sample_layout.oas", "OASIS"]]) {

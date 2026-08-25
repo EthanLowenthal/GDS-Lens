@@ -1,5 +1,7 @@
-# Builds gdstk + the qhull_r subset it needs + bindings.cpp into an Emscripten
-# module (gdstk_wasm.js). Must be configured with `emcmake cmake`.
+# Builds gdstk + the qhull_r subset it needs + this project's renderer into an
+# Emscripten module (gds-lens-engine.js). Must be configured with `emcmake
+# cmake`. The CMake target keeps the name gdstk_wasm; only the emitted files
+# carry the package prefix (see OUTPUT_NAME at the bottom).
 #
 # Two variants come out of this one file, selected by GDS_LENS_INLINE_WASM:
 # see the note on that option below. Configure each into its own build tree
@@ -21,14 +23,15 @@ if(NOT EMSCRIPTEN)
     message(FATAL_ERROR "Configure this project with `emcmake cmake` (Emscripten not detected).")
 endif()
 
-# gdstk itself only requires C++11, but embind (used by bindings.cpp) needs
-# C++17+; compiling everything at C++17 is fine since it's a superset.
+# gdstk itself only requires C++11, but embind (used by renderer.cpp to export
+# the module's API) needs C++17+; compiling everything at C++17 is fine since
+# it's a superset.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 99)
 
-# OFF (the default) emits gdstk_wasm.js plus a sibling gdstk_wasm.wasm, which
-# the JS fetches.
+# OFF (the default) emits gds-lens-engine.js plus a sibling
+# gds-lens-engine.wasm, which the JS fetches.
 #
 # ON embeds the binary inside the JS instead (-sSINGLE_FILE), for hosts that
 # cannot fetch it: a VS Code webview cannot reach its own asset URLs, neither
@@ -36,7 +39,18 @@ set(CMAKE_C_STANDARD 99)
 # compilation and the separate cache entry, and makes the .js
 # encoding-sensitive (see the note further down), so it is opt-in.
 option(GDS_LENS_INLINE_WASM
-    "Embed the .wasm binary inside gdstk_wasm.js instead of fetching it" OFF)
+    "Embed the .wasm binary inside gds-lens-engine.js instead of fetching it" OFF)
+
+# ON emits an ES module (gds-lens-engine.mjs, `export default createGdstkModule`)
+# rather than a classic script defining a global. That is what lets the whole
+# viewer be bundled into a single ESM file a consumer can `import` with no
+# build configuration and no sibling files to serve -- the factory becomes a
+# normal import instead of something the page has to have loaded first.
+#
+# Implies the inline binary: the point of this variant is that nothing has to
+# be fetched, so a separate .wasm would defeat it.
+option(GDS_LENS_ESM
+    "Emit an ES module (.mjs) exporting the factory, with the binary inlined" OFF)
 
 set(GDSTK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/gdstk")
 set(QHULL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/qhull")
@@ -83,7 +97,7 @@ set(QHULL_SOURCES
     "${QHULL_DIR}/src/libqhull_r/userprintf_r.c"
     "${QHULL_DIR}/src/libqhull_r/userprintf_rbox_r.c")
 
-add_executable(gdstk_wasm bindings.cpp renderer.cpp lyp_util.cpp stroke_font.cpp
+add_executable(gdstk_wasm renderer.cpp lyp_util.cpp stroke_font.cpp
     ${GDSTK_SOURCES} ${QHULL_SOURCES})
 
 target_include_directories(gdstk_wasm PRIVATE
@@ -94,9 +108,25 @@ target_include_directories(gdstk_wasm PRIVATE
 
 set_source_files_properties(${QHULL_SOURCES} PROPERTIES LANGUAGE C)
 
+# Absolute build paths otherwise end up inside the binary. There is no
+# CMAKE_BUILD_TYPE here, so NDEBUG is never defined and assert() stays live in
+# gdstk, earcut and libcxxabi -- each one embedding __FILE__, which at -O3 is
+# still the full path of the machine that compiled it. Six of those shipped in
+# the .wasm (and, embedded, in the inline payload's .js), carrying the
+# developer's home directory to anyone who ran `strings` on the package.
+#
+# Rewriting the prefix rather than defining NDEBUG, deliberately: those asserts
+# are worth keeping. This module parses untrusted layouts, and an assert turns a
+# violated invariant into a clean abort() that load-errors.js already explains,
+# instead of undefined behaviour on malformed input. This fixes the leak without
+# changing what the code does -- and makes the binary reproducible across
+# checkouts, which is a second thing worth having in a published artifact.
+get_filename_component(GDS_LENS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+
 target_compile_options(gdstk_wasm PRIVATE
     -O3
     -Wno-unused-parameter
+    -ffile-prefix-map=${GDS_LENS_ROOT}=/gds-lens
     -sUSE_ZLIB=1)
 
 target_link_options(gdstk_wasm PRIVATE
@@ -108,8 +138,9 @@ target_link_options(gdstk_wasm PRIVATE
     -sMAX_WEBGL_VERSION=2
     -sFULL_ES3=1
     # MODULARIZE without EXPORT_ES6 produces a plain global factory function
-    # (createGdstkModule), loadable from a classic <script> tag in the
-    # webview without needing type="module" + CSP changes for ES imports.
+    # (createGdstkModule), loadable from a classic <script> tag without
+    # needing type="module" + CSP changes for ES imports. The esm variant
+    # below adds EXPORT_ES6 on top, for the bundled build.
     -sMODULARIZE=1
     -sEXPORT_NAME=createGdstkModule
     -sALLOW_MEMORY_GROWTH=1
@@ -132,7 +163,11 @@ target_link_options(gdstk_wasm PRIVATE
     # headroom on top of the rest of the call chain.
     -sSTACK_SIZE=8388608)
 
-if(GDS_LENS_INLINE_WASM)
+if(GDS_LENS_ESM)
+    target_link_options(gdstk_wasm PRIVATE -sEXPORT_ES6=1)
+endif()
+
+if(GDS_LENS_INLINE_WASM OR GDS_LENS_ESM)
     # Emscripten embeds the binary as a raw binary string, which is smaller
     # than base64 but makes the file encoding-sensitive: it must be decoded as
     # UTF-8 or the binary is corrupted, surfacing as a WebAssembly CompileError
@@ -148,6 +183,21 @@ if(GDS_LENS_INLINE_WASM)
     target_link_options(gdstk_wasm PRIVATE -sSINGLE_FILE=1)
 endif()
 
+# .mjs for the ES module build so Node and every bundler treat it as one
+# regardless of the nearest package.json's "type".
+if(GDS_LENS_ESM)
+    set(GDS_LENS_SUFFIX ".mjs")
+else()
+    set(GDS_LENS_SUFFIX ".js")
+endif()
+
+# Named for the package rather than for gdstk. These files get copied into a
+# consumer's web root, often alongside their own assets, so every name in the
+# payload is prefixed -- "gdstk_wasm.js" beside someone else's build output is
+# asking for a collision. Emscripten bakes the .wasm filename into the .js, so
+# setting OUTPUT_NAME moves both together. (The factory *global* stays
+# createGdstkModule: it is distinctive enough not to clash, and it says what
+# the module actually is.)
 set_target_properties(gdstk_wasm PROPERTIES
-    OUTPUT_NAME "gdstk_wasm"
-    SUFFIX ".js")
+    OUTPUT_NAME "gds-lens-engine"
+    SUFFIX "${GDS_LENS_SUFFIX}")

@@ -9,7 +9,7 @@
 // missing or misnamed script in the payload fails here and nowhere else.
 //
 // Runs once per built payload, because the two differ in exactly this: the
-// dist/web build's Worker has to locate and fetch a separate gdstk_wasm.wasm
+// dist/web build's Worker has to locate and fetch a separate gds-lens-engine.wasm
 // from inside a blob: URL, which nothing else exercises.
 //
 // Skipped for payloads that have not been built (npm run build).
@@ -30,10 +30,10 @@ test(`the ${variant?.name ?? "web"} payload loads a layout as a plain web page`,
             if (req.url().endsWith(".wasm")) wasmFetches.push(req.url());
         });
 
-        await page.goto(`http://127.0.0.1:${port}/viewer.html?src=sample_layout.gds`);
+        await page.goto(`http://127.0.0.1:${port}/gds-lens.html?src=sample_layout.gds`);
 
         // The host has to install itself before viewer.js reads it. This is
-        // exactly what broke when host.js was left out of the payload.
+        // exactly what broke when gds-lens-host.js was left out of the payload.
         assert.ok(await page.evaluate(() => typeof window.gdsLensHost === "object"),
                   "window.gdsLensHost was never installed");
 
@@ -96,7 +96,7 @@ test(`the ${variant?.name ?? "web"} payload loads a layout as a plain web page`,
         // wrong CMake tree, which otherwise still loads and looks fine.
         if (variant.separateWasm) {
             assert.ok(wasmFetches.length > 0,
-                "the web payload should fetch gdstk_wasm.wasm rather than embed it");
+                "the web payload should fetch gds-lens-engine.wasm rather than embed it");
             // Two instantiations, main thread and Worker; the Worker's is the
             // one that needs locateFile, since it runs from a blob: URL with
             // no directory of its own to resolve against.

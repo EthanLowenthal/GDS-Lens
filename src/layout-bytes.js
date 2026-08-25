@@ -3,23 +3,22 @@
 // the webview, the parse Worker, the wasm module's own GDSII/OASIS sniffing --
 // sees exactly what an uncompressed file would have produced.
 //
-// Expanding in the extension host rather than in the webview or the wasm module
-// is a memory decision. The viewer's entire size budget is the 32-bit wasm heap:
-// the file's bytes and the flattened geometry built from them both have to fit
-// in 4 GB (see DEVELOPING.md), and that heap is the one address space that can
-// least afford a second full copy of the file. The host has no such ceiling, so
-// doing it here spends the compressed copy and the decompressor's scratch space
-// where they cost nothing, and hands the wasm side a single buffer.
+// Expanding out here rather than inside the wasm module is a memory decision.
+// The viewer's entire size budget is the 32-bit wasm heap: the file's bytes and
+// the flattened geometry built from them both have to fit in 4 GB (see "Limits"
+// in README.md), and that heap is the one address space that can least afford a
+// second full copy of the file. JavaScript has no such ceiling, so doing it
+// here spends the compressed copy and the decompressor's scratch space where
+// they cost nothing, and hands the wasm side a single buffer.
 //
 // Built on the platform's DecompressionStream rather than Node's zlib, so the
-// same code runs in the desktop extension host and in the Web Worker extension
-// host vscode.dev uses (see "Running on the web" in DEVELOPING.md). That makes
-// expansion async, which is the one shape change from the zlib version; it also
+// same code runs in a browser, a Worker and Node unchanged. That makes
+// expansion async, which is the one shape change from a zlib version; it also
 // makes the size cap ours to enforce, since there is no `maxOutputLength` to
 // hand off to -- that's what the running total in gunzip() is for.
 //
-// Standalone, no imports, with a module.exports tail -- the same shape as
-// marker-parsers.js and load-errors.js, so the tests can require() it directly.
+// No imports, no DOM and no wasm, the same shape as marker-parsers.js and
+// load-errors.js. Published on its own as `gds-lens/layout-bytes`.
 "use strict";
 
 // gzip's magic number: RFC 1952's ID1/ID2. Detection is by content rather than
@@ -107,7 +106,7 @@ async function gunzip(bytes, cap) {
 // Uncompressed layout bytes, whatever the input was.
 //
 //   { ok: true,  bytes, gzipped, storedSize }
-//   { ok: false, reason: "too-large" | "corrupt", storedSize, detail }
+//   { ok: false, reason: "too-large" | "corrupt", storedSize, limit, detail }
 //
 // Not-gzipped input is passed straight back, untouched and uncopied, so the
 // ordinary path costs one two-byte comparison. maxBytes caps what a compressed
@@ -120,8 +119,8 @@ async function decodeLayoutBytes(bytes, maxBytes) {
     if (!looksGzipped(bytes)) return { ok: true, bytes: bytes, gzipped: false, storedSize: null };
 
     const storedSize = gzipStoredSize(bytes);
+    const cap = Number.isFinite(maxBytes) ? maxBytes : Infinity;
     try {
-        const cap = Number.isFinite(maxBytes) ? maxBytes : Infinity;
         return { ok: true, bytes: await gunzip(bytes, cap), gzipped: true, storedSize: storedSize };
     } catch (err) {
         // The `tooLarge` flag is the cap above being hit -- the one failure here
@@ -132,6 +131,10 @@ async function decodeLayoutBytes(bytes, maxBytes) {
             ok: false,
             reason: err && err.tooLarge ? "too-large" : "corrupt",
             storedSize: storedSize,
+            // Reported back rather than left for the caller to remember: it is
+            // the one number a "too large" message needs, and the caller that
+            // passed it is not always the one wording the failure.
+            limit: cap,
             detail: err && err.message ? err.message : String(err)
         };
     }

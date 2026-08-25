@@ -1,10 +1,10 @@
 // Turns the engine-level failures a layout load can hit into text a layout
-// engineer can act on. This is a standalone script (no imports) loaded three
-// ways, following the same pattern as marker-parsers.js: the webview pulls it
-// in via a <script> tag, the parse Worker gets it prepended into its bundle
-// (see extension.cjs -- the Worker is a separate script context that can't
-// import from the main thread), and Node unit tests require() it via the
-// module.exports tail.
+// engineer can act on.
+//
+// Imported by both sides of the load: the main thread (viewer.js) and the
+// parse Worker, which are separate script contexts and each get their own
+// copy through the bundler. No imports of its own, and no DOM or wasm, so
+// Node unit tests import it directly too.
 //
 // Running out of room in the wasm heap surfaces as one of a handful of
 // unhelpful strings depending on which allocation happened to be the one that
@@ -34,4 +34,31 @@ function isOutOfMemory(err) {
     return OOM_PATTERN.test(err && err.message ? err.message : String(err));
 }
 
-export { describeLoadFailure, isOutOfMemory };
+// Wording for a failed gzip expansion (the {ok:false} half of what
+// decodeLayoutBytes returns; see layout-bytes.js, which deliberately leaves
+// the prose to its caller).
+//
+// The two reasons need different things said. "too-large" is about this
+// machine: the file is fine, there is nowhere to put it, and the number worth
+// quoting is the limit. "corrupt" is about the file: it is truncated or was
+// written by something that stopped halfway, and no limit would have helped.
+function describeDecodeFailure(result) {
+    if (!result || result.ok) return "";
+    if (result.reason === "too-large") {
+        const gb = (result.limit / (1024 * 1024 * 1024)).toFixed(1);
+        const claimed = result.storedSize
+            ? ` The file's own trailer claims ${(result.storedSize / (1024 * 1024)).toFixed(0)} MB uncompressed.`
+            : "";
+        return "This compressed layout is too large to expand.\n\n"
+            + `Expanding stopped at the ${gb} GB limit.${claimed} The viewer parses `
+            + "layouts in a 32-bit WebAssembly module, so the expanded file and the "
+            + "geometry built from it both have to fit in one 4 GB address space. "
+            + "An uncompressed copy of the same design will not help; a design that "
+            + "reuses cells rather than flattening them will.";
+    }
+    return "This layout looks gzipped, but the compressed data could not be read.\n\n"
+        + "Usually a truncated or half-written file -- a copy that was interrupted, "
+        + `or a download that stopped early. (${result.detail})`;
+}
+
+export { describeLoadFailure, isOutOfMemory, describeDecodeFailure };

@@ -284,7 +284,10 @@
                            color: var(--fg-dim); border-bottom: 1px solid var(--border); }
         #hierarchyTitle { flex: 1; }
         #hierarchyCount { color: var(--fg-faint); }
-        #hierarchyHide { cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        /* Same icon-only treatment as #staleDismiss: a real button, styled
+           back down to the bare glyph it was before. */
+        #hierarchyHide { background: none; border: 0; font: inherit; color: inherit;
+                         cursor: pointer; opacity: 0.7; padding: 0 2px; }
         #hierarchyHide:hover { opacity: 1; }
         #hierarchyTree { flex: 1; overflow: auto; padding: 4px 0 8px; }
         /* One row per node. The whole row frames its cell on click, so it's
@@ -320,7 +323,11 @@
         /* The closed row. Styled like a tree row rather than like the panel
            header, because that's what it is: something you click to open. */
         #hierarchyFindToggle { display: flex; align-items: center; gap: 4px; padding: 3px 8px;
-                               color: var(--fg-dim); cursor: pointer; white-space: nowrap; }
+                               color: var(--fg-dim); cursor: pointer; white-space: nowrap;
+                               /* A <button> now, for keyboard and screen readers: reset the
+                                  chrome and let it fill the row as the div did. */
+                               width: 100%; background: none; border: 0; font: inherit;
+                               text-align: left; }
         #hierarchyFindToggle:hover { background: var(--surface); color: var(--fg); }
         #hierarchyFindTwisty { flex: none; width: 12px; text-align: center; color: var(--fg-faint); }
         #hierarchyFindLabel { flex: none; }
@@ -408,8 +415,14 @@
         #staleBanner button.secondary { background: transparent; border-color: transparent;
                                         color: var(--warn-fg-dim); padding: 3px 6px; }
         #staleBanner button.secondary:hover { background: transparent; color: var(--warn-btn-fg); text-decoration: underline; }
-        #staleDismiss { cursor: pointer; opacity: 0.7; padding: 0 2px; }
-        #staleDismiss:hover { opacity: 1; }
+        /* An icon-only control: a real <button> for keyboard and screen
+           readers, styled back down to bare text. The reset is explicit
+           because #staleBanner button above is more specific than an id on its
+           own and would otherwise give this the Reload button's chrome. */
+        #staleBanner button#staleDismiss { background: none; border: 0; border-radius: 0;
+                                           font: inherit; color: inherit; cursor: pointer;
+                                           opacity: 0.7; padding: 0 2px; }
+        #staleBanner button#staleDismiss:hover { background: none; opacity: 1; }
         #loadingOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; font-family: monospace; color: var(--fg-dim); background: var(--bg); z-index: 30; }
         #loadingOverlay.hidden { display: none; }
         #loadingBarTrack { width: 320px; height: 8px; background: var(--surface); border-radius: 4px; overflow: hidden; }
@@ -447,3 +460,10 @@
         #debugLog .err { color: var(--log-err); }
         #debugToggleBtn { position: absolute; bottom: 8px; left: 8px; z-index: 41; font-family: monospace; font-size: 10px; background: var(--surface); color: var(--fg-dim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 8px; cursor: pointer; opacity: 0.6; }
         #debugToggleBtn:hover { opacity: 1; }
+
+        /* The progress bars are the only motion in the viewer. Someone who has
+           asked the OS for less of it still needs the bar to show progress --
+           so it still moves, it just stops easing there. */
+        @media (prefers-reduced-motion: reduce) {
+            #loadingBarFill, #reloadBarFill { transition: none; }
+        }

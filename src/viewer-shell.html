@@ -1,24 +1,31 @@
 <!-- lil-gui mounts its panel here rather than at document.body, so the
      whole control surface lives inside the shadow root. -->
 <div id="guiHost"></div>
-    <div id="loadingOverlay">
+    <div id="loadingOverlay" role="status" aria-live="polite">
         <div id="loadingBarTrack"><div id="loadingBarFill"></div></div>
         <div id="loadingPhase">Loading layout...</div>
         <div id="loadingPercent"></div>
     </div>
-    <div id="loadError"></div>
-    <div id="reloadProgress" class="hidden">
+    <!-- role="alert" rather than a polite live region: this replaces the
+         view entirely, so it is the only thing left to read. -->
+    <div id="loadError" role="alert"></div>
+    <div id="reloadProgress" class="hidden" role="status" aria-live="polite">
         <div id="reloadBarTrack"><div id="reloadBarFill"></div></div>
         <div id="reloadLabel">Reloading...</div>
     </div>
-    <div id="staleBanner" class="hidden">
+    <div id="staleBanner" class="hidden" role="status">
         <span id="staleText">A newer version of this file is on disk.</span>
         <button id="staleReloadBtn" type="button">Reload</button>
         <button id="staleAlwaysBtn" type="button" class="secondary"
                 title="Reload now, and automatically whenever this file changes from now on">Always</button>
-        <span id="staleDismiss" title="Dismiss until the next change">✕</span>
+        <button id="staleDismiss" type="button" class="icon-only"
+                aria-label="Dismiss until the next change"
+                title="Dismiss until the next change">✕</button>
     </div>
-    <canvas id="glCanvas"></canvas>
+    <!-- tabindex so the keyboard handlers in viewer.js are reachable without
+         a pointer; labelled because a bare <canvas> announces nothing. -->
+    <canvas id="glCanvas" tabindex="0" role="img"
+            aria-label="Layout view. Drag to pan, scroll to zoom."></canvas>
 
     <!-- Cell hierarchy: rows are built by renderHierarchy in viewer.js from
          the tree parseGdsToLayers hands back, lazily as branches open. -->
@@ -26,7 +33,9 @@
         <div id="hierarchyHeader">
             <span id="hierarchyTitle">Hierarchy</span>
             <span id="hierarchyCount"></span>
-            <span id="hierarchyHide" title="Hide the hierarchy tree (H)">✕</span>
+            <button id="hierarchyHide" type="button" class="icon-only"
+                aria-label="Hide the hierarchy tree"
+                title="Hide the hierarchy tree (H)">✕</button>
         </div>
         <!-- Find (see the search block in viewer.js): one box over two
              haystacks, the design's cell names and its own TEXT labels.
@@ -38,28 +47,30 @@
              of the thing being browsed. "/" opens it and lands in the box, so
              the fold costs nothing to whoever is actually searching. -->
         <div id="hierarchyFind">
-            <div id="hierarchyFindToggle"
+            <button id="hierarchyFindToggle" type="button"
+                 aria-expanded="false" aria-controls="hierarchySearch"
                  title="Find a cell by name, or a label by its text (/)">
                 <span id="hierarchyFindTwisty">▸</span>
                 <span id="hierarchyFindLabel">Find</span>
                 <span id="hierarchySearchCount"></span>
-            </div>
+            </button>
             <div id="hierarchySearch" class="hidden">
                 <input id="hierarchySearchInput" type="text" placeholder="cell name"
                        spellcheck="false" autocomplete="off"
                        title="Find a cell by name, or a label by its text (/ focuses this box)">
                 <div id="hierarchyScope">
-                    <button id="hierarchyScopeCells" type="button"
+                    <button id="hierarchyScopeCells" type="button" aria-pressed="true"
                             title="Search the design's cell names">Cells</button>
-                    <button id="hierarchyScopeLabels" type="button"
+                    <button id="hierarchyScopeLabels" type="button" aria-pressed="false"
                             title="Search the layout's own TEXT labels">Labels</button>
                 </div>
             </div>
         </div>
-        <div id="hierarchyTree"></div>
-        <div id="hierarchyResults" class="hidden"></div>
+        <div id="hierarchyTree" role="tree" aria-label="Cell hierarchy"></div>
+        <div id="hierarchyResults" class="hidden" role="listbox" aria-label="Search results"></div>
     </div>
     <button id="hierarchyShowBtn" type="button" class="hidden"
+            aria-expanded="false" aria-controls="hierarchyPanel"
             title="Show the design's cell hierarchy (H)">Hierarchy</button>
 
     <div id="debugPanel" class="hidden">
@@ -73,10 +84,11 @@
             <div id="debugLog"></div>
         </div>
     </div>
-    <button id="debugToggleBtn" type="button">Debug tools</button>
+    <button id="debugToggleBtn" type="button"
+            aria-expanded="false" aria-controls="debugPanel">Debug tools</button>
 
     <div id="viewReadout">
-        <div id="copyToast" class="hidden"></div>
+        <div id="copyToast" class="hidden" role="status" aria-live="polite"></div>
         <div id="scaleContainer">
             <div id="scaleLabel">0 μm</div>
             <div id="scaleBar" style="width: 100px;"></div>

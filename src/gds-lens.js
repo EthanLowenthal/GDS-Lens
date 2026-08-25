@@ -8,7 +8,7 @@
 
 import { setMountTarget } from "./mount-target.js";
 
-// True only in the inline-wasm payload, where gdstk_wasm.js carries the ~400KB
+// True only in the inline-wasm payload, where gds-lens-engine.js carries the ~400KB
 // wasm binary inline as a raw string -- 66,000-odd non-ASCII bytes. A <script
 // src> with no charset of its own is decoded using the *document's* encoding,
 // so on a page that does not declare UTF-8 those bytes are mangled and the
@@ -38,12 +38,24 @@ function warnIfNotUtf8() {
     }
 }
 
-// One viewer per page for now. renderer.cpp holds its state (GL program, VAO,
-// uniform locations, camera, layer table) in file-scope globals, so a second
-// element cannot share the module and would silently fight the first over the
-// same state. Refusing it with a visible message is the honest failure until
-// that state is threaded through a context.
+// One viewer at a time. renderer.cpp holds its state (GL program, VAO, uniform
+// locations, camera, layer table) in file-scope globals, so two live elements
+// cannot share the module and would silently fight over the same state.
+// Refusing the second with a visible message is the honest failure until that
+// state is threaded through a context.
+//
+// "At a time" rather than "per page load", though: the element that holds the
+// claim gives it up when it leaves the DOM, and the next one to connect gets
+// the existing engine moved into it. Without that, a framework re-render or an
+// SPA route change -- anything that recreates the node -- left every
+// subsequent <gds-lens> permanently refusing, since the engine's module body
+// had already run and could not run again.
 let mounted = null;
+
+// The loaded engine module, kept across mounts. Populated on the first mount
+// and never torn down: it owns the wasm instance and the GL context, and a
+// module body cannot be re-run.
+let engine = null;
 
 export class GdsLens extends HTMLElement {
     #ready = null;
@@ -53,7 +65,12 @@ export class GdsLens extends HTMLElement {
             this.#refuse();
             return;
         }
-        if (this.#ready) return;   // moved in the DOM, not a fresh mount
+        // Moved in the DOM rather than recreated: this element still owns its
+        // own shadow tree, so there is nothing to redo.
+        if (this.#ready) {
+            mounted = this;
+            return;
+        }
         mounted = this;
         warnIfNotUtf8();
         this.#ready = this.#mount();
@@ -66,19 +83,26 @@ export class GdsLens extends HTMLElement {
     }
 
     async #mount() {
+        // Already running from an earlier element: move it here rather than
+        // building a second engine, which is not possible.
+        if (engine) {
+            engine.adopt(this);
+            return engine.viewer;
+        }
         setMountTarget(this);
         // Deferred on purpose: this is what pulls in the engine, instantiates
         // the wasm module and creates the GL context.
-        const { viewer } = await import("./viewer.js");
-        return viewer;
+        engine = await import("./viewer.js");
+        return engine.viewer;
     }
 
     #refuse() {
         console.error(
-            "[GDS] only one <gds-lens> can be active per page: the renderer keeps " +
-            "its state in module-scope globals, so a second one would fight the first."
+            "[GDS] only one <gds-lens> can be active at a time: the renderer keeps " +
+            "its state in module-scope globals, so a second one would fight the first. " +
+            "Remove the first from the DOM and this one will take over its engine."
         );
-        this.textContent = "Only one <gds-lens> is supported per page.";
+        this.textContent = "Only one <gds-lens> is supported at a time.";
     }
 
     // Resolves once the engine has mounted, so callers can await readiness
@@ -113,6 +137,15 @@ export class GdsLens extends HTMLElement {
 
     async showError(message) {
         return (await this.ready).showError(message);
+    }
+
+    // Releases the claim without tearing anything down. The element is very
+    // often coming straight back -- React and friends recreate the node on
+    // re-render -- and discarding the wasm instance and GL context only to
+    // rebuild them a tick later would be far worse than holding them. The
+    // engine stays up; the next element to connect adopts it.
+    disconnectedCallback() {
+        if (mounted === this) mounted = null;
     }
 
     static get observedAttributes() {

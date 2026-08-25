@@ -1,6 +1,11 @@
 import { rankCellMatches, cellPathToTarget } from "./cell-search.js";
 import { parseMarkerFile, flattenMarkerModel } from "./marker-parsers.js";
-import { describeLoadFailure } from "./load-errors.js";
+import { describeLoadFailure, describeDecodeFailure } from "./load-errors.js";
+import { decodeLayoutBytes, looksGzipped } from "./layout-bytes.js";
+// Resolved by the build to engine-source.js (the served payloads) or
+// engine-source.esm.js (the bundled module). A bare specifier because
+// esbuild's alias only rewrites those, not relative paths.
+import { loadGdstkFactory, workerBundle } from "gds-lens:engine";
 // Inlined at build time (esbuild's text loader), because a component has to
 // carry its own markup and styles: there is no separate document for a host
 // page to load them from.
@@ -19,15 +24,15 @@ import viewerCss from "./viewer.css";
 import GUI from "lil-gui";
 import guiCss from "lil-gui-css";
 
-// Thin bootstrap: instantiate the wasm module and relay postMessage payloads
-// from the extension host into it. JS never touches GDS/GL data -- that all
-// lives in wasm/renderer.cpp (GL context + shaders + camera + input) and
-// wasm/bindings.cpp (gdstk GDSII/OASIS parsing), which attach directly to
-// #glCanvas and the DOM themselves. The control surface (load .lyp button +
-// per-layer visibility toggles) is built with lil-gui
-// (vendor/lil-gui.umd.min.js).
+// Thin bootstrap: instantiate the wasm module and relay what the host hands in
+// into it. JS never touches GDS/GL data -- that all lives in
+// wasm/renderer.cpp (gdstk GDSII/OASIS parsing, GL context, shaders, camera
+// and input), which attaches to #glCanvas and the shadow root itself. The
+// control surface (load .lyp button + per-layer visibility toggles) is built
+// with lil-gui, a real dependency (see the import above).
 //
-// Loading a layout file is split across a Worker (see wasm-worker.js) and this
+// Loading a layout file is split across a Worker (see wasm-worker.js, shipped
+// as gds-lens-worker.js) and this
 // main-thread module: the Worker instantiates its own copy of the same wasm
 // module and runs parseGdsToLayers() (parse + flatten + triangulate, no
 // GL/DOM) so the canvas/lil-gui panel stay responsive on very large files,
@@ -42,40 +47,52 @@ import guiCss from "lil-gui-css";
 // The element is handed over by <gds-lens>'s connectedCallback (gds-lens.js),
 // which is what defers everything in this module until one connects. The
 // fallbacks keep the payload usable when it is loaded as a plain page.
-const hostElement = takeMountTarget() || document.querySelector("gds-lens") ||
+let hostElement = takeMountTarget() || document.querySelector("gds-lens") ||
     document.body.appendChild(document.createElement("gds-lens"));
-const shadow = hostElement.shadowRoot || hostElement.attachShadow({ mode: "open" });
+let shadow = hostElement.shadowRoot || hostElement.attachShadow({ mode: "open" });
 shadow.innerHTML = `<style>${guiCss}</style><style>${viewerCss}</style>${shellHtml}`;
 
 // Every lookup is scoped to the shadow root. ShadowRoot is a DocumentFragment,
 // which implements NonElementParentNode, so getElementById works on it exactly
 // as on a document.
-const viewerRoot = shadow;
+let viewerRoot = shadow;
 
 // The element carrying the viewer's state classes (theme-light, debug,
 // hierarchy-open, ...), which viewer.css selects on. The host element rather
 // than the shadow root, because a DocumentFragment is not an element and
 // cannot carry classes -- and because :host() then lets a page theme the
 // viewer from outside.
-const rootEl = hostElement;
+let rootEl = hostElement;
 
 // Resolved in one pass at startup rather than one lookup per element. All of
-// these are static in viewer.html (nothing below creates an element with an
-// id), and this script is the last tag in <body>, so the tree is fully parsed
-// by the time this runs. A missing element yields undefined rather than null,
-// which the falsy guards throughout this file already handle: a webview still
-// holding stale HTML from before a panel existed must not throw and abort the
-// rest of setup.
+// these are static in viewer-shell.html (nothing below creates an element with
+// an id), and the shell is injected into the shadow root just above, so the
+// tree is fully built by the time this runs. A missing element yields
+// undefined rather than null, which the falsy guards throughout this file
+// already handle: a host still holding stale HTML from before a panel existed
+// must not throw and abort the rest of setup.
 const els = Object.fromEntries(
     Array.from(viewerRoot.querySelectorAll("[id]"), (el) => [el.id, el])
 );
 
-// On-screen debug log (see #debugPanel in viewer.html): mirrors every
-// console.log/error call here, plus 'gdsLog' messages relayed from the
-// Worker (which has no DOM of its own to render into), so debugging doesn't
-// depend on getting the right DevTools window attached to the right webview
-// -- the log is just selectable text in the page itself.
+// On-screen debug log (see #debugPanel in viewer-shell.html): the viewer's own
+// trace output, plus 'gdsLog' messages relayed from the Worker (which has no
+// DOM of its own to render into), so debugging doesn't depend on getting the
+// right DevTools window attached to the right frame -- the log is just
+// selectable text in the page itself.
+//
+// This used to be done by assigning window.console.log/error. It cannot be:
+// this is a component in someone else's page, and replacing a global the host
+// owns means the host's own logging appends to our panel for the life of the
+// page (growing a detached <div> forever once the element is removed), with no
+// way to opt out. Everything here routes through trace()/fail() instead, and
+// the host's console is left exactly as we found it.
 const debugLogEl = els.debugLog;
+
+// A long-lived page can log a lot. The panel is a debugging aid, not a
+// transcript, so old lines are dropped rather than retained forever.
+const MAX_DEBUG_LINES = 500;
+
 function safeStringify(arg) {
     if (typeof arg === "string") return arg;
     if (arg instanceof Error) return arg.stack || arg.message;
@@ -91,18 +108,38 @@ function appendDebugLine(text, isError) {
     if (isError) line.className = "err";
     line.textContent = `[${new Date().toISOString().slice(11, 23)}] ${text}`;
     debugLogEl.appendChild(line);
+    while (debugLogEl.childElementCount > MAX_DEBUG_LINES) {
+        debugLogEl.removeChild(debugLogEl.firstElementChild);
+    }
     debugLogEl.scrollTop = debugLogEl.scrollHeight;
 }
-const originalConsoleLog = console.log.bind(console);
-const originalConsoleError = console.error.bind(console);
-console.log = (...args) => {
-    originalConsoleLog(...args);
+
+// Opt-in, because the breadcrumbs below are useful when a load misbehaves and
+// noise on every successful one. `debug` on the element covers an embedder
+// driving the component; ?gdsDebug=1 covers a plain page where the markup
+// isn't the reader's to edit.
+const debugRequested = () => {
+    if (rootEl && rootEl.hasAttribute && rootEl.hasAttribute("debug")) return true;
+    try {
+        return new URLSearchParams(location.search).get("gdsDebug") === "1";
+    } catch {
+        return false;
+    }
+};
+const traceToConsole = debugRequested();
+
+// Breadcrumbs: the panel always, the host's console only when asked.
+function trace(...args) {
     appendDebugLine(args.map(safeStringify).join(" "), false);
-};
-console.error = (...args) => {
-    originalConsoleError(...args);
+    if (traceToConsole) console.log(...args);
+}
+
+// Failures: the panel and the console, always. These are the lines that
+// explain a blank viewer, so they are never gated behind a flag.
+function fail(...args) {
     appendDebugLine(args.map(safeStringify).join(" "), true);
-};
+    console.error(...args);
+}
 // Null-guarded: a missing element here (e.g. a webview still holding stale
 // HTML from before this panel existed) must not throw and abort the rest of
 // this script -- everything below, including the window "message" listener
@@ -111,7 +148,8 @@ const debugPanelEl = els.debugPanel;
 const debugToggleBtn = els.debugToggleBtn;
 if (debugToggleBtn && debugPanelEl) {
     debugToggleBtn.addEventListener("click", () => {
-        debugPanelEl.classList.toggle("hidden");
+        const open = debugPanelEl.classList.toggle("hidden") === false;
+        debugToggleBtn.setAttribute("aria-expanded", String(open));
     });
 }
 const debugCopyBtn = els.debugCopyBtn;
@@ -119,11 +157,11 @@ if (debugCopyBtn) {
     debugCopyBtn.addEventListener("click", () => {
         const text = debugLogEl ? debugLogEl.innerText : "";
         navigator.clipboard.writeText(text).then(
-            () => console.log("[GDS] debug log copied to clipboard"),
+            () => trace("[GDS] debug log copied to clipboard"),
             (err) => {
                 // Clipboard API can be blocked in a sandboxed webview -- fall back
                 // to selecting the text so the user can Cmd/Ctrl+C manually.
-                console.error("[GDS] clipboard write failed, select-all instead:", err);
+                fail("[GDS] clipboard write failed, select-all instead:", err);
                 if (!debugLogEl) return;
                 const range = document.createRange();
                 range.selectNodeContents(debugLogEl);
@@ -135,13 +173,13 @@ if (debugCopyBtn) {
     });
 }
 
-console.log("[GDS] viewer.js starting to execute");
+trace("[GDS] viewer.js starting to execute");
 
 window.onerror = (msg, url, line, col, err) => {
-    console.error("[GDS] window.onerror:", msg, "at", url + ":" + line + ":" + col, err && err.stack);
+    fail("[GDS] window.onerror:", msg, "at", url + ":" + line + ":" + col, err && err.stack);
 };
 window.addEventListener("unhandledrejection", (event) => {
-    console.error("[GDS] unhandled promise rejection on main thread:", event.reason);
+    fail("[GDS] unhandled promise rejection on main thread:", event.reason);
 });
 
 // Everything this file needs from whatever is embedding it. hosts/browser.js
@@ -151,12 +189,14 @@ window.addEventListener("unhandledrejection", (event) => {
 const host = (typeof window !== "undefined" && window.gdsLensHost) || {};
 // A host that never arrived is the one failure that looks like nothing at all:
 // with no connect() there is nobody to hand a layout in, so the page sits on
-// its loading bar forever with an empty log. Nearly always a host.js that did
+// its loading bar forever with an empty log. Nearly always a gds-lens-host.js
+// that did
 // not load (a 404, or a CSP that blocked it), so say that plainly rather than
 // leaving the bar to be interpreted.
 if (!window.gdsLensHost) {
-    console.error(
-        "[GDS] no window.gdsLensHost -- host.js did not load or did not run. " +
+    fail(
+        "[GDS] no window.gdsLensHost -- gds-lens-host.js did not load or did not " +
+        "run. " +
         "Nothing can drive the viewer, so no layout will ever appear."
     );
 }
@@ -165,7 +205,7 @@ if (!window.gdsLensHost) {
 // the embedder does not offer it, and the control for it is hidden.
 const hostCan = (name) => typeof host[name] === "function";
 const hostCall = (name, ...args) => (hostCan(name) ? host[name](...args) : undefined);
-console.log("[GDS] host ready, typeof createGdstkModule:", typeof createGdstkModule, "typeof lil:", typeof lil, "typeof Worker:", typeof Worker, "typeof Blob:", typeof Blob);
+trace("[GDS] host ready; Worker:", typeof Worker, "Blob:", typeof Blob, "bundled worker:", !!workerBundle);
 
 // container: the panel belongs inside the shadow root, not at document level.
 // injectStyles: false: lil-gui otherwise appends its stylesheet to
@@ -248,7 +288,7 @@ const modeButtons = new Map();
 // Built by hand instead of via gui.add(): lil-gui has no segmented-control
 // type. Reusing its own .lil-controller/.lil-name/.lil-widget classes means
 // the row picks up the panel's row metrics and theme colors for free (the
-// button styling itself lives in viewer.html).
+// button styling itself lives in viewer.css).
 const modeRow = document.createElement("div");
 modeRow.className = "lil-controller mode-row";
 const modeName = document.createElement("div");
@@ -843,6 +883,10 @@ function setHierarchyOpen(open, byUser) {
     if (byUser) hierarchyUserChoice = open;
     if (hierarchyPanel) hierarchyPanel.classList.toggle("hidden", !open);
     rootEl.classList.toggle("hierarchy-open", open);
+    // Both controls point at the same panel, so both carry its state: the
+    // class alone says nothing to a screen reader.
+    if (hierarchyShowBtn) hierarchyShowBtn.setAttribute("aria-expanded", String(open));
+    if (hierarchyHide) hierarchyHide.setAttribute("aria-expanded", String(open));
     // The outline belongs to the panel: it's the tree pointing at the layout,
     // so with the tree away it would be a dashed rectangle with nothing on
     // screen to explain it. Putting the panel away takes it down, and bringing
@@ -946,6 +990,12 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
         row.className = "hier-row";
         row.style.paddingLeft = `${6 + depth * 12}px`;
         if (!box) row.classList.add("hier-boxless");
+        // The panel is the main way around a design, so the tree is a real
+        // tree to anything reading it: depth is what the indent conveys
+        // visually, and aria-expanded is set by setExpanded below.
+        row.setAttribute("role", "treeitem");
+        row.setAttribute("aria-level", String(depth + 1));
+        if (expandable) row.setAttribute("aria-expanded", "false");
 
         const twisty = document.createElement("span");
         twisty.className = "hier-twisty";
@@ -961,6 +1011,9 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
 
         const children = document.createElement("div");
         children.className = "hier-children hidden";
+        // A treeitem's children have to sit in a group for the nesting to be
+        // reported, rather than reading as one flat list.
+        children.setAttribute("role", "group");
         container.append(row, children);
 
         let built = false;
@@ -972,6 +1025,7 @@ function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
             }
             children.classList.toggle("hidden", !open);
             twisty.textContent = open ? "▾" : "▸";
+            row.setAttribute("aria-expanded", String(open));
             if (open) hierarchyExpanded.add(path);
             else hierarchyExpanded.delete(path);
         }
@@ -1204,7 +1258,7 @@ let findRows = [];
 let findActiveIndex = -1;
 
 // Opens and closes the fold the box lives in (closed on arrival -- see the
-// markup in viewer.html). Closing clears the query rather than just hiding the
+// markup in viewer-shell.html). Closing clears the query rather than just hiding the
 // box: a result list is the answer to a question the panel would no longer be
 // showing, and leaving one up with nothing on screen to explain it is the same
 // mistake as leaving cell outlines up with the panel away.
@@ -1213,6 +1267,8 @@ function setFindOpen(open) {
     const changed = open !== findIsOpen();
     hierarchySearchBox.classList.toggle("hidden", !open);
     if (hierarchyFindTwisty) hierarchyFindTwisty.textContent = open ? "▾" : "▸";
+    // The twisty is decoration; this is what actually announces the state.
+    if (hierarchyFindToggle) hierarchyFindToggle.setAttribute("aria-expanded", String(open));
 
     if (open) {
         // Opening it is asking to type in it -- and so is asking for it again
@@ -1479,6 +1535,7 @@ function updateFindScope() {
                               hierarchyModel.cells && hierarchyModel.cells.length > 0);
     if (hierarchyScopeCells) {
         hierarchyScopeCells.classList.toggle("scope-active", findScope === "cells");
+        hierarchyScopeCells.setAttribute("aria-pressed", String(findScope === "cells"));
         hierarchyScopeCells.disabled = !cellsAvailable;
         hierarchyScopeCells.title = cellsAvailable
             ? "Search the design's cell names"
@@ -1486,6 +1543,7 @@ function updateFindScope() {
     }
     if (hierarchyScopeLabels) {
         hierarchyScopeLabels.classList.toggle("scope-active", findScope === "labels");
+        hierarchyScopeLabels.setAttribute("aria-pressed", String(findScope === "labels"));
     }
     if (hierarchySearchInput) {
         hierarchySearchInput.placeholder = findScope === "labels" ? "label text" : "cell name";
@@ -1619,7 +1677,7 @@ function renderMarkerBrowser(model) {
     markersFolder.open();
 
     if (model.warnings.length > 0) {
-        console.error("[GDS] marker warnings:", model.warnings.join(" | "));
+        fail("[GDS] marker warnings:", model.warnings.join(" | "));
         const row = markersFolder.add({ w: () => {} }, "w")
             .name(`⚠ ${model.warnings.length} warning${model.warnings.length === 1 ? "" : "s"}`);
         row.domElement.title = model.warnings.join("\n");
@@ -1771,7 +1829,7 @@ if (glCanvas && canvasMenuEl && canvasMenuCopyEl) {
                 // select-and-Ctrl-C fallback for a number that isn't on the page
                 // as selectable text, so the toast has to carry it: it stays up
                 // long enough to read and to retype.
-                console.error("[GDS] clipboard write failed for coordinate:", err);
+                fail("[GDS] clipboard write failed for coordinate:", err);
                 showCopyToast("Couldn't copy \u2014 " + text);
             }
         );
@@ -1839,10 +1897,11 @@ window.addEventListener("keydown", (event) => {
 }, true);
 
 // ---- "Newer version on disk" banner ----
-// The extension host watches the layout file and posts 'fileChanged' when it
-// changes underneath us (see the watcher in extension.cjs); this is only the
-// UI for that. Clicking Reload asks the host to re-read and re-send the file
-// as a fresh 'init' -- the webview never touches disk itself.
+// A host that watches the layout file calls viewer.showStale() when it changes
+// underneath us; this is only the UI for that. Clicking Reload calls the host's
+// requestReload(), asking it to re-read and re-send the file -- the viewer
+// never touches disk itself, and hides this banner entirely for a host that
+// implements neither (see hostCan in the host block above).
 const staleBanner = els.staleBanner;
 const staleText = els.staleText;
 const staleReloadBtn = els.staleReloadBtn;
@@ -1910,9 +1969,9 @@ function restoreViewState(Module, saved) {
 
 // ---- Named views ----
 // A view is a camera plus which layers were on -- the two halves of "how I was
-// looking at this design" -- saved under a name and kept with the layout by the
-// extension host (see NAMED_VIEWS_KEY in extension.cjs), so they're still there
-// when the file is reopened days later.
+// looking at this design" -- saved under a name and persisted by the host
+// (loadViews/saveViews on the ViewerHost; the default browser host puts them in
+// localStorage), so they're still there when the file is reopened days later.
 //
 // Deliberately not part of one: the render toggles (Infill / Text / Merge /
 // Grid). Those are a preference set once for how you like layouts drawn, not a
@@ -2069,7 +2128,7 @@ const loadError = els.loadError;
 // staring at a stalled progress bar with no explanation. The wasm side is
 // then told separately, best-effort, so it can clear any half-loaded layers.
 function showFatalError(message) {
-    console.error("[GDS] load failed:", message);
+    fail("[GDS] load failed:", message);
     loadError.textContent = "Could not open this layout\n\n" + message;
     endProgress();
     // Nothing loaded, so there's no cell tree to browse -- and leaving the
@@ -2091,6 +2150,7 @@ function clearFatalError() {
 // describeLoadFailure comes from load-errors.js (its own <script> tag).
 
 const phaseLabels = {
+    decompressing: "Decompressing layout...",
     parsing: "Parsing layout file...",
     flattening: "Flattening hierarchy...",
     triangulating: "Triangulating geometry..."
@@ -2136,7 +2196,7 @@ function updateProgress(phase, current, total) {
 // Registered synchronously (not inside the .then() below) so an 'init'
 // message that arrives before wasm instantiation finishes isn't dropped --
 // window message events aren't queued for late listeners.
-console.log("[GDS] calling createGdstkModule() on main thread...");
+trace("[GDS] resolving the wasm factory on the main thread...");
 // Synchronous handle on the same module modulePromise resolves to. The
 // 'init' handler needs to read the *current* camera/layer state before the
 // incoming parse replaces it, and a .then() would run too late for that.
@@ -2146,27 +2206,38 @@ let activeWorker = null;
 // View state captured for the in-flight reload, re-applied once its geometry
 // is uploaded. Null on a first open.
 let pendingViewState = null;
-const modulePromise = createGdstkModule({
-    // Read by dom_root() in renderer.cpp for its own element lookups. Passed
-    // in the instantiation object so it is in place before main() runs.
-    gdsLensRoot: viewerRoot,
-    preRun: [(Module) => {
-        // Emscripten resolves an event/context target by consulting
-        // specialHTMLTargets before falling back to document.querySelector,
-        // which cannot see into a shadow root. Registering the canvas under
-        // the name renderer.cpp asks for is what lets the GL context and
-        // every mouse handler bind to an element the document cannot find.
-        // preRun is the last point before main() creates that context.
-        Module.specialHTMLTargets["!gdsLensCanvas"] = viewerRoot.getElementById("glCanvas");
-    }]
+const modulePromise = loadGdstkFactory().then((createGdstkModule) => {
+    if (typeof createGdstkModule !== "function") {
+        throw new Error(
+            "gds-lens-engine.js did not load: createGdstkModule is not defined. "
+            + "In the served payload it is a classic <script> that must come "
+            + "before gds-lens.js (see gds-lens.html).");
+    }
+    return createGdstkModule({
+        // Read by dom_root() in renderer.cpp for its own element lookups.
+        // Passed in the instantiation object so it is in place before main()
+        // runs -- and re-pointed by adopt() if the viewer later moves.
+        gdsLensRoot: viewerRoot,
+        preRun: [(Module) => {
+            // Emscripten resolves an event/context target by consulting
+            // specialHTMLTargets before falling back to
+            // document.querySelector, which cannot see into a shadow root.
+            // Registering the canvas under the name renderer.cpp asks for is
+            // what lets the GL context and every mouse handler bind to an
+            // element the document cannot find. preRun is the last point
+            // before main() creates that context.
+            Module.specialHTMLTargets["!gdsLensCanvas"] =
+                viewerRoot.getElementById("glCanvas");
+        }]
+    });
 });
 modulePromise.then(
     (Module) => {
         resolvedModule = Module;
-        console.log("[GDS] main-thread createGdstkModule() resolved OK");
+        trace("[GDS] main-thread createGdstkModule() resolved OK");
     },
     (err) => {
-        console.error("[GDS] main-thread createGdstkModule() REJECTED:", err);
+        fail("[GDS] main-thread createGdstkModule() REJECTED:", err);
         // Nothing else will ever run if this fails, so this is the one place
         // the message has to come from -- showFatalError's own best-effort
         // call into the module simply no-ops on the same rejection.
@@ -2175,8 +2246,8 @@ modulePromise.then(
 );
 
 // ---- Theme ----
-// The page chrome themes itself off a `theme-light` class on <body> in CSS
-// alone (see the token block in viewer.html). What's left for JS is the half
+// The chrome themes itself off a `theme-light` class on the host element in
+// CSS alone (see the token block in viewer.css). What's left for JS is the half
 // CSS can't reach: the canvas is drawn by renderer.cpp, which owns the
 // background it clears to, the ruler/selection ink, and the fallback layer
 // palette, all three of which assume a near-black background otherwise.
@@ -2233,6 +2304,14 @@ function createParseWorker() {
     // A host that cannot serve URLs to a Worker supplies the script itself.
     if (hostCan("createWorker")) return host.createWorker();
 
+    // The bundled ESM build carries the Worker's whole script as text, because
+    // a bundled module has no siblings to fetch. See engine-source.esm.js.
+    if (workerBundle) {
+        trace("[GDS] building worker from the bundled script");
+        const blob = new Blob([workerBundle.text()], { type: "text/javascript" });
+        return new Worker(URL.createObjectURL(blob), { type: workerBundle.type });
+    }
+
     // Ordinary page: pull the two scripts in by URL. They have to be absolute
     // -- importScripts() inside a blob Worker resolves relative URLs against
     // the blob: URL rather than against the document, so bare filenames here
@@ -2246,9 +2325,57 @@ function createParseWorker() {
     // inline-wasm build, which never looks a binary up.
     const bootstrap =
         `self.gdsLensScriptBase = ${url(".")};\n` +
-        `importScripts(${url("gdstk_wasm.js")}, ${url("wasm-worker.js")});`;
-    console.log("[GDS] building worker from document-relative script URLs");
+        `importScripts(${url("gds-lens-engine.js")}, ${url("gds-lens-worker.js")});`;
+    trace("[GDS] building worker from document-relative script URLs");
     return new Worker(URL.createObjectURL(new Blob([bootstrap], { type: "application/javascript" })));
+}
+
+// ---- Moving the viewer to a new host element ----
+// This module's body runs once and cannot be re-run: it holds the GL context,
+// the wasm module and lil-gui's bindings. So when the element is removed and a
+// different one appears -- a framework re-render, an SPA route change -- the
+// answer is to move the viewer into the new element rather than to stand up a
+// second engine, which is impossible anyway.
+//
+// Three things make the move cheap. A <canvas> keeps its WebGL context when it
+// moves in the DOM. Listeners live on nodes, so everything bound inside the
+// shadow tree comes along. And renderer.cpp reads its DOM root from
+// Module.gdsLensRoot on every lookup rather than caching it (see dom_root), so
+// re-pointing that property is all the C++ side needs.
+const adoptCallbacks = new Set();
+
+function adopt(element) {
+    if (!element || element === hostElement) return;
+    const next = element.shadowRoot || element.attachShadow({ mode: "open" });
+
+    // The state classes belong to the viewer, not to whichever element is
+    // hosting it: viewer.css selects on them (theme-light, debug,
+    // hierarchy-open) and :host() lets a page theme through them.
+    for (const name of hostElement.classList) element.classList.add(name);
+
+    // Moved as nodes. Re-serializing through innerHTML would build fresh
+    // elements and lose the GL context, every listener and lil-gui's bindings
+    // -- the whole point of moving rather than rebuilding.
+    while (shadow.firstChild) next.appendChild(shadow.firstChild);
+
+    hostElement = element;
+    rootEl = element;
+    shadow = next;
+    viewerRoot = next;
+
+    if (resolvedModule) resolvedModule.gdsLensRoot = next;
+    else modulePromise.then((Module) => { Module.gdsLensRoot = next; }).catch(() => {});
+
+    // Hosts bind to the element they were given (the default one puts
+    // drag-and-drop there), and that element is now detached. Tell them.
+    for (const callback of adoptCallbacks) {
+        try {
+            callback(element);
+        } catch (err) {
+            fail("[GDS] a host's onAdopt callback threw:", err);
+        }
+    }
+    trace("[GDS] moved the viewer into a new <gds-lens>");
 }
 
 // ---- The surface a host drives the viewer through ----
@@ -2256,14 +2383,35 @@ function createParseWorker() {
 // functions now, so the transport (VS Code's RPC, a page calling them
 // directly, a test) is the host's business rather than this file's.
 
-function loadLayout(bytes, { reload = false } = {}) {
-    console.log("[GDS] init payload: fileData byteLength =", bytes && bytes.byteLength,
+// What a compressed layout is allowed to expand to. The parse has to fit the
+// expanded file *and* the geometry built from it into one 32-bit address space
+// (see "Limits" in README.md), so a cap well inside 4 GB fails a hopeless load
+// at the cheap step instead of after a minute of parsing.
+const MAX_LAYOUT_BYTES = 2 * 1024 * 1024 * 1024;
+
+// Bytes arrive in whichever shape the caller happened to have. Normalized here
+// rather than at each entry point, because gzip is sniffed by looking at the
+// first two bytes and an ArrayBuffer has no [0] to look at -- a compressed
+// file handed over as one would sail past undetected and reach the parser
+// still gzipped.
+function asBytes(source) {
+    if (source instanceof Uint8Array) return source;
+    if (source instanceof ArrayBuffer) return new Uint8Array(source);
+    if (source && source.buffer instanceof ArrayBuffer) {
+        return new Uint8Array(source.buffer, source.byteOffset, source.byteLength);
+    }
+    return source;
+}
+
+async function loadLayout(source, { reload = false } = {}) {
+    const bytes = asBytes(source);
+    trace("[GDS] init payload: fileData byteLength =", bytes && bytes.byteLength,
                 "reload:", !!reload);
     // A reload supersedes any load still running (the file can change
     // again while a slow one is in flight) -- drop the old worker rather
     // than letting two of them race to upload geometry.
     if (activeWorker) {
-        console.log("[GDS] superseding an in-flight load");
+        trace("[GDS] superseding an in-flight load");
         activeWorker.terminate();
         activeWorker = null;
     }
@@ -2282,7 +2430,7 @@ function loadLayout(bytes, { reload = false } = {}) {
             // Nothing loaded yet, or the module is wedged -- reload as if
             // it were a first open (framed on the design) rather than
             // failing the reload outright.
-            console.error("[GDS] could not capture view state, reloading framed:", err);
+            fail("[GDS] could not capture view state, reloading framed:", err);
         }
     }
 
@@ -2291,16 +2439,34 @@ function loadLayout(bytes, { reload = false } = {}) {
     // an empty viewport behind a hairline bar reads as a hung viewer.
     beginProgress(pendingViewState !== null);
 
+    // Gzip comes off here rather than inside the wasm module. Detection is by
+    // magic number, not by filename, so a ".gds" that is secretly gzipped
+    // opens too -- which is how these arrive out of some flows. Doing it on
+    // this side also keeps a second full copy of the file out of the 32-bit
+    // heap, which is the one address space that can least afford it.
+    let parseBytes = bytes;
+    if (looksGzipped(bytes)) {
+        updateProgress("decompressing", 0, 0);
+        const decoded = await decodeLayoutBytes(bytes, MAX_LAYOUT_BYTES);
+        if (!decoded.ok) {
+            fail(`[GDS] gzip expansion failed (${decoded.reason}):`, decoded.detail);
+            showFatalError(describeDecodeFailure(decoded));
+            return;
+        }
+        trace("[GDS] expanded gzip:", bytes.byteLength, "->", decoded.bytes.byteLength, "bytes");
+        parseBytes = decoded.bytes;
+    }
+
     let worker;
     try {
         worker = createParseWorker();
-        console.log("[GDS] new Worker() constructor returned OK");
+        trace("[GDS] new Worker() constructor returned OK");
     } catch (err) {
-        console.error("[GDS] failed to build/start worker:", err);
+        fail("[GDS] failed to build/start worker:", err);
         showFatalError(`Failed to create worker: ${err.message || err}`);
         return;
     }
-    startWorker(worker, bytes);
+    startWorker(worker, parseBytes);
 }
 
 function applyLyp(name, text) {
@@ -2319,7 +2485,7 @@ function applyMarkers(name, text) {
             // see marker-parsers.js, loaded via its own <script> tag.
             model = parseMarkerFile(text, DOMParser);
         } catch (err) {
-            console.error("[GDS] marker parse failed:", err);
+            fail("[GDS] marker parse failed:", err);
             removeMarkerBrowser();
             currentMarkers = null;
             Module.clearMarkers();
@@ -2364,11 +2530,25 @@ function goToPointFromHost(x, y) {
 function toggleDebug() {
     // "Toggle Debug Tools" -- show/hide the debug entry point (the button
     // that opens #debugPanel, which holds both the engine readout and the
-    // log), hidden by default, see viewer.html.
+    // log), hidden by default, see viewer-shell.html.
     rootEl.classList.toggle("debug");
 }
 
 const viewer = {
+    // The element the viewer is mounted in. A host needs it to scope anything
+    // it binds to the viewer's own surface -- drag-and-drop above all, which
+    // on `window` would preventDefault every drag in the embedding page and
+    // quietly break the host's own drop targets.
+    get element() {
+        return hostElement;
+    },
+    // Called with the new element when the viewer moves (see adopt). Returns a
+    // function that unregisters. A host that binds anything to `element` needs
+    // this, or its listeners stay on an element that is no longer in the page.
+    onAdopt(callback) {
+        adoptCallbacks.add(callback);
+        return () => adoptCallbacks.delete(callback);
+    },
     load: loadLayout,
     showError: showFatalError,
     setLyp: applyLyp,
@@ -2401,7 +2581,7 @@ Promise.resolve(hostCall("loadViews")).then((views) => {
 
 hostCall("connect", viewer);
 
-export { viewer };
+export { viewer, adopt };
 
 function startWorker(worker, fileData) {
     activeWorker = worker;
@@ -2411,11 +2591,11 @@ function startWorker(worker, fileData) {
     // since a Worker's unhandled promise rejections don't reach this
     // handler.
     worker.onerror = (err) => {
-        console.error("[GDS] worker.onerror fired:", err.message, "at", err.filename + ":" + err.lineno + ":" + err.colno, err.error);
+        fail("[GDS] worker.onerror fired:", err.message, "at", err.filename + ":" + err.lineno + ":" + err.colno, err.error);
         showFatalError(`Worker failed to start: ${err.message || err}`);
     };
     worker.onmessageerror = (err) => {
-        console.error("[GDS] worker.onmessageerror fired (structured-clone failure):", err);
+        fail("[GDS] worker.onmessageerror fired (structured-clone failure):", err);
         showFatalError("Worker message failed to deserialize -- see devtools console");
     };
     worker.onmessage = (workerEvent) => {
@@ -2426,14 +2606,14 @@ function startWorker(worker, fileData) {
             appendDebugLine("[worker] " + workerMessage.text, workerMessage.level === "error");
             return;
         }
-        // Deliberately not logging the full workerMessage here: the
+        // Deliberately logging the type and not the whole workerMessage: the
         // 'gdsResult' message carries the entire parsed geometry (every
-        // layer's outline/fill vertex arrays), and console.log is patched
-        // above to JSON.stringify + append everything it's given to
-        // #debugLog -- serializing and DOM-inserting the whole design on
-        // every load was the dominant cost of moving parsing into a Worker
-        // at all, swamping whatever the off-main-thread parse saved.
-        console.log("[GDS] main thread received worker message:", workerMessage.type);
+        // layer's outline/fill vertex arrays), and trace() JSON.stringifies
+        // whatever it is given into #debugLog -- serializing and
+        // DOM-inserting the whole design on every load was the dominant cost
+        // of moving parsing into a Worker at all, swamping whatever the
+        // off-main-thread parse saved.
+        trace("[GDS] main thread received worker message:", workerMessage.type);
         if (workerMessage.type === "gdsProgress") {
             updateProgress(workerMessage.phase, workerMessage.current, workerMessage.total);
         } else if (workerMessage.type === "gdsResult") {
@@ -2446,7 +2626,7 @@ function startWorker(worker, fileData) {
                 showFatalError(workerMessage.error);
                 return;
             }
-            console.log("[GDS] load succeeded, layer count:", workerMessage.layers.length);
+            trace("[GDS] load succeeded, layer count:", workerMessage.layers.length);
             modulePromise.then((Module) => {
                 // uploadLayers is the other place a big layout can run out of
                 // memory -- the parse fit in the worker, but this thread's
@@ -2467,7 +2647,7 @@ function startWorker(worker, fileData) {
                     try {
                         restoreViewState(Module, pendingViewState);
                     } catch (err) {
-                        console.error("[GDS] could not restore view state:", err);
+                        fail("[GDS] could not restore view state:", err);
                     }
                     pendingViewState = null;
                 }
@@ -2479,13 +2659,13 @@ function startWorker(worker, fileData) {
                 // geometry this load just replaced.
                 refreshRulerRow(Module);
                 endProgress();
-                console.log("[GDS] done, progress hidden");
+                trace("[GDS] done, progress hidden");
             }, (err) => {
                 showFatalError(`WebAssembly module failed to load: ${err && err.message ? err.message : err}`);
             });
         }
     };
-    console.log("[GDS] posting 'parse' message to worker...");
+    trace("[GDS] posting 'parse' message to worker...");
     // A host may hand in either an ArrayBuffer or a typed-array view over
     // one, and the transfer list accepts only the buffer itself. Normalize
     // here rather than making every host care, but do not transfer a buffer
@@ -2504,5 +2684,5 @@ function startWorker(worker, fileData) {
         { type: "parse", fileData: transfer },
         [transfer]
     );
-    console.log("[GDS] worker.postMessage('parse') call returned");
+    trace("[GDS] worker.postMessage('parse') call returned");
 }

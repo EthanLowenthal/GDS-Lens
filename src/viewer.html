@@ -16,21 +16,14 @@
 <body>
     <gds-lens></gds-lens>
 
-    <!-- Base64 of gdstk_wasm.js's + wasm-worker.js's concatenated text (see
-         extension.cjs) -- inert (not executed) since "text/plain" isn't a JS
-         mimetype. A host that cannot reach its own asset URLs from a Worker
-         reads this and builds the Worker's Blob script from it; see
-         createWorker in the VS Code adapter. It lives in the outer document
-         rather than the shadow root because it is the host's to fill in. -->
-    <script type="text/plain" id="workerBundle">{{workerBundleBase64}}</script>
-
     <!-- Emscripten's output, loaded as a classic script for the
          createGdstkModule global it defines. -->
-    <script src="gdstk_wasm.js"></script>
-    <!-- The embedder's ViewerHost. Must precede viewer.js, which reads
-         window.gdsLensHost as it starts. Defaults to the plain-page host;
-         a host that needs different services replaces this file. -->
-    <script src="host.js"></script>
+    <script src="gds-lens-engine.js"></script>
+    <!-- The embedder's ViewerHost. Must precede gds-lens.js, which reads
+         window.gdsLensHost as it starts. Defaults to the plain-page host; a
+         host that needs different services replaces this file, or sets
+         window.gdsLensHost itself and omits it. -->
+    <script src="gds-lens-host.js"></script>
     <script src="gds-lens.js"></script>
 </body>
 </html>
