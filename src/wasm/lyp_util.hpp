@@ -41,7 +41,7 @@ std::string trim(const std::string& s);
 // hexToRgb() returning null); the requested alpha is otherwise always > 0.
 std::array<float, 4> hex_to_rgba(const std::string& hex_in, float alpha);
 
-// the .lyp/.lyrdb tooling's <frame-brightness>/<fill-brightness>: -255..255 shifts the color
+// the format's <frame-brightness>/<fill-brightness>: -255..255 shifts the color
 // toward black (negative) or white (positive), with +-255 reaching full
 // white/black. Alpha is left alone.
 void apply_brightness(std::array<float, 4>& color, long brightness);

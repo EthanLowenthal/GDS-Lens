@@ -4178,7 +4178,7 @@ void loadAndRenderGds(const std::string& path) {
 // Parse one leaf .lyp block -- the region covering a single layer, containing
 // exactly one <source> -- and insert it into g_lyp_info under `category`. A
 // no-op when the block has no numeric <source> (e.g. a subgroup header, or
-// the .lyp/.lyrdb tooling's catch-all "*/*") or is bound to a layout other than the first.
+// the format's catch-all "*/*") or is bound to a layout other than the first.
 // An entry without colors is still kept (its name and visibility apply; the
 // colors fall back to the hash defaults in apply_layer_colors). group_visible
 // carries the enclosing group node's <visible> flag: the format hides every
@@ -4265,7 +4265,7 @@ void loadLypText(const std::string& xml_text_in) {
     std::string xml_text = lyp_util::strip_xml_comments(xml_text_in);
 
     // Multi-tab files: <layer-properties-tabs> wraps one <layer-properties>
-    // element per tab. Parse only the first tab -- mirroring the .lyp/.lyrdb tooling's initial
+    // element per tab. Parse only the first tab -- mirroring the usual initial
     // view -- instead of letting later tabs' entries overwrite earlier ones.
     // (find_open_tag can't match "<layer-properties-tabs" for the "<layer-
     // properties" prefix search below since '-' follows the name, so the first
@@ -4340,7 +4340,7 @@ void loadLypText(const std::string& xml_text_in) {
 // visibility) for building the sidebar layer list in JS -- no per-polygon
 // geometry crosses this boundary, just one short string/bool/number tuple
 // per layer. Ordered with .lyp-defined layers first (in the order they
-// appeared in the file, matching the .lyp/.lyrdb tooling's own layer panel), then any
+// appeared in the file, matching how such files are usually presented), then any
 // .lyp-less layers present in the GDS, sorted numerically.
 val getLayers() {
     std::vector<const LayerBuffer*> ordered;

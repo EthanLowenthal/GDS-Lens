@@ -35,7 +35,7 @@
 "use strict";
 
 // Decides the format by content, not extension (marker files are named all
-// sorts of things): the .lyp/.lyrdb tooling writes XML with a <report-database> root; a ASCII DRC
+// sorts of things): a .lyrdb is XML with a <report-database> root; an ASCII DRC
 // ASCII results database starts with a "<top-cell-name> <resolution>" header
 // line, optionally preceded by '//' comment lines. Returns 'lyrdb' | 'drc'
 // | null (unrecognized).
@@ -299,11 +299,12 @@ function parseLyrdb(text, domParserCtor) {
 // it counts *edges*, each edge being four numbers on one line. '//' comment
 // lines may appear anywhere.
 //
-// Grammar and semantics follow the common ASCII writer as decoded by open implementations's reader
-// (src/rdb/rdb/rdbRVEReader.cc), including the trailing-'.' strip on check
+// Grammar and semantics were worked out from the open-source reader in
+// KLayout (src/rdb/rdb/rdbRVEReader.cc), not from any vendor documentation,
+// including the trailing-'.' strip on check
 // names and the CN 'c' flag. Never throws on malformed interior lines -- skips
 // and records a warning instead. Not handled: the sibling "<file>.waived"
-// database the .lyp/.lyrdb tooling looks for alongside the results file (the webview only ever
+// database some tools look for alongside the results file (the webview only ever
 // receives one file's text).
 function parseDrcAscii(text) {
     if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
