@@ -183,7 +183,7 @@ A VS Code webview is the case it was built for. Nothing else differs.
 | Binary cached separately from the JS | yes | no |
 | Sensitive to the page's encoding | no | yes |
 
-The last row is the one that bites. The embedded binary is a raw string, so
+On the last row: the embedded binary is a raw string, so
 `gdstk_wasm.js` has to be *decoded* as UTF-8 or it is corrupted, and the module
 fails with a `WebAssembly.instantiate()` error about section lengths that says
 nothing about the cause. Either `Content-Type: text/javascript; charset=utf-8`
