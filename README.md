@@ -6,10 +6,9 @@ WebAssembly and a WebGL2 renderer.
 
 Reading and rendering only. Writing layouts is deliberately out of scope.
 
-![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](images/example.png)
+![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](https://raw.githubusercontent.com/EthanLowenthal/GDS-Lens/main/images/example.png)
 
-> **Status**: pre-release, not yet published to npm. The API is unstable and
-> will change.
+> **Status**: pre-1.0. The API is unstable and will change.
 
 ## Quick start
 

@@ -31,7 +31,10 @@ web page rather than for a webview.
   configuration and no sibling files to serve. Built from a new
   `GDS_LENS_ESM` wasm variant (`-sEXPORT_ES6`). The binary is inlined once and
   shared with the worker through a `blob:` URL rather than inlined twice, which
-  is why this build needs `blob:` in `script-src`; 252 KB gzipped.
+  is why this build needs `blob:` in `script-src`; 252 KB gzipped. The module
+  imports without a DOM, so a server render of a page that uses the element
+  does not throw -- the element registers itself on the client, where
+  `customElements` exists.
 - `describeDecodeFailure` on `gds-lens/load-errors`, and `limit` on the failure
   result from `decodeLayoutBytes`.
 - The `ViewerHost` interface, with every method optional -- the viewer removes
@@ -47,6 +50,12 @@ web page rather than for a webview.
 - `debug` attribute and `?gdsDebug=1` for trace output.
 - Continuous integration: lint and the pure tests on every push, plus a lane
   that builds both wasm payloads and runs the browser suite against them.
+  Publishing runs from a `v*` tag in the same way -- built and tested in the
+  job that publishes it, so the tarball on the registry is one a green run
+  produced rather than whatever a laptop had on disk. It authenticates with
+  npm trusted publishing rather than a stored token, which also means the
+  published tarball carries provenance: a signed statement of the commit and
+  workflow that built it, verifiable with `npm audit signatures`.
 
 ### Changed
 
@@ -70,8 +79,8 @@ web page rather than for a webview.
   `scripts/check-dist.mjs`, which refuses a `dist/` that is missing, older than
   the sources it was built from, or still carrying a template placeholder; and
   `scripts/check-package.mjs`, which reads the file list npm would actually
-  publish and refuses build output, object files, CMake artifacts, or anything
-  containing the build machine's home directory.
+  publish and refuses build output, object files, CMake artifacts, the wasm
+  sources, or anything containing the build machine's home directory.
 - Third-party notices now cover the whole payload, not only what is linked
   into the WebAssembly: zlib and Emscripten (in `gdstk_wasm.js`) and lil-gui
   (bundled into `gds-lens.js`) have been added.
@@ -110,11 +119,14 @@ web page rather than for a webview.
   `dragover`/`drop` to `window` and called `preventDefault`, which silently
   disabled the embedding application's own drop targets. Both are bound to the
   `<gds-lens>` element.
-- **The Emscripten build tree no longer ships.** `files` in `package.json` is
-  an allowlist that overrides `.gitignore`, so listing `src/` published the
-  whole build directory: 211 object files and CMake caches, 2.0 MB, with
-  absolute paths from the build machine inside them. Excluded via a
-  `!src/wasm/build` negation; the tarball is 45 files and 633 KB.
+- **Neither the Emscripten build tree nor the C++ ships.** `files` in
+  `package.json` is an allowlist that overrides `.gitignore`, so listing `src/`
+  published the whole build directory: 211 object files and CMake caches,
+  2.0 MB, with absolute paths from the build machine inside them. The wasm
+  sources went with them, which is no better a use of an install -- a consumer
+  gets the compiled payload and has no toolchain to rebuild it from
+  `renderer.cpp`. A `!src/wasm` negation excludes both, and `check:package`
+  fails on either coming back. The tarball is 39 files, 812 KB packed.
 - **Absolute build paths no longer end up in the WebAssembly.** With no
   `CMAKE_BUILD_TYPE`, `NDEBUG` was never defined, so `assert()` stayed live in
   gdstk, earcut and libcxxabi -- each embedding `__FILE__` as the full path of

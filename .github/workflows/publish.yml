@@ -1,0 +1,145 @@
+# Publishes to npm from a tag, so the tarball on the registry is built by the
+# same job that tested it.
+#
+# The alternative was `npm publish` from a laptop, which works but ships
+# whatever dist/ happens to be sitting there. check:dist catches a *stale*
+# payload; it cannot tell you the build machine was the one you meant.
+#
+# Authentication is npm trusted publishing: the job proves who it is with a
+# short-lived OIDC token minted by GitHub, and npm checks that against a
+# trusted publisher configured on the package. There is no NPM_TOKEN and no
+# secret of any kind to leak, rotate, or forget the expiry of. Provenance --
+# a signed statement of which commit and workflow produced the tarball, which
+# npm shows on the package page and `npm audit signatures` verifies -- comes
+# from the same token.
+#
+# Two things this file cannot enforce, so they are written down instead:
+#
+#   * The trusted publisher on npmjs.com names this workflow by *filename*.
+#     Renaming or moving this file breaks publishing, with an auth error that
+#     does not mention the rename.
+#   * Trusted publishing needs npm 11.5.1 or newer (and Node 22.14+), while
+#     setup-node's Node 22 ships npm 10. Hence the upgrade step below --
+#     without it the publish fails claiming it needs a token.
+#   * A trusted publisher can only be configured on a package that already
+#     exists, so the very first version has to be published by hand to create
+#     it -- npm/cli#8544 tracks lifting that. That one tarball is the only
+#     release without provenance; every version after it comes through here.
+#
+# Note also that ci.yml does NOT run on a tag push -- its trigger is
+# `push.branches`, which tags do not match -- so this workflow does the full
+# build and the whole suite itself rather than assuming a green run upstream.
+
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+  # For rehearsing the whole thing. Defaults to a dry run: the only difference
+  # from a real publish is the last step, so a green manual run means the next
+  # tag will work.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and check, but do not publish"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: build + publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The OIDC token trusted publishing authenticates with. Without this the
+      # job cannot mint one and npm falls back to asking for a token.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          # Deliberately no `registry-url`: it writes an .npmrc line reading
+          # NODE_AUTH_TOKEN, which is unset here, and an empty auth token is
+          # worse than none. The default registry is npmjs.org already.
+
+      # See the note at the top. The floor is 11.5.1; taking the latest keeps
+      # this from being a version to remember.
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # Pinned to match ci.yml and the local toolchain. See the note there:
+      # the payload is a compiled artifact, so the compiler is part of it.
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.1
+          actions-cache-folder: emsdk-cache
+
+      - run: npm ci
+
+      # A tag that disagrees with package.json means one of the two was
+      # forgotten, and publishing either would be wrong: npm takes the version
+      # from the manifest, so a v0.2.0 tag would quietly publish 0.1.0 and the
+      # tag would then point at a release that does not exist. Skipped on a
+      # manual run, which has no tag to compare against.
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(npm pkg get version | tr -d '"')"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME says $tag, package.json says $version"
+            exit 1
+          fi
+          echo "publishing $version"
+
+      - run: npx playwright install --with-deps chromium
+
+      - run: npm run build:wasm
+
+      - run: npm run build
+
+      # The same guard as ci.yml's wasm lane, and the reason it is repeated
+      # rather than left to prepublishOnly: `npm test` there reports success on
+      # a run where every browser test skipped. Publishing on the back of that
+      # is the one place it would really cost something.
+      - name: Test (full, no skips allowed)
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap 'test/*.test.js' 2>&1 | tee test-output.txt
+          skipped=$(sed -n 's/^# skipped \([0-9]\{1,\}\)$/\1/p' test-output.txt)
+          if [ -z "$skipped" ]; then
+            echo "::error::could not read a skip count from the test output; the guard is broken."
+            exit 1
+          fi
+          if [ "$skipped" -ne 0 ]; then
+            echo "::error::$skipped test(s) skipped; the payload or Chromium is missing."
+            exit 1
+          fi
+          echo "no tests skipped"
+
+      # prepublishOnly runs lint, the suite, check:dist and check:package again
+      # as part of this. That duplication is deliberate: those guards belong to
+      # the package, so a publish from anywhere gets them, and re-running them
+      # costs seconds next to the wasm build above.
+      #
+      # --provenance is redundant under trusted publishing, which generates it
+      # regardless. It stays as insurance: if this ever falls back to token
+      # auth, provenance should not quietly disappear with it.
+      - name: Publish
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "dry run: packing and running every publish guard, but not publishing"
+            npm publish --dry-run --provenance --access public
+          else
+            npm publish --provenance --access public
+          fi
