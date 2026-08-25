@@ -2359,11 +2359,15 @@ const viewer = {
 };
 
 // Controls whose host service is missing have nothing behind them, so they
-// are removed rather than left to do nothing when clicked.
-if (!hostCan("pickLyp")) lypController.domElement.closest(".controller")?.remove();
-if (!hostCan("pickMarkers")) markerController.domElement.closest(".controller")?.remove();
+// are removed rather than left to do nothing when clicked. lil-gui prefixes
+// its class names (.lil-controller, not .controller), and an optional-chained
+// remove() on a selector that matches nothing fails silently, so getting this
+// wrong leaves dead controls rather than an error.
+const controllerRow = (controller) => controller.domElement.closest(".lil-controller");
+if (!hostCan("pickLyp")) controllerRow(lypController)?.remove();
+if (!hostCan("pickMarkers")) controllerRow(markerController)?.remove();
 if (!hostCan("saveViews") && !hostCan("promptViewName")) {
-    saveViewController.domElement.closest(".controller")?.remove();
+    controllerRow(saveViewController)?.remove();
 }
 
 Promise.resolve(hostCall("loadViews")).then((views) => {
