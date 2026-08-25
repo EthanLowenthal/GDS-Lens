@@ -14,12 +14,38 @@
 // back the flattened geometry, this thread's Module.uploadLayers() does the
 // (fast, GPU-bound) VBO upload -- the only part that needs the GL context.
 
+// ---- Element refs ----
+// The root this viewer owns. `document` while the payload is a whole page;
+// the one thing that has to change to put two viewers on one page, or to move
+// the subtree into a shadow root, is this line -- document.getElementById()
+// searches the whole document and does not cross a shadow boundary, so every
+// lookup goes through here instead.
+const viewerRoot = document;
+
+// The element carrying the viewer's state classes (theme-light, debug,
+// hierarchy-open, ...), which viewer.html's CSS selects on. Separate from
+// viewerRoot because a document is not an element: when the subtree moves
+// into a container these become that container, and the CSS selectors move
+// with them.
+const rootEl = document.body;
+
+// Resolved in one pass at startup rather than one lookup per element. All of
+// these are static in viewer.html (nothing below creates an element with an
+// id), and this script is the last tag in <body>, so the tree is fully parsed
+// by the time this runs. A missing element yields undefined rather than null,
+// which the falsy guards throughout this file already handle: a webview still
+// holding stale HTML from before a panel existed must not throw and abort the
+// rest of setup.
+const els = Object.fromEntries(
+    Array.from(viewerRoot.querySelectorAll("[id]"), (el) => [el.id, el])
+);
+
 // On-screen debug log (see #debugPanel in viewer.html): mirrors every
 // console.log/error call here, plus 'gdsLog' messages relayed from the
 // Worker (which has no DOM of its own to render into), so debugging doesn't
 // depend on getting the right DevTools window attached to the right webview
 // -- the log is just selectable text in the page itself.
-const debugLogEl = document.getElementById("debugLog");
+const debugLogEl = els.debugLog;
 function safeStringify(arg) {
     if (typeof arg === "string") return arg;
     if (arg instanceof Error) return arg.stack || arg.message;
@@ -51,14 +77,14 @@ console.error = (...args) => {
 // HTML from before this panel existed) must not throw and abort the rest of
 // this script -- everything below, including the window "message" listener
 // that shows the loading bar at all, depends on this file finishing setup.
-const debugPanelEl = document.getElementById("debugPanel");
-const debugToggleBtn = document.getElementById("debugToggleBtn");
+const debugPanelEl = els.debugPanel;
+const debugToggleBtn = els.debugToggleBtn;
 if (debugToggleBtn && debugPanelEl) {
     debugToggleBtn.addEventListener("click", () => {
         debugPanelEl.classList.toggle("hidden");
     });
 }
-const debugCopyBtn = document.getElementById("debugCopyBtn");
+const debugCopyBtn = els.debugCopyBtn;
 if (debugCopyBtn) {
     debugCopyBtn.addEventListener("click", () => {
         const text = debugLogEl ? debugLogEl.innerText : "";
@@ -254,7 +280,7 @@ function refreshRulerRow(Module) {
 // after any click that could have finished one. setTimeout(0) rather than
 // handling it inline because it has to run after the whole event dispatch,
 // whichever order the renderer's listener and this one were registered in.
-const glCanvas = document.getElementById("glCanvas");
+const glCanvas = els.glCanvas;
 if (glCanvas) {
     glCanvas.addEventListener("mousedown", () => {
         if (currentMode !== "measure") return;
@@ -674,11 +700,11 @@ function renderLayerList(layers) {
 // cell once, but the tree it spans is the expansion of a DAG, so a mid-sized
 // chip's fully materialized tree is far larger than its library -- and nobody
 // reads more than the few branches they opened.
-const hierarchyPanel = document.getElementById("hierarchyPanel");
-const hierarchyTree = document.getElementById("hierarchyTree");
-const hierarchyCount = document.getElementById("hierarchyCount");
-const hierarchyHide = document.getElementById("hierarchyHide");
-const hierarchyShowBtn = document.getElementById("hierarchyShowBtn");
+const hierarchyPanel = els.hierarchyPanel;
+const hierarchyTree = els.hierarchyTree;
+const hierarchyCount = els.hierarchyCount;
+const hierarchyHide = els.hierarchyHide;
+const hierarchyShowBtn = els.hierarchyShowBtn;
 
 let hierarchyModel = null;
 // Open branches and the selected row are keyed by their path of cell names
@@ -770,7 +796,7 @@ function hierarchyBoxes(node, cell, parentXform, spanningBox) {
 function setHierarchyOpen(open, byUser) {
     if (byUser) hierarchyUserChoice = open;
     if (hierarchyPanel) hierarchyPanel.classList.toggle("hidden", !open);
-    document.body.classList.toggle("hierarchy-open", open);
+    rootEl.classList.toggle("hierarchy-open", open);
     // The outline belongs to the panel: it's the tree pointing at the layout,
     // so with the tree away it would be a dashed rectangle with nothing on
     // screen to explain it. Putting the panel away takes it down, and bringing
@@ -1022,7 +1048,7 @@ function renderHierarchy(model) {
     // .hierarchy-available says there's a tree to show, open or not, which is
     // what the stale banner's left edge keys off (the reopen button sits in
     // the same corner it starts in).
-    document.body.classList.toggle("hierarchy-available", cellCount > 0);
+    rootEl.classList.toggle("hierarchy-available", cellCount > 0);
 
     if (!model || cellCount === 0) {
         if (hierarchyCount) hierarchyCount.textContent = "";
@@ -1101,14 +1127,14 @@ if (hierarchyShowBtn) {
 // also why choosing a cell *reveals* it -- opens the branches down to it and
 // selects the row (see revealCell) -- instead of just moving the camera and
 // leaving the tree pointing somewhere else entirely.
-const hierarchyFindToggle = document.getElementById("hierarchyFindToggle");
-const hierarchyFindTwisty = document.getElementById("hierarchyFindTwisty");
-const hierarchySearchBox = document.getElementById("hierarchySearch");
-const hierarchySearchInput = document.getElementById("hierarchySearchInput");
-const hierarchySearchCount = document.getElementById("hierarchySearchCount");
-const hierarchyResults = document.getElementById("hierarchyResults");
-const hierarchyScopeCells = document.getElementById("hierarchyScopeCells");
-const hierarchyScopeLabels = document.getElementById("hierarchyScopeLabels");
+const hierarchyFindToggle = els.hierarchyFindToggle;
+const hierarchyFindTwisty = els.hierarchyFindTwisty;
+const hierarchySearchBox = els.hierarchySearch;
+const hierarchySearchInput = els.hierarchySearchInput;
+const hierarchySearchCount = els.hierarchySearchCount;
+const hierarchyResults = els.hierarchyResults;
+const hierarchyScopeCells = els.hierarchyScopeCells;
+const hierarchyScopeLabels = els.hierarchyScopeLabels;
 
 // Rows past this aren't built. A 260px list is read, not scrolled through by
 // the thousand, and the count line says how many matches were left out -- the
@@ -1636,7 +1662,7 @@ function stepMarker(direction) {
 // handled this event"), which is what makes a menu of our own possible at all.
 // It only covers the canvas: right-clicking the panels still gets VS Code's
 // menu, since a coordinate means nothing there.
-const copyToastEl = document.getElementById("copyToast");
+const copyToastEl = els.copyToast;
 let copyToastTimer = 0;
 function showCopyToast(text) {
     if (!copyToastEl) return;
@@ -1646,8 +1672,8 @@ function showCopyToast(text) {
     copyToastTimer = setTimeout(() => copyToastEl.classList.add("hidden"), 1800);
 }
 
-const canvasMenuEl = document.getElementById("canvasMenu");
-const canvasMenuCopyEl = document.getElementById("canvasMenuCopy");
+const canvasMenuEl = els.canvasMenu;
+const canvasMenuCopyEl = els.canvasMenuCopy;
 const canvasMenuValueEl = canvasMenuEl && canvasMenuEl.querySelector(".menu-value");
 // The text the open menu is offering, captured when it opened. Held here rather
 // than re-read on click because the click happens after the pointer has moved
@@ -1771,11 +1797,11 @@ window.addEventListener("keydown", (event) => {
 // changes underneath us (see the watcher in extension.cjs); this is only the
 // UI for that. Clicking Reload asks the host to re-read and re-send the file
 // as a fresh 'init' -- the webview never touches disk itself.
-const staleBanner = document.getElementById("staleBanner");
-const staleText = document.getElementById("staleText");
-const staleReloadBtn = document.getElementById("staleReloadBtn");
-const staleAlwaysBtn = document.getElementById("staleAlwaysBtn");
-const staleDismiss = document.getElementById("staleDismiss");
+const staleBanner = els.staleBanner;
+const staleText = els.staleText;
+const staleReloadBtn = els.staleReloadBtn;
+const staleAlwaysBtn = els.staleAlwaysBtn;
+const staleDismiss = els.staleDismiss;
 
 function showStaleBanner(show, text) {
     if (!staleBanner) return;
@@ -1981,14 +2007,14 @@ function setNamedViews(views) {
     renderNamedViews();
 }
 
-const loadingOverlay = document.getElementById("loadingOverlay");
-const loadingBarFill = document.getElementById("loadingBarFill");
-const loadingPhase = document.getElementById("loadingPhase");
-const loadingPercent = document.getElementById("loadingPercent");
-const reloadProgress = document.getElementById("reloadProgress");
-const reloadBarFill = document.getElementById("reloadBarFill");
-const reloadLabel = document.getElementById("reloadLabel");
-const loadError = document.getElementById("loadError");
+const loadingOverlay = els.loadingOverlay;
+const loadingBarFill = els.loadingBarFill;
+const loadingPhase = els.loadingPhase;
+const loadingPercent = els.loadingPercent;
+const reloadProgress = els.reloadProgress;
+const reloadBarFill = els.reloadBarFill;
+const reloadLabel = els.reloadLabel;
+const loadError = els.loadError;
 
 // Every load-failure path ends here. Writing the DOM directly rather than
 // going through Module.showLoadError matters: the module itself may be the
@@ -2106,7 +2132,7 @@ function detectLightTheme() {
     if (hostCan("isLightTheme")) return !!host.isLightTheme();
     // A host may instead just set the class itself, which is cheaper than
     // implementing a method when it is already rewriting <body> anyway.
-    if (document.body.classList.contains("theme-light")) return true;
+    if (rootEl.classList.contains("theme-light")) return true;
     return lightMediaQuery.matches;
 }
 
@@ -2120,7 +2146,7 @@ function applyTheme() {
     lightTheme = light;
     // Toggling this re-triggers the observer below, which then no-ops on the
     // early return above.
-    document.body.classList.toggle("theme-light", light);
+    rootEl.classList.toggle("theme-light", light);
     modulePromise.then((Module) => {
         Module.setTheme(light);
         // setTheme recolors the layers in place (the fallback palette is
@@ -2135,7 +2161,7 @@ function applyTheme() {
 // A host that signals a theme switch by rewriting <body>'s class list rather
 // than calling applyTheme() gets picked up here. (This also fires for the
 // debug command's own class toggle, which applyTheme ignores.)
-new MutationObserver(applyTheme).observe(document.body, { attributes: true, attributeFilter: ["class"] });
+new MutationObserver(applyTheme).observe(rootEl, { attributes: true, attributeFilter: ["class"] });
 lightMediaQuery.addEventListener("change", applyTheme);
 applyTheme();
 
@@ -2151,7 +2177,7 @@ function createParseWorker() {
     // whole script text, base64'd, into #workerBundle -- an inert
     // type="text/plain" tag, so the bundle's own text can safely contain a
     // literal "</script>".
-    const inline = document.getElementById("workerBundle");
+    const inline = els.workerBundle;
     if (inline && inline.textContent.trim()) {
         // atob() yields a "binary string" -- one JS char per raw byte
         // (0-255), NOT real UTF-16 text. gdstk_wasm.js contains genuine
@@ -2288,7 +2314,7 @@ function toggleDebug() {
     // "Toggle Debug Tools" -- show/hide the debug entry point (the button
     // that opens #debugPanel, which holds both the engine readout and the
     // log), hidden by default, see viewer.html.
-    document.body.classList.toggle("debug");
+    rootEl.classList.toggle("debug");
 }
 
 const viewer = {
