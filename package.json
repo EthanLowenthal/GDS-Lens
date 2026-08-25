@@ -1,6 +1,6 @@
 {
   "name": "gds-lens",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "GDSII & OASIS layout parsing and WebGL2 rendering for the browser",
   "license": "MIT",
   "author": "Ethan Lowenthal",
