@@ -1,8 +1,21 @@
 # Third-party licences
 
-The compiled WebAssembly module (`gdstk_wasm.js`) statically links the projects
-below. All are permissive and compatible with this project's MIT licence; the
-requirement they impose is attribution, reproduced here in full.
+The published payload (`dist/web/` and `dist/inline-wasm/`) carries third-party
+code in two places: statically linked into the compiled WebAssembly module
+(`gds-lens-engine.js`), and bundled into the JavaScript beside it
+(`gds-lens.js`). Everything from both is listed below. All are permissive and
+compatible with this project's MIT licence; the requirement they impose is
+attribution, reproduced here in full.
+
+| Project | Licence | Arrives in |
+|---|---|---|
+| gdstk | BSL-1.0 | linked into `gds-lens-engine.js` |
+| Clipper | BSL-1.0 | linked into `gds-lens-engine.js` |
+| Qhull | Qhull licence | linked into `gds-lens-engine.js` |
+| earcut.hpp | ISC | linked into `gds-lens-engine.js` |
+| zlib | zlib licence | linked into `gds-lens-engine.js` (Emscripten's `-sUSE_ZLIB=1` port) |
+| Emscripten | MIT / NCSA | its runtime *is* `gds-lens-engine.js` |
+| lil-gui | MIT | bundled into `gds-lens.js`, stylesheet included |
 
 Qhull's licence in particular requires that its notice accompany any
 distribution that includes it - including binary-only distributions, for which
@@ -141,4 +154,108 @@ INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
 OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
 TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
 THIS SOFTWARE.
+```
+
+---
+
+## zlib - zlib licence
+
+<https://github.com/madler/zlib>
+
+Linked into the WebAssembly module through Emscripten's bundled zlib port
+(`-sUSE_ZLIB=1` in `src/wasm/CMakeLists.txt`), which gdstk uses to read and
+write OASIS CBLOCK-compressed records. Version 1.3.2, used unmodified.
+
+```
+Copyright notice:
+
+ (C) 1995-2026 Jean-loup Gailly and Mark Adler
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Jean-loup Gailly        Mark Adler
+  jloup@gzip.org          madler@alumni.caltech.edu
+```
+
+---
+
+## Emscripten - MIT / University of Illinois NCSA (dual)
+
+<https://github.com/emscripten-core/emscripten>
+
+`gds-lens-engine.js` is Emscripten's own output: the loader, the runtime and the
+embind glue in it are Emscripten's code, not this project's. Emscripten is
+available under two separate licences, the MIT licence and the University of
+Illinois/NCSA Open Source License, either of which may be chosen. The MIT
+text is reproduced here; the NCSA text is in Emscripten's own `LICENSE` file.
+
+```
+Copyright (c) 2010-2014 Emscripten authors, see AUTHORS file.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## lil-gui - MIT
+
+<https://github.com/georgealways/lil-gui>
+
+The viewer's control panel. Unlike everything above it is JavaScript, bundled
+into `dist/*/gds-lens.js` by esbuild, and its stylesheet is carried inline in
+the payload (the panel lives in a shadow root, which cannot see a stylesheet
+appended to `document.head`). Version 0.21.0, used unmodified.
+
+```
+MIT License
+
+Copyright (c) 2019 George Michael Brower
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```

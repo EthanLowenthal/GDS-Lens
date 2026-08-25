@@ -11,13 +11,22 @@ Reading and rendering only. Writing layouts is deliberately out of scope.
 
 ## Quick start
 
-```html
-<script type="module" src="gds-lens.js"></script>
+```sh
+npm install gds-lens
+```
 
+```js
+import "gds-lens";   // registers <gds-lens>
+```
+
+```html
 <gds-lens src="chip.gds" style="width: 100%; height: 600px"></gds-lens>
 ```
 
-That's the whole thing. Pan with the mouse, zoom with the wheel.
+That's the whole thing. Pan with the mouse, zoom with the wheel. The import
+pulls in one self-contained module — the parser, the renderer, the WebAssembly
+binary and the control panel — so there is nothing to copy and nothing else to
+serve.
 
 Or drive it from JavaScript:
 
@@ -32,9 +41,41 @@ await viewer.load("chip.gds");        // a URL, or bytes you already have
 await viewer.goToPoint(120.5, -40);   // centre on a coordinate, in microns
 ```
 
-Serve `gds-lens.js` alongside the other files in the payload (below). They must
-be on the same origin as the page: the WebAssembly binary and the parse worker
-are both fetched relative to the scripts.
+### Or serve the files instead
+
+If you would rather serve a payload than bundle one — for a smaller download
+and a streaming WebAssembly compile — copy `dist/web/` and load its scripts in
+order. The order matters: both must precede `gds-lens.js`, which reads them as
+it starts.
+
+```html
+<script src="gds-lens-engine.js"></script>  <!-- the wasm module -->
+<script src="gds-lens-host.js"></script>    <!-- the default ViewerHost -->
+<script src="gds-lens.js"></script>         <!-- the element -->
+
+<gds-lens src="chip.gds" style="width: 100%; height: 600px"></gds-lens>
+```
+
+#### What each file is
+
+Six files, of which four are load-bearing:
+
+| File | | What it is |
+|---|---|---|
+| `gds-lens.js` | required | The element, the viewer and the control panel. This is the package. Load it **last**. |
+| `gds-lens-engine.js` | required | gdstk's GDSII/OASIS reader and the WebGL2 renderer, compiled to WebAssembly. Defines the `createGdstkModule` global `gds-lens.js` looks for, which is why it goes first. The parse worker loads it too. |
+| `gds-lens-engine.wasm` | required | The binary, fetched by `gds-lens-engine.js` from beside it. `inline-wasm` embeds it instead. |
+| `gds-lens-worker.js` | required | The parse worker: reads and triangulates off the main thread so the canvas stays responsive. Fetched by the worker, never by your page. |
+| `gds-lens-host.js` | optional | The default `ViewerHost` (below). Omit it if you set `window.gdsLensHost` yourself before `gds-lens.js` runs. |
+| `gds-lens.html` | optional | A working reference page. Read it for the script order; no need to deploy it. |
+
+Every name carries the package prefix because these get copied into someone
+else's web root, where a bare `host.js` or `wasm-worker.js` is a collision
+waiting to happen. Serve them from one directory, in the order above.
+
+`dist/web/gds-lens.html` is a working page doing exactly this. Everything in the
+payload must be on the same origin as the page: the WebAssembly binary and the
+parse worker are both fetched relative to the scripts.
 
 ## What it does
 
@@ -50,11 +91,7 @@ are both fetched relative to the scripts.
 
 ## Installing
 
-```sh
-npm install gds-lens
-```
-
-The package ships prebuilt: no Emscripten toolchain required to consume it.
+The package ships prebuilt: no Emscripten toolchain is required to consume it.
 Installing straight from a git URL will not work, because `dist/` is built in
 CI rather than committed.
 
@@ -83,11 +120,17 @@ CI rather than committed.
 
 The element is `display: block` with no intrinsic height, so give it one.
 
-### One per page
+### One at a time
 
 The renderer keeps its state in module-scope globals, so only one `<gds-lens>`
-can be active at a time. A second one refuses visibly rather than fighting the
-first for the same WebGL context.
+can be *live* at a time. A second one alongside the first refuses visibly
+rather than fighting it for the same WebGL context.
+
+Removing one and adding another is fine, though, which is what matters in a
+framework: React and friends recreate the node on re-render, and an SPA route
+change destroys and rebuilds it. The engine is not torn down when the element
+leaves the DOM — the next `<gds-lens>` to connect has it moved into it, keeping
+the WebGL context, the parsed design and the camera. Nothing reloads.
 
 ## Embedding: the `ViewerHost` interface
 
@@ -96,6 +139,13 @@ can do goes through a host object, which you install as `window.gdsLensHost`
 before the element script runs. Leave it unset and a default host handles a
 plain web page: `<input type=file>` for the pickers, `localStorage` for saved
 views, `prompt()` for a name, plus `?src=` and drag-and-drop for loading.
+
+Two things the default host does to the page, both of which a replacement host
+inherits responsibility for and neither of which the element itself does: it
+publishes the viewer surface as `window.gdsLens`, so a plain page can drive it
+from a script tag or the console; and it binds drag-and-drop to the
+`<gds-lens>` element rather than to `window`, which leaves the rest of the
+page's own drop targets alone.
 
 Every method is optional. The viewer hides the control for anything a host
 does not implement, so a read-only embed can supply almost none of it.
@@ -132,6 +182,7 @@ rather than answering it:
 | `toggleDebug()` | Show or hide the debug panel. |
 | `setNamedViews(views)` | Replace the saved-view set. |
 | `applyTheme()` | Re-ask `isLightTheme()` after a theme change. |
+| `element` | The `<gds-lens>` the viewer is mounted in. Bind anything of your own to this rather than to `window`, so it stays inside the component. |
 
 ### Example
 
@@ -155,46 +206,81 @@ cleanly into Node, a worker, or an extension host.
 
 | Import | Exports |
 |---|---|
-| `gds-lens` | `GdsLens`, and registers `<gds-lens>` |
-| `gds-lens/viewer` | `viewer`, the surface above, for mounting without the element |
+| `gds-lens` | `GdsLens`, and registers `<gds-lens>`. The bundled module — everything inlined |
 | `gds-lens/parsers` | `parseMarkerFile`, `parseLyrdb`, `parseDrcAscii`, `sniffMarkerFormat`, `parsePointList`, `flattenMarkerModel` |
 | `gds-lens/layout-bytes` | `decodeLayoutBytes`, `looksGzipped`, `gzipStoredSize` |
 | `gds-lens/coord-parse` | `parseCoordinatePair` |
 | `gds-lens/cell-search` | `rankCellMatches`, `cellPathToTarget` |
-| `gds-lens/load-errors` | `describeLoadFailure`, `isOutOfMemory` |
+| `gds-lens/load-errors` | `describeLoadFailure`, `isOutOfMemory`, `describeDecodeFailure` |
 | `gds-lens/hosts/browser` | `createBrowserHost` |
 | `gds-lens/web/*` | The prebuilt payload, for hosts that serve files rather than bundle |
 | `gds-lens/inline-wasm/*` | The same payload with the binary embedded, for hosts that cannot fetch |
+| `gds-lens/esm/*` | The bundled module by path, if you would rather not rely on `.` |
 
-### The two payloads
+TypeScript declarations ship for all of these.
 
-Use `dist/web/`. `gdstk_wasm.js` fetches `gdstk_wasm.wasm` from beside it, so
-serve the two together.
+### The three builds
 
-`dist/inline-wasm/` is the same payload with the binary embedded in
-`gdstk_wasm.js`, for hosts that cannot fetch a file next to their own scripts.
-A VS Code webview is the case it was built for. Nothing else differs.
+`import "gds-lens"` gets you `dist/esm/`, and that is the right default. The
+other two are there for cases it cannot cover.
 
-|  | `web` | `inline-wasm` |
-|---|---|---|
-| Module transfer, gzipped (JS + binary) | 188 KB | 196 KB |
-| Streaming compile | yes | no |
-| Binary cached separately from the JS | yes | no |
-| Sensitive to the page's encoding | no | yes |
+|  | `esm` | `web` | `inline-wasm` |
+|---|---|---|---|
+| How it arrives | `import "gds-lens"` | scripts you serve | scripts you serve |
+| Files to serve | none | 4 (+2 optional) | 3 (+2 optional) |
+| Bundler configuration | none | n/a | n/a |
+| Total transfer, gzipped | 252 KB | 235 KB | 243 KB |
+| Streaming WebAssembly compile | no | yes | no |
+| Binary cached separately from the JS | no | yes | no |
+| Sensitive to the page's encoding | no | no | yes |
+| Needs `blob:` in `script-src` | yes | no | no |
 
-On the last row: the embedded binary is a raw string, so `gdstk_wasm.js` has to
-be *decoded* as UTF-8 or it is corrupted, and the module fails with a
-`WebAssembly.instantiate()` error about section lengths that says nothing about
-the cause. Either `Content-Type: text/javascript; charset=utf-8` or
-`<meta charset="UTF-8">` on the page satisfies it; only the absence of both
-breaks. This payload warns in the console when the document is not UTF-8.
+**`esm`** is one file with everything inside it: the markup, the styles,
+lil-gui, the default host, the WebAssembly binary and the parse worker's whole
+script. Nothing is fetched, so nothing has to be served or copied, and no
+bundler needs configuring. It costs the streaming compile and about 17 KB over
+the payload.
+
+Both the main thread and the parse worker need Emscripten's module, and a
+worker cannot share the main thread's copy. Rather than inline it twice — which
+would add ~190 KB gzipped for nothing — it is inlined once as text and loaded
+from a `blob:` URL by both. That is the one thing this build asks of a page's
+CSP that the others do not: `blob:` in `script-src`, on top of the `worker-src
+blob:` all three need.
+
+**`web`** is the payload to serve if you can. `gds-lens-engine.js` fetches
+`gds-lens-engine.wasm` from beside it, so serve the two together; the binary
+compiles as it streams and is cached on its own.
+
+**`inline-wasm`** is `web` with the binary embedded in `gds-lens-engine.js`, for
+hosts that cannot fetch a file next to their own scripts — a VS Code webview
+cannot, from a Worker or from the main thread. Nothing else differs.
+
+On that last row: `inline-wasm` embeds the binary as a raw string, so
+`gds-lens-engine.js` has to be *decoded* as UTF-8 or it is corrupted, and the module
+then fails with a `WebAssembly.instantiate()` error about section lengths that
+says nothing about the cause. Either `Content-Type: text/javascript;
+charset=utf-8` or `<meta charset="UTF-8">` on the page satisfies it; only the
+absence of both breaks. That payload warns in the console when the document is
+not UTF-8. `esm` escapes its non-ASCII, so it does not care.
+
+### Compressed layouts
+
+Gzip is handled for you: `<gds-lens src="chip.gds.gz">` works, and so does a
+plain `.gds` that is secretly gzipped, because the format is decided by magic
+number rather than by filename. Expansion happens in JavaScript rather than
+inside the WebAssembly heap, which is the one address space that can least
+afford a second copy of the file, and it is capped at 2 GB.
+
+The same decoder is exported if you want it separately — to check a file before
+handing it over, say:
 
 ```js
 import { decodeLayoutBytes } from "gds-lens/layout-bytes";
 
-// Gzip is detected by magic number, not by extension.
-const result = await decodeLayoutBytes(await file.arrayBuffer());
-if (result.ok) viewer.load(result.bytes);
+const result = await decodeLayoutBytes(new Uint8Array(await file.arrayBuffer()));
+if (result.ok) await viewer.load(result.bytes);
+else console.error(result.reason);   // "too-large" | "corrupt"
 ```
 
 ## Limits
@@ -228,27 +314,39 @@ Then:
 ```sh
 git submodule update --init --recursive
 npm install
-npm run build:wasm     # both variants -> src/wasm/build/{web,inline}/
-npm run build          # -> dist/web/ and dist/inline-wasm/
+npm run build:wasm     # all three -> src/wasm/build/{web,inline,esm}/
+npm run build          # -> dist/{web,inline-wasm,esm}/
 npm test
 ```
 
-`npm run build:wasm:web` and `npm run build:wasm:inline` build one variant
-each; `npm run build` then produces whichever payloads it finds, and says which
-it skipped.
+`npm run build:wasm:web`, `:inline` and `:esm` build one variant each; `npm run
+build` then produces whichever outputs it finds the wasm for, and says which it
+skipped. The three differ only in link flags, but CMake caches those, so each
+gets its own build tree.
 
 `npm test` includes browser tests that need Chromium
-(`npx playwright install chromium`); they skip if it is missing. The
-end-to-end load test runs once per built payload.
+(`npx playwright install chromium`); they skip if it is missing. The end-to-end
+load test runs once per built payload.
+
+Before publishing, `npm run check:dist` and `npm run check:package` verify that
+the payloads are present and no newer than their sources, and that the tarball
+carries nothing it should not. `prepublishOnly` runs both.
 
 ## Licence
 
 MIT, see [`LICENCE.md`](LICENCE.md).
 
-The compiled WebAssembly statically links four permissive projects:
-[gdstk](https://github.com/heitzmann/gdstk) (BSL-1.0), Clipper (BSL-1.0),
-[Qhull](http://www.qhull.org) (Qhull licence) and
-[earcut.hpp](https://github.com/mapbox/earcut.hpp) (ISC). Qhull's licence
-requires its notice to accompany any distribution that includes it, so see
-[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md). Qhull's original source
-can be obtained from [qhull.org](http://www.qhull.org).
+The payload carries third-party code in two places. Statically linked into the
+WebAssembly: [gdstk](https://github.com/heitzmann/gdstk) (BSL-1.0), Clipper
+(BSL-1.0), [Qhull](http://www.qhull.org) (Qhull licence),
+[earcut.hpp](https://github.com/mapbox/earcut.hpp) (ISC) and
+[zlib](https://github.com/madler/zlib) (zlib licence) - and `gds-lens-engine.js` is
+itself [Emscripten](https://github.com/emscripten-core/emscripten)'s output
+(MIT/NCSA). Bundled into the JavaScript beside it:
+[lil-gui](https://github.com/georgealways/lil-gui) (MIT).
+
+Every notice is reproduced in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md). Qhull's licence in
+particular requires its notice to accompany any distribution that includes it,
+and its original source can be obtained from
+[qhull.org](http://www.qhull.org).
