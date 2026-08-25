@@ -121,8 +121,7 @@ dozen elements.
 
 [`examples/multi-view.html`](https://github.com/EthanLowenthal/GDS-Lens/blob/main/examples/multi-view.html)
 is a working page of six: three loading a layout from `src`, three waiting for a
-button, one of them created and released on demand to keep a context free. It is
-in the repository rather than in the package, which is why that link leaves.
+button, one of them created and released on demand to keep a context free.
 
 #### Removal parks the viewer
 
