@@ -55,7 +55,14 @@ const module_ = (files, globalSet) => ({
 export default [
     {
         // Generated, vendored and built output, none of it ours to fix.
-        ignores: ["src/wasm/build/**", "dist/**"],
+        //
+        // emsdk-cache is the Emscripten SDK, which the CI action unpacks
+        // *inside* the working tree. It carries its own eslint.config.mjs, and
+        // `eslint .` finding that config -- not the SDK's code, the config --
+        // fails the whole run with ERR_MODULE_NOT_FOUND for a plugin only
+        // Emscripten depends on. ci.yml never hit this because its lint lane
+        // has no SDK; the publish job runs both, so it did.
+        ignores: ["src/wasm/build/**", "dist/**", "emsdk-cache/**"],
     },
     // The viewer's main thread: browser globals plus the vendored ones.
     module_(["src/viewer.js", "src/gds-lens.js", "src/mount-target.js",

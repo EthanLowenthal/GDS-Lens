@@ -7,3 +7,6 @@ src/wasm/build/
 
 .DS_Store
 *.log
+
+# The Emscripten SDK, when the CI action unpacks it into the working tree.
+emsdk-cache/
