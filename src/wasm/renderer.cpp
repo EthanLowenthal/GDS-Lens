@@ -62,6 +62,30 @@ struct nth<1, gdstk::Vec2> {
 #include "stroke_font.hpp"
 
 using namespace emscripten;
+
+// Emscripten resolves an event/context target string by consulting
+// specialHTMLTargets first and only then document.querySelector (see
+// findEventTarget in its libhtml5.js). A canvas inside a shadow root is not
+// reachable by selector, so JS registers the element under this name and the
+// lookup finds it there. Nothing changes for a plain page: the same
+// registration is done either way.
+static const char* kCanvasTarget = "!gdsLensCanvas";
+
+// The node this renderer looks its elements up in. `document` by default, so
+// a plain page behaves exactly as before; a host that mounts the viewer in a
+// shadow root calls setRoot() with it instead, because document.getElementById
+// does not cross a shadow boundary. ShadowRoot is a DocumentFragment, which
+// implements NonElementParentNode, so getElementById works on both and every
+// call site below is unchanged apart from what it asks.
+val dom_root() {
+    // Read off the module object rather than held in a C++ global, so it is
+    // already in place before main() runs: the host passes it in the very
+    // object it instantiates the module with, and there is no window in which
+    // this could fall back to `document` by accident.
+    val root = val::module_property("gdsLensRoot");
+    if (root.isUndefined() || root.isNull()) return val::global("document");
+    return root;
+}
 using namespace gdstk;
 
 namespace {
@@ -680,7 +704,7 @@ bool init_gl() {
     emscripten_webgl_init_context_attributes(&attrs);
     attrs.majorVersion = 2;
     attrs.minorVersion = 0;
-    EMSCRIPTEN_WEBGL_CONTEXT_HANDLE ctx = emscripten_webgl_create_context("#glCanvas", &attrs);
+    EMSCRIPTEN_WEBGL_CONTEXT_HANDLE ctx = emscripten_webgl_create_context(kCanvasTarget, &attrs);
     if (ctx <= 0) return false;
     if (emscripten_webgl_make_context_current(ctx) != EMSCRIPTEN_RESULT_SUCCESS) return false;
 
@@ -1035,12 +1059,12 @@ PolygonRange make_range(const std::vector<float>& verts, GLint first, GLsizei co
 }
 
 void set_inner_html(const char* id, const std::string& html) {
-    val el = val::global("document").call<val>("getElementById", std::string(id));
+    val el = dom_root().call<val>("getElementById", std::string(id));
     if (!el.isNull() && !el.isUndefined()) el.set("innerHTML", html);
 }
 
 void set_inner_text(const char* id, const std::string& text) {
-    val el = val::global("document").call<val>("getElementById", std::string(id));
+    val el = dom_root().call<val>("getElementById", std::string(id));
     if (!el.isNull() && !el.isUndefined()) el.set("innerText", text);
 }
 
@@ -1060,7 +1084,7 @@ void update_scale_bar() {
     else if (normalized >= 2) step = 2 * magnitude;
     double final_bar_pixels = step * g_zoom;
 
-    val scale_bar = val::global("document").call<val>("getElementById", std::string("scaleBar"));
+    val scale_bar = dom_root().call<val>("getElementById", std::string("scaleBar"));
     if (!scale_bar.isNull() && !scale_bar.isUndefined()) {
         scale_bar["style"].set("width", std::to_string(final_bar_pixels) + "px");
     }
@@ -1161,7 +1185,7 @@ std::string format_coord_pair(double x_um, double y_um) {
 // and the camera moving beneath a stationary pointer (wheel zoom, "go to").
 void update_coord_readout() {
     if (!g_gl_ready) return;
-    val el = val::global("document").call<val>("getElementById", std::string("coordReadout"));
+    val el = dom_root().call<val>("getElementById", std::string("coordReadout"));
     if (el.isNull() || el.isUndefined()) return;
     if (!g_cursor_inside) {
         el["classList"].call<void>("add", std::string("hidden"));
@@ -1228,7 +1252,7 @@ std::string measure_label_html(const Measurement& m) {
 // since there is no fixed number of them any more.
 void update_measure_labels() {
     val document = val::global("document");
-    val container = document.call<val>("getElementById", std::string("measureLabels"));
+    val container = dom_root().call<val>("getElementById", std::string("measureLabels"));
     if (container.isNull() || container.isUndefined()) return;
 
     const size_t needed = g_measurements.size() + (g_measure_pending ? 1 : 0);
@@ -2401,7 +2425,7 @@ void resize_canvas() {
     g_canvas_width = width;
     g_canvas_height = height;
 
-    val canvas = val::global("document").call<val>("getElementById", std::string("glCanvas"));
+    val canvas = dom_root().call<val>("getElementById", std::string("glCanvas"));
     canvas.set("width", width);
     canvas.set("height", height);
 
@@ -4551,7 +4575,7 @@ void setMeasureMode(bool on) {
         }
     }
     if (!g_gl_ready) return;  // no DOM in headless (plain Node) runs
-    val canvas = val::global("document").call<val>("getElementById", std::string("glCanvas"));
+    val canvas = dom_root().call<val>("getElementById", std::string("glCanvas"));
     if (!canvas.isNull() && !canvas.isUndefined()) {
         canvas["style"].set("cursor", std::string(on ? "crosshair" : "default"));
     }
@@ -4731,11 +4755,11 @@ val getMarkerStats() {
 int main() {
     g_gl_ready = init_gl();
     if (!g_gl_ready) return 0;
-    emscripten_set_mousedown_callback("#glCanvas", nullptr, false, on_mousedown);
-    emscripten_set_mousemove_callback("#glCanvas", nullptr, false, on_mousemove);
+    emscripten_set_mousedown_callback(kCanvasTarget, nullptr, false, on_mousedown);
+    emscripten_set_mousemove_callback(kCanvasTarget, nullptr, false, on_mousemove);
     emscripten_set_mouseup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, on_mouseup);
-    emscripten_set_mouseleave_callback("#glCanvas", nullptr, false, on_mouseleave);
-    emscripten_set_wheel_callback("#glCanvas", nullptr, false, on_wheel);
+    emscripten_set_mouseleave_callback(kCanvasTarget, nullptr, false, on_mouseleave);
+    emscripten_set_wheel_callback(kCanvasTarget, nullptr, false, on_wheel);
     emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, on_resize);
     resize_canvas();
     return 0;

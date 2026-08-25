@@ -55,6 +55,10 @@ const options = (entry, name) => ({
     bundle: true,
     format: "iife",
     target: "es2022",
+    // The component carries its own markup and styles: there is no separate
+    // document for a host page to load them from, so they are inlined as
+    // strings and injected into the shadow root at mount.
+    loader: { ".html": "text", ".css": "text" },
     // Defined by the classic scripts loaded before these bundles.
     external: [],
     logLevel: "warning"

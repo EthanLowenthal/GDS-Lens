@@ -1,6 +1,11 @@
 import { rankCellMatches, cellPathToTarget } from "./cell-search.js";
 import { parseMarkerFile, flattenMarkerModel } from "./marker-parsers.js";
 import { describeLoadFailure } from "./load-errors.js";
+// Inlined at build time (esbuild's text loader), because a component has to
+// carry its own markup and styles: there is no separate document for a host
+// page to load them from.
+import shellHtml from "./viewer-shell.html";
+import viewerCss from "./viewer.css";
 
 // Thin bootstrap: instantiate the wasm module and relay postMessage payloads
 // from the extension host into it. JS never touches GDS/GL data -- that all
@@ -18,20 +23,27 @@ import { describeLoadFailure } from "./load-errors.js";
 // back the flattened geometry, this thread's Module.uploadLayers() does the
 // (fast, GPU-bound) VBO upload -- the only part that needs the GL context.
 
-// ---- Element refs ----
-// The root this viewer owns. `document` while the payload is a whole page;
-// the one thing that has to change to put two viewers on one page, or to move
-// the subtree into a shadow root, is this line -- document.getElementById()
-// searches the whole document and does not cross a shadow boundary, so every
-// lookup goes through here instead.
-const viewerRoot = document;
+// ---- Mounting ----
+// The viewer lives in a shadow root so it can be dropped into a page that has
+// its own styles: nothing here escapes, and nothing outside reaches in. The
+// host element is created here if the page has not placed a <gds-lens>
+// itself, so opening the payload as a plain page still works.
+const hostElement = document.querySelector("gds-lens") ||
+    document.body.appendChild(document.createElement("gds-lens"));
+const shadow = hostElement.shadowRoot || hostElement.attachShadow({ mode: "open" });
+shadow.innerHTML = `<style>${viewerCss}</style>${shellHtml}`;
+
+// Every lookup is scoped to the shadow root. ShadowRoot is a DocumentFragment,
+// which implements NonElementParentNode, so getElementById works on it exactly
+// as on a document.
+const viewerRoot = shadow;
 
 // The element carrying the viewer's state classes (theme-light, debug,
-// hierarchy-open, ...), which viewer.html's CSS selects on. Separate from
-// viewerRoot because a document is not an element: when the subtree moves
-// into a container these become that container, and the CSS selectors move
-// with them.
-const rootEl = document.body;
+// hierarchy-open, ...), which viewer.css selects on. The host element rather
+// than the shadow root, because a DocumentFragment is not an element and
+// cannot carry classes -- and because :host() then lets a page theme the
+// viewer from outside.
+const rootEl = hostElement;
 
 // Resolved in one pass at startup rather than one lookup per element. All of
 // these are static in viewer.html (nothing below creates an element with an
@@ -141,7 +153,12 @@ const hostCan = (name) => typeof host[name] === "function";
 const hostCall = (name, ...args) => (hostCan(name) ? host[name](...args) : undefined);
 console.log("[GDS] host ready, typeof createGdstkModule:", typeof createGdstkModule, "typeof lil:", typeof lil, "typeof Worker:", typeof Worker, "typeof Blob:", typeof Blob);
 
-const gui = new lil.GUI({ width: 260 });
+// container: the panel belongs inside the shadow root, not at document level.
+// injectStyles: false: lil-gui otherwise appends its stylesheet to
+// document.head, which a shadow root does not see, so the panel would render
+// unstyled. Its CSS is carried in viewer.css instead (see the lil-gui block
+// there), alongside everything else the shadow root owns.
+const gui = new lil.GUI({ width: 260, container: viewerRoot.getElementById("guiHost"), injectStyles: false });
 const actions = {
     // Clicking the row always opens the file dialog (load, or replace the
     // current file); the injected ✕ (see setFileChip) handles unloading.
@@ -2115,7 +2132,20 @@ let activeWorker = null;
 // View state captured for the in-flight reload, re-applied once its geometry
 // is uploaded. Null on a first open.
 let pendingViewState = null;
-const modulePromise = createGdstkModule();
+const modulePromise = createGdstkModule({
+    // Read by dom_root() in renderer.cpp for its own element lookups. Passed
+    // in the instantiation object so it is in place before main() runs.
+    gdsLensRoot: viewerRoot,
+    preRun: [(Module) => {
+        // Emscripten resolves an event/context target by consulting
+        // specialHTMLTargets before falling back to document.querySelector,
+        // which cannot see into a shadow root. Registering the canvas under
+        // the name renderer.cpp asks for is what lets the GL context and
+        // every mouse handler bind to an element the document cannot find.
+        // preRun is the last point before main() creates that context.
+        Module.specialHTMLTargets["!gdsLensCanvas"] = viewerRoot.getElementById("glCanvas");
+    }]
+});
 modulePromise.then(
     (Module) => {
         resolvedModule = Module;
@@ -2186,37 +2216,13 @@ applyTheme();
 // a sandboxed webview often cannot reach its own asset URLs from inside a
 // Worker and has to inline them instead.
 function createParseWorker() {
+    // A host that cannot serve URLs to a Worker supplies the script itself.
     if (hostCan("createWorker")) return host.createWorker();
 
-    // Inlined bundle: a host that cannot serve URLs to a Worker drops the
-    // whole script text, base64'd, into #workerBundle -- an inert
-    // type="text/plain" tag, so the bundle's own text can safely contain a
-    // literal "</script>".
-    // The tag ships holding a {{workerBundleBase64}} placeholder for a host
-    // that substitutes into it. Left unsubstituted it is still non-empty, so
-    // "has any content" is not the test: an unfilled placeholder means there
-    // is no inline bundle, and atob() on it throws a decode error that looks
-    // nothing like the missing substitution it actually is.
-    const inlineText = els.workerBundle ? els.workerBundle.textContent.trim() : "";
-    if (inlineText && !inlineText.startsWith("{{")) {
-        // atob() yields a "binary string" -- one JS char per raw byte
-        // (0-255), NOT real UTF-16 text. gdstk_wasm.js contains genuine
-        // non-ASCII bytes (its embedded wasm binary), so passing that string
-        // straight to `new Blob([...])` would have the Blob constructor
-        // UTF-8-*encode* it as if it were text, expanding every byte >=128
-        // into a 2-byte sequence and corrupting the wasm binary (surfaced as
-        // a WebAssembly.instantiate() "section was shorter than expected
-        // size" CompileError inside the worker). Converting to a Uint8Array
-        // first makes the Blob use the raw bytes as-is.
-        const bundleBytes = Uint8Array.from(atob(inlineText), (c) => c.charCodeAt(0));
-        console.log("[GDS] decoded inline worker bundle, length =", bundleBytes.length);
-        return new Worker(URL.createObjectURL(new Blob([bundleBytes], { type: "application/javascript" })));
-    }
-
-    // Ordinary page: pull the same two scripts in by URL. They have to be
-    // absolute -- importScripts() inside a blob Worker resolves relative URLs
-    // against the blob: URL rather than against the document, so bare
-    // filenames here would silently fail to load.
+    // Ordinary page: pull the two scripts in by URL. They have to be absolute
+    // -- importScripts() inside a blob Worker resolves relative URLs against
+    // the blob: URL rather than against the document, so bare filenames here
+    // would silently fail to load.
     const url = (name) => JSON.stringify(new URL(name, document.baseURI).href);
     const bootstrap = `importScripts(${url("gdstk_wasm.js")}, ${url("wasm-worker.js")});`;
     console.log("[GDS] building worker from document-relative script URLs");

@@ -81,19 +81,32 @@ test("the payload loads a layout as a plain web page", { skip: !built || !chromi
 
         // The overlay hides only once geometry has been uploaded, which means
         // the Worker started, wasm instantiated and the parse succeeded.
+        // Scoped to the shadow root: the viewer's elements are not reachable
+        // from the document, which is the point of mounting it in one.
         await page.waitForFunction(
-            () => document.getElementById("loadingOverlay")?.classList.contains("hidden"),
+            () => document.querySelector("gds-lens")?.shadowRoot
+                ?.getElementById("loadingOverlay")?.classList.contains("hidden"),
             { timeout: 60_000 });
 
         // #loadError hides via `:empty` in CSS rather than a class, so any
         // text in it at all is a failure.
         const loadError = await page.evaluate(
-            () => document.getElementById("loadError")?.textContent.trim() || null);
+            () => document.querySelector("gds-lens")?.shadowRoot
+                ?.getElementById("loadError")?.textContent.trim() || null);
         assert.equal(loadError, null, `viewer reported a load error: ${loadError}`);
 
         // fixtures/sample_layout.gds has shapes on layers 1/0 and 2/0.
         const layers = await page.evaluate(() => window.gdsLens.getLayerCount?.() ?? null);
         if (layers !== null) assert.ok(layers > 0, "no layers reached the renderer");
+
+        // The isolation is the point, so check it rather than assume it: none
+        // of the viewer's elements may be reachable from the document, and the
+        // page must not have inherited its styles.
+        const leaked = await page.evaluate(() => ({
+            byId: !!document.getElementById("glCanvas"),
+            styles: document.styleSheets.length
+        }));
+        assert.equal(leaked.byId, false, "viewer elements are reachable from the document");
 
         assert.deepEqual(errors, [], `uncaught errors on the page: ${errors.join("; ")}`);
     } finally {

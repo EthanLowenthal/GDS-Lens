@@ -104,7 +104,7 @@ target_link_options(gdstk_wasm PRIVATE
     # fail with the explicit message wasm-worker.js produces.
     -sMAXIMUM_MEMORY=4294967296
     -sENVIRONMENT=web,node
-    -sEXPORTED_RUNTIME_METHODS=FS,ccall
+    -sEXPORTED_RUNTIME_METHODS=FS,ccall,specialHTMLTargets
     -sNO_EXIT_RUNTIME=1
     # embind's invoker functions are normally generated via `new Function(...)`
     # (a JS string-eval), which needs CSP 'unsafe-eval' -- 'wasm-unsafe-eval'

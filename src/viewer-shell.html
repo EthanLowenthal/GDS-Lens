@@ -1,0 +1,93 @@
+<!-- lil-gui mounts its panel here rather than at document.body, so the
+     whole control surface lives inside the shadow root. -->
+<div id="guiHost"></div>
+    <div id="loadingOverlay">
+        <div id="loadingBarTrack"><div id="loadingBarFill"></div></div>
+        <div id="loadingPhase">Loading layout...</div>
+        <div id="loadingPercent"></div>
+    </div>
+    <div id="loadError"></div>
+    <div id="reloadProgress" class="hidden">
+        <div id="reloadBarTrack"><div id="reloadBarFill"></div></div>
+        <div id="reloadLabel">Reloading...</div>
+    </div>
+    <div id="staleBanner" class="hidden">
+        <span id="staleText">A newer version of this file is on disk.</span>
+        <button id="staleReloadBtn" type="button">Reload</button>
+        <button id="staleAlwaysBtn" type="button" class="secondary"
+                title="Reload now, and automatically whenever this file changes from now on">Always</button>
+        <span id="staleDismiss" title="Dismiss until the next change">✕</span>
+    </div>
+    <canvas id="glCanvas"></canvas>
+
+    <!-- Cell hierarchy: rows are built by renderHierarchy in viewer.js from
+         the tree parseGdsToLayers hands back, lazily as branches open. -->
+    <div id="hierarchyPanel" class="hidden">
+        <div id="hierarchyHeader">
+            <span id="hierarchyTitle">Hierarchy</span>
+            <span id="hierarchyCount"></span>
+            <span id="hierarchyHide" title="Hide the hierarchy tree (H)">✕</span>
+        </div>
+        <!-- Find (see the search block in viewer.js): one box over two
+             haystacks, the design's cell names and its own TEXT labels.
+             Results take the tree's place while a query is up.
+
+             Collapsed by default, and folded away behind one row rather than
+             sitting open above the tree: the panel is here to browse the
+             hierarchy, and two more rows of chrome over it are two fewer rows
+             of the thing being browsed. "/" opens it and lands in the box, so
+             the fold costs nothing to whoever is actually searching. -->
+        <div id="hierarchyFind">
+            <div id="hierarchyFindToggle"
+                 title="Find a cell by name, or a label by its text (/)">
+                <span id="hierarchyFindTwisty">▸</span>
+                <span id="hierarchyFindLabel">Find</span>
+                <span id="hierarchySearchCount"></span>
+            </div>
+            <div id="hierarchySearch" class="hidden">
+                <input id="hierarchySearchInput" type="text" placeholder="cell name"
+                       spellcheck="false" autocomplete="off"
+                       title="Find a cell by name, or a label by its text (/ focuses this box)">
+                <div id="hierarchyScope">
+                    <button id="hierarchyScopeCells" type="button"
+                            title="Search the design's cell names">Cells</button>
+                    <button id="hierarchyScopeLabels" type="button"
+                            title="Search the layout's own TEXT labels">Labels</button>
+                </div>
+            </div>
+        </div>
+        <div id="hierarchyTree"></div>
+        <div id="hierarchyResults" class="hidden"></div>
+    </div>
+    <button id="hierarchyShowBtn" type="button" class="hidden"
+            title="Show the design's cell hierarchy (H)">Hierarchy</button>
+
+    <div id="debugPanel" class="hidden">
+        <div id="debugPanelHeader">
+            <span>Debug tools</span>
+            <button id="debugCopyBtn" type="button">Copy log</button>
+        </div>
+        <div id="debugBody">
+            <!-- Engine readout, written from renderer.cpp (set_inner_html("ui", ...)). -->
+            <div id="ui"></div>
+            <div id="debugLog"></div>
+        </div>
+    </div>
+    <button id="debugToggleBtn" type="button">Debug tools</button>
+
+    <div id="viewReadout">
+        <div id="copyToast" class="hidden"></div>
+        <div id="scaleContainer">
+            <div id="scaleLabel">0 μm</div>
+            <div id="scaleBar" style="width: 100px;"></div>
+        </div>
+        <div id="coordReadout" class="hidden"></div>
+    </div>
+
+    <div id="measureLabels"></div>
+
+    <div id="canvasMenu" class="hidden" role="menu">
+        <button id="canvasMenuCopy" type="button" role="menuitem">
+            <span>Copy coordinate</span><span class="menu-value"></span>
+        </button>
+    </div>
