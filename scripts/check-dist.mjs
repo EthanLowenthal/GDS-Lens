@@ -31,7 +31,7 @@ const SOURCES = [
     "src/wasm/renderer.cpp", "src/wasm/lyp_util.cpp",
     "src/wasm/stroke_font.cpp", "src/wasm/shaders.hpp",
     "src/viewer.js", "src/gds-lens.js", "src/wasm-worker.js", "src/hosts/browser.js",
-    "src/engine-source.js", "src/engine-source.esm.js",
+    "src/esm-entry.js", "src/engine-source.js", "src/engine-source.esm.js",
     "src/viewer-shell.html", "src/viewer.css", "src/viewer.html",
 ];
 

@@ -91,6 +91,10 @@ export type LayoutSource = string | Uint8Array | ArrayBuffer;
  * actually connects.
  *
  * `display: block` with no intrinsic height, so give it one.
+ *
+ * Each element drives its own viewer, so several can be live at once. Each
+ * one costs a WebAssembly instance and a WebGL2 context, and browsers cap
+ * live contexts per page at roughly eight to sixteen.
  */
 export declare class GdsLens extends HTMLElement {
     /**
@@ -117,6 +121,18 @@ export declare class GdsLens extends HTMLElement {
 
     /** Replaces the view with an error message. */
     showError(message: string): Promise<void>;
+
+    /**
+     * Gives up this element's viewer for good, releasing its WebAssembly
+     * instance and WebGL context.
+     *
+     * Rarely needed. Removing an element from the DOM *parks* its viewer
+     * instead, so the next `<gds-lens>` to mount adopts it and a framework
+     * remount costs nothing -- which is what you want almost always. Call
+     * this only on a page that creates viewers it will never use again, and
+     * is running into the browser's per-page context limit.
+     */
+    destroy(): Promise<void>;
 }
 
 declare global {
@@ -129,6 +145,10 @@ declare global {
         /**
          * Published by the default browser host (not by the element), so a
          * plain page can drive the viewer from a script tag or the console.
+         *
+         * With more than one viewer on the page this is the one that mounted
+         * most recently, since there is only one global to hold it. Reach a
+         * specific viewer through its element instead.
          */
         gdsLens?: ViewerSurface;
     }

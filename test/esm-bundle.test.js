@@ -69,8 +69,13 @@ test("the bundled module carries everything it needs", { skip }, async () => {
     const bareImports = imports.filter((m) => !m.includes("("));
     assert.deepEqual(bareImports, [], "the bundle has unresolved static imports");
 
-    // The pieces that used to live in sibling files.
-    assert.match(text, /gdsLensHost/, "the default host is not bundled");
+    // The pieces that used to live in sibling files. The host is checked by
+    // something only its implementation contains -- matching "gdsLensHost"
+    // proves nothing, because viewer.js reads that global itself, so the
+    // identifier was in the bundle for years while the host was not.
+    assert.match(text, /createBrowserHost/, "the default host is not bundled");
+    assert.match(text, /gds-lens:named-views/,
+        "the default host is bundled but not its localStorage-backed saved views");
     assert.match(text, /lil-gui/, "lil-gui is not bundled");
     assert.match(text, /type:\s*"module"/, "the worker is not created as a module worker");
 
@@ -112,6 +117,50 @@ const consumerPage = `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 <gds-lens src="SRC"></gds-lens>
 <script type="module" src="gds-lens.js"></script>
 </body></html>`;
+
+// The default host is the half of the package that talks to the environment:
+// the .lyp and marker pickers, saved views, drag-and-drop, ?src=. In the
+// served payloads it arrives as gds-lens-host.js, which a consumer of the
+// bundled module has no way to load -- so the bundle has to carry it. It did
+// not, and the symptom was a console error insisting no layout would ever
+// appear on a page whose layout had loaded perfectly well.
+test("importing the module installs a working default host",
+     { skip: skip || (!chromium && "playwright's chromium is missing") }, async () => {
+    const server = await serve({ "index.html": consumerPage.replace("SRC", "sample_layout.gds") });
+    const browser = await chromium.launch({
+        args: ["--use-gl=angle", "--use-angle=swiftshader"],
+    });
+    const page = await browser.newPage();
+    const consoleErrors = [];
+    page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text()); });
+    try {
+        await page.goto(`http://127.0.0.1:${server.address().port}/`);
+        await page.waitForFunction(
+            () => document.querySelector("gds-lens")?.shadowRoot
+                ?.getElementById("loadingOverlay")?.classList.contains("hidden"),
+            { timeout: 60_000 });
+
+        assert.equal(await page.evaluate(() => typeof window.gdsLensHost), "object",
+            "no default host was installed");
+        // connect() ran, which is what publishes the surface and binds
+        // drag-and-drop. Its absence is how the missing host went unnoticed:
+        // the element's own load() does not go through the host at all.
+        assert.equal(await page.evaluate(() => typeof window.gdsLens?.load), "function",
+            "the host never called connect()");
+
+        // The controls the viewer removes when the host cannot back them.
+        const ui = await page.evaluate(
+            () => document.querySelector("gds-lens").shadowRoot.textContent);
+        assert.match(ui, /Load \.lyp/, "the .lyp picker was removed: no pickLyp on the host");
+        assert.match(ui, /Load Marker File/, "the marker picker was removed: no pickMarkers");
+
+        assert.deepEqual(consoleErrors, [],
+            `the console should be clean: ${consoleErrors.join(" | ")}`);
+    } finally {
+        await browser.close();
+        server.close();
+    }
+});
 
 for (const fixture of ["sample_layout.gds", "sample_layout.gds.gz", "sample_layout.oas"]) {
     test(`a page with only the module loads ${fixture}`,

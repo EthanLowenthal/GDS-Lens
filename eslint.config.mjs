@@ -65,7 +65,7 @@ export default [
         ignores: ["src/wasm/build/**", "dist/**", "emsdk-cache/**"],
     },
     // The viewer's main thread: browser globals plus the vendored ones.
-    module_(["src/viewer.js", "src/gds-lens.js", "src/mount-target.js",
+    module_(["src/viewer.js", "src/gds-lens.js", "src/esm-entry.js",
              "src/engine-source.js", "src/engine-source.esm.js"],
         { ...globals.browser, ...vendorGlobals, ...buildFlags }),
     // The parse Worker: its own global scope, with no DOM in it.
@@ -86,7 +86,7 @@ export default [
         // Chromium, so `window` and `document` in them are real.
         files: ["test/browser-smoke.test.js", "test/custom-element.test.js",
             "test/host-contract.test.js", "test/viewer-ui.test.js",
-            "test/esm-bundle.test.js"],
+            "test/esm-bundle.test.js", "test/react.test.js"],
         languageOptions: {
             globals: { ...globals.node, ...globals.browser },
             ecmaVersion: 2022,

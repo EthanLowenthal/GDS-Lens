@@ -1,5 +1,5 @@
 {
-    "//": "Type-checks types/*.d.ts against smoke.ts. Emits nothing, and lives here rather than in types/ so it stays out of the published tarball.",
+    "//": "Type-checks types/*.d.ts against smoke.ts, and the README's JSX declaration against jsx-smoke.tsx (hence `jsx`). Emits nothing, and lives here rather than in types/ so it stays out of the published tarball.",
     "compilerOptions": {
         "strict": true,
         "noEmit": true,
@@ -8,7 +8,8 @@
         "moduleResolution": "NodeNext",
         "lib": ["ES2022", "DOM"],
         "skipLibCheck": false,
-        "types": []
+        "types": [],
+        "jsx": "react-jsx"
     },
-    "include": ["../../types/*.d.ts", "smoke.ts"]
+    "include": ["../../types/*.d.ts", "smoke.ts", "jsx-smoke.tsx"]
 }

@@ -36,6 +36,13 @@ export function createBrowserHost() {
     // identity to key on, so everything in one page shares a bucket. Wrapped
     // because storage throws outright in some privacy modes rather than
     // merely coming back empty.
+    //
+    // Shared across viewers, too, which matters on a page with more than one:
+    // each reads the bucket once at mount, so two viewers that both save a
+    // view write whole sets over each other and the later one wins. Fixing it
+    // needs a document identity to key on, which is exactly what a plain page
+    // does not have -- an embedder that has one (a file path, a document URI)
+    // should implement loadViews/saveViews itself rather than inherit this.
     const VIEWS_KEY = "gds-lens:named-views";
     const readViews = () => {
         try {
@@ -92,6 +99,13 @@ export function createBrowserHost() {
             // viewer from the console or a script tag. This is the default
             // host's doing, not the element's: an embedder that replaces
             // gds-lens-host.js gets no such global unless it sets one.
+            //
+            // connect runs once per viewer, so on a page with several this
+            // ends up holding whichever mounted last -- there is one global
+            // and no name to distinguish them by. `viewer.element` is the way
+            // to a particular one. Left as a plain assignment rather than, say,
+            // a list, because the console convenience this exists for wants
+            // one obvious handle and a page with two viewers has the elements.
             window.gdsLens = viewer;
 
             const loadBytes = (bytes) => viewer.load(bytes, { reload: false });

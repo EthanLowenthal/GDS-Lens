@@ -178,7 +178,10 @@ async function buildEsm() {
     // code so that the Worker can share the one copy; see
     // engine-source.esm.js for why that matters.
     await build({
-        entryPoints: [join(root, "src/gds-lens.js")],
+        // esm-entry.js rather than gds-lens.js: the bundled module has to carry
+        // the default host too, since there is no sibling gds-lens-host.js for
+        // a consumer to load beside it. See src/esm-entry.js.
+        entryPoints: [join(root, "src/esm-entry.js")],
         outfile: join(out, "gds-lens.js"),
         bundle: true,
         format: "esm",
