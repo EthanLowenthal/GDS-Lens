@@ -1,6 +1,7 @@
 # GDS Lens
 
 [![npm](https://img.shields.io/npm/v/gds-lens.svg?style=flat-square&color=0f1720&label=NPM)](https://www.npmjs.com/package/gds-lens)
+[![Downloads](https://img.shields.io/npm/dt/gds-lens.svg?style=flat-square&color=0f1720&label=Downloads)](https://www.npmjs.com/package/gds-lens)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENCE.md)
 
 GDSII and OASIS chip layouts, parsed and rendered in the browser. A drop-in
