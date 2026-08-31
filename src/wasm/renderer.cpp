@@ -2077,11 +2077,11 @@ void draw_grid() {
 // exceeded kMaxTriangulatePoints (rendered outline-only in normal mode)
 // don't contribute here.
 void draw_layer_merged(const LayerBuffer& layer) {
-    bool has_fill = layer.fill_vbo != 0;
+    bool has_geometry = layer.fill_vbo != 0 || layer.outline_ebo != 0;
     for (const InstancedBatch& batch : layer.instanced_batches) {
-        if (batch.fill_vbo) has_fill = true;
+        if (batch.fill_vbo || batch.outline_ebo) has_geometry = true;
     }
-    if (!has_fill) return;
+    if (!has_geometry) return;
 
     // Pass 1: coverage mask, rasterized at g_mask_scale times the canvas
     // resolution for anti-aliasing (see kCompositeFragmentShaderSrc). Only
@@ -2104,13 +2104,41 @@ void draw_layer_merged(const LayerBuffer& layer) {
         glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
         glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
     }
-    for (const InstancedBatch& batch : layer.instanced_batches) {
-        if (!batch.fill_vbo) continue;
-        enable_instance_attribs(batch.instance_vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
+    // Boundaries as well as fill, because triangles alone lose thin geometry.
+    // A 0.5um waveguide on a full-chip view is a few hundredths of a pixel
+    // wide: it covers no sample, contributes nothing to the mask, and the
+    // layer disappears exactly where it is densest. Lines have a one-fragment
+    // minimum width, so drawing each polygon's boundary guarantees every
+    // shape leaves coverage behind however thin it has become on screen.
+    //
+    // Safe to do unconditionally. The mask is a union, so boundaries interior
+    // to it change nothing, and the outer edge gains at most half a mask texel
+    // (a quarter of a canvas pixel at the default scale). It also picks up the
+    // polygons too large to triangulate, which used to be missing from merged
+    // layers altogether.
+    if (layer.outline_ebo) {
+        glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
         glEnableVertexAttribArray(g_loc_position);
         glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-        glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
+        glDrawElements(GL_LINES, layer.outline_index_count, GL_UNSIGNED_INT, 0);
+    }
+    for (const InstancedBatch& batch : layer.instanced_batches) {
+        if (!batch.fill_vbo && !batch.outline_ebo) continue;
+        enable_instance_attribs(batch.instance_vbo);
+        glEnableVertexAttribArray(g_loc_position);
+        if (batch.fill_vbo) {
+            glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
+            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
+        }
+        if (batch.outline_ebo) {
+            glBindBuffer(GL_ARRAY_BUFFER, batch.outline_vbo);
+            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
+            glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
+                                    batch.instance_count);
+        }
         disable_instance_attribs();
     }
 
