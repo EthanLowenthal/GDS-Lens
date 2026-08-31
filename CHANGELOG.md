@@ -7,6 +7,26 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [1.0.3] - 2026-08-31
+
+### Fixed
+
+- Thin shapes vanished when "merge overlapping shapes" was on. The merge pass
+  builds a screen-space coverage mask out of fill triangles, but with infill
+  off a layer is normally drawn as outlines -- and a GL line covers at least
+  one fragment, while the triangles of a 0.5 um waveguide at fit zoom are about
+  0.04 px across and cover no sample at all. Every waveguide in a full-die view
+  simply disappeared. The mask now rasterises the outline edges as well as the
+  fill, so what merge mode shows is what the layer draws. Raising the mask's
+  supersampling was not the fix: even 8x still misses 0.04 px, at 16x the
+  memory.
+- `[` and `]` jumped into a different marker category. The step walked every
+  category that was ticked visible, so with a marker selected in a hidden
+  category the first press left it for an unrelated result somewhere else in
+  the file. Stepping now stays inside the selected marker's own category
+  whenever that category is hidden, including when the step runs off the end of
+  the list.
+
 ## [1.0.2] - 2026-08-25
 
 ### Changed
