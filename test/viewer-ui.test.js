@@ -336,6 +336,93 @@ test("a reload draws a clean frame, background grid included", { skip }, async (
 
 // ---- Marker-file warnings say what they are ----
 
+// ---- Touch ----
+
+test("one finger pans the layout and two pinch it", { skip }, async () => {
+    await withLoadedViewer(async (page) => {
+        // Synthetic TouchEvents rather than an emulated touchscreen: the
+        // gestures are ordinary listeners on the element (see the touch block
+        // in viewer.js), and constructing the events is what lets a test spell
+        // out the touch lists and the identifiers in them. `composed` is not
+        // optional -- without it the event never leaves the shadow root, which
+        // is exactly where the listeners are not.
+        //
+        // Worth guarding at all because the gestures used to live in
+        // renderer.cpp behind emscripten_set_touchstart_callback, where they
+        // worked in every browser that could be driven from a test and in none
+        // that anyone holds: on iOS Safari that callback never runs.
+        await page.evaluate(() => {
+            const root = document.querySelector("gds-lens").shadowRoot;
+            window.canvas = root.getElementById("glCanvas");
+            window.readout = root.getElementById("coordReadout");
+            // The world coordinate under a canvas pixel, which is the only
+            // read on the camera this side has: the renderer writes it on
+            // every mousemove.
+            window.worldAt = (x, y) => {
+                const box = window.canvas.getBoundingClientRect();
+                window.canvas.dispatchEvent(new MouseEvent("mousemove", {
+                    bubbles: true, composed: true,
+                    clientX: box.left + x, clientY: box.top + y
+                }));
+                const [, wx, wy] = window.readout.textContent.match(/X:\s*(-?[\d.]+)\s+Y:\s*(-?[\d.]+)/);
+                return { x: parseFloat(wx), y: parseFloat(wy) };
+            };
+            window.touch = (type, points, changed = points) => {
+                const box = window.canvas.getBoundingClientRect();
+                const make = ([id, x, y]) => new Touch({
+                    identifier: id, target: window.canvas,
+                    clientX: box.left + x, clientY: box.top + y
+                });
+                const touches = points.map(make);
+                window.canvas.dispatchEvent(new TouchEvent(type, {
+                    bubbles: true, cancelable: true, composed: true,
+                    touches, targetTouches: touches, changedTouches: changed.map(make)
+                }));
+            };
+        });
+
+        // µm per 100 canvas px, i.e. 100/zoom, read off two points.
+        const scale = () => page.evaluate(() => window.worldAt(300, 200).x - window.worldAt(200, 200).x);
+
+        const perPx = (await scale()) / 100;
+        const panned = await page.evaluate(() => {
+            const before = window.worldAt(200, 200);
+            window.touch("touchstart", [[1, 150, 200]]);
+            for (let i = 1; i <= 4; i++) window.touch("touchmove", [[1, 150 + i * 50, 200]]);
+            window.touch("touchend", [], [[1, 350, 200]]);
+            return { before, after: window.worldAt(200, 200) };
+        });
+        // A finger dragged 200 px to the right brings the layout with it, so
+        // the world under a fixed pixel moves 200 px worth of µm to the left.
+        // The tolerance is set by the readout, not by the arithmetic: it is
+        // rounded for reading, so two of them subtracted carry its granularity.
+        const expected = 200 * perPx;
+        assert.ok(Math.abs((panned.after.x - panned.before.x) + expected) < 0.25 + expected * 0.1,
+                  `one finger did not pan: ${panned.before.x} -> ${panned.after.x} µm, ` +
+                  `expected a move of ${-expected.toFixed(2)}`);
+
+        // Fingers 200 px apart pulled to 400 px apart double the zoom, and the
+        // point under the midpoint they share stays where it is.
+        const before = await scale();
+        const mid = await page.evaluate(() => window.worldAt(250, 200));
+        await page.evaluate(() => {
+            window.touch("touchstart", [[1, 150, 200], [2, 350, 200]]);
+            for (let i = 1; i <= 4; i++) {
+                const half = 100 + i * 25;
+                window.touch("touchmove", [[1, 250 - half, 200], [2, 250 + half, 200]]);
+            }
+            window.touch("touchend", [], [[1, 50, 200], [2, 450, 200]]);
+        });
+        const after = await scale();
+        const midAfter = await page.evaluate(() => window.worldAt(250, 200));
+        assert.ok(Math.abs(after - before / 2) < before * 0.05,
+                  `pinch did not double the zoom: ${before} -> ${after} µm per 100 px`);
+        const slack = 0.25 + Math.abs(after) * 0.05;
+        assert.ok(Math.abs(midAfter.x - mid.x) < slack && Math.abs(midAfter.y - mid.y) < slack,
+                  `pinch did not hold its midpoint: ${JSON.stringify(mid)} -> ${JSON.stringify(midAfter)}`);
+    });
+});
+
 test("the marker browser spells out its warnings, not just a count", { skip }, async () => {
     await withLoadedViewer(async (page) => {
         // The warnings used to be a single inert row reading "⚠ 2 warnings",

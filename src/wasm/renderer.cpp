@@ -3404,10 +3404,27 @@ constexpr double kLinesPerNotch = 3.0;
 // one stray event crosses decades of zoom in a frame.
 constexpr double kMaxNotchesPerEvent = 4.0;
 
-// Zooms around the cursor rather than the view center: the world point
-// currently under the mouse (computed from the vertex shader's inverse --
-// see kVertexShaderSrc) is held fixed on screen across the zoom change by
-// solving for the new pan that keeps it there.
+// Applies a new zoom while holding still whatever the world point under a
+// given canvas pixel is, which is what makes a zoom happen where it was asked
+// for rather than at the middle of the screen. That point (computed from the
+// vertex shader's inverse -- see kVertexShaderSrc) is solved back into the pan
+// that keeps it under the same pixel. The wheel zooms with it; so does the
+// touch pinch, from JS, by way of getCamera/setCamera (see viewer.js).
+void zoom_about_canvas_point(float new_zoom, float target_x, float target_y) {
+    float old_zoom = g_zoom;
+    if (new_zoom == old_zoom) return;
+    float px = target_x - (float)g_canvas_width * 0.5f;
+    float py = (float)g_canvas_height * 0.5f - target_y;
+    float world_x = g_pan_x + px / old_zoom;
+    float world_y = g_pan_y + py / old_zoom;
+    g_zoom = new_zoom;
+    g_pan_x = world_x - px / new_zoom;
+    g_pan_y = world_y - py / new_zoom;
+    clamp_pan();
+}
+
+// Zooms around the cursor (see zoom_about_canvas_point) rather than the view
+// center.
 //
 // The zoom step is proportional to how far the event says the wheel turned,
 // not one fixed step per event. A stepped mouse wheel sends one event per
@@ -3423,20 +3440,10 @@ bool on_wheel(int /*eventType*/, const EmscriptenWheelEvent* e, void* /*userData
     }
     notches = std::max(-kMaxNotchesPerEvent, std::min(kMaxNotchesPerEvent, notches));
 
-    float old_zoom = g_zoom;
     // deltaY > 0 is a scroll away from the viewer, which zooms out.
     float factor = (float)std::pow(kZoomPerNotch, -notches);
-    float new_zoom = clamp_zoom_value(old_zoom * factor);
-    if (new_zoom != old_zoom) {
-        float px = (float)e->mouse.targetX - (float)g_canvas_width * 0.5f;
-        float py = (float)g_canvas_height * 0.5f - (float)e->mouse.targetY;
-        float world_x = g_pan_x + px / old_zoom;
-        float world_y = g_pan_y + py / old_zoom;
-        g_zoom = new_zoom;
-        g_pan_x = world_x - px / new_zoom;
-        g_pan_y = world_y - py / new_zoom;
-        clamp_pan();
-    }
+    zoom_about_canvas_point(clamp_zoom_value(g_zoom * factor),
+                            (float)e->mouse.targetX, (float)e->mouse.targetY);
     update_scale_bar();
     // The pointer hasn't moved, but the world under it has. The readout itself
     // is refreshed by the redraw below (see draw_frame), which is what covers

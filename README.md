@@ -32,10 +32,10 @@ import "gds-lens";   // registers <gds-lens>
 <gds-lens src="chip.gds" style="width: 100%; height: 600px"></gds-lens>
 ```
 
-That's the whole thing. Pan with the mouse, zoom with the wheel. The import
-pulls in one self-contained module — the parser, the renderer, the WebAssembly
-binary, and the control panel — so there is nothing to copy and nothing
-else to serve.
+That's the whole thing. Pan with the mouse, zoom with the wheel; on a touch
+screen, drag to pan and pinch to zoom. The import pulls in one self-contained
+module — the parser, the renderer, the WebAssembly binary, and the control
+panel — so there is nothing to copy and nothing else to serve.
 
 Or drive it from JavaScript:
 

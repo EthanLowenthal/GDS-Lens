@@ -133,6 +133,19 @@
         .note { flex: 1 1 auto; }
         nav { margin-left: 0; }
     }
+
+    /* On a phone the page is the viewer, so the chrome around it goes: the
+       description, the file button and its status line in the header, and the
+       what-it-is-built-from line in the footer. Two of those are unusable here
+       anyway -- there is no drag-and-drop on touch, and the picker's extension
+       filter greys out .gds/.oas in the iOS Files app -- and the rest is
+       reading matter competing with the layout for a small screen. The name,
+       the links and the build stay. */
+    @media (max-width: 620px) {
+        .tagline, #open, #status, #stack { display: none; }
+        header { padding: 8px 14px; }
+        footer { padding: 6px 14px; }
+    }
 </style>
 </head>
 <body>
@@ -156,7 +169,7 @@
 
 <footer>
     <span id="build">gds-lens</span>
-    <span>Parsing is <a href="https://github.com/heitzmann/gdstk">gdstk</a>
+    <span id="stack">Parsing is <a href="https://github.com/heitzmann/gdstk">gdstk</a>
         compiled to WebAssembly; rendering is WebGL2.</span>
     <span style="margin-left:auto">
         <a href="https://github.com/EthanLowenthal/GDS-Lens/blob/main/LICENCE.md">MIT</a>

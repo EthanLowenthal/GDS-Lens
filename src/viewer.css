@@ -110,7 +110,12 @@
            against it rather than against the page. */
         :host { display: block; position: relative; width: 100%; height: 100%; overflow: hidden;
                 background: var(--bg); user-select: none; color: var(--fg); }
-        canvas { width: 100%; height: 100%; display: block; }
+        /* touch-action: none hands every gesture over the canvas to the touch
+           handlers in renderer.cpp: without it the browser claims a drag for
+           page scrolling and a pinch for its own page zoom before the handlers
+           see the second event, and it is also what turns off double-tap zoom
+           over the layout. */
+        canvas { width: 100%; height: 100%; display: block; touch-action: none; }
         /* The engine readout (polygon/label counts + the per-frame #renderStats
            span, both written from renderer.cpp). It lives inside #debugPanel
            rather than floating over the canvas on its own: it's debug-only
@@ -195,6 +200,15 @@
            overlay (30) and debug panel (40) rather than lil-gui's 1001. */
         #guiHost { position: absolute; top: 0; right: 15px; max-height: 100%; z-index: 20; display: flex; }
         #guiHost > .lil-gui.lil-root { max-height: 100%; }
+        /* Both panels are sized for a window, and a phone is narrower than
+           either of them plus anything worth seeing. Capped rather than
+           reflowed: they still open over the layout, but never across all of
+           it. (The control panel also starts collapsed here -- see touchOnly
+           in viewer.js.) */
+        @media (pointer: coarse) and (hover: none) {
+            #guiHost > .lil-gui.lil-root { max-width: 85vw; }
+            #hierarchyPanel { width: min(260px, 85vw); }
+        }
         /* Checkbox rows (layer list + top-level toggles): lil-gui gives the
            label a 45% min-width and no overflow handling, so a long name like
            "250/74 – SIN_WG_S" would push into the checkbox column. Widen the
@@ -236,6 +250,10 @@
            buttons a readable width. */
         .lil-gui .lil-controller.mode-row .lil-name { min-width: 30%; }
         .lil-gui .lil-controller.mode-row .mode-widget { gap: 4px; }
+        /* Greyed out where the mode is not offered (see touchOnly in
+           viewer.js). lil-gui dims a whole disabled controller, but has no rule
+           for one disabled button inside a live row. */
+        .lil-gui .lil-controller.mode-row .mode-widget button:disabled { opacity: 0.5; cursor: default; }
         .lil-gui .lil-controller.mode-row .mode-widget button { flex: 1; }
         /* :hover/:active spelled out too -- lil-gui's own button:hover rule
            outranks a bare .mode-active, which would grey out the selected

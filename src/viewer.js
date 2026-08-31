@@ -311,6 +311,14 @@ export function createViewer(mountTarget) {
     // unstyled. Its CSS is carried in viewer.css instead (see the lil-gui block
     // there), alongside everything else the shadow root owns.
     const gui = new GUI({ width: 260, container: viewerRoot.getElementById("guiHost"), injectStyles: false });
+
+    // A touch-only device: coarse pointer *and* no hover, so a touchscreen
+    // laptop (coarse pointer, but a mouse too) is not one. Two things follow
+    // from it -- the panel starts collapsed, and measure mode is withheld --
+    // and both are about the same thing: what a fingertip can do, and how much
+    // room there is to do it in.
+    const touchOnly = typeof window.matchMedia === "function"
+        && window.matchMedia("(pointer: coarse) and (hover: none)").matches;
     const actions = {
         // Clicking the row always opens the file dialog (load, or replace the
         // current file); the injected ✕ (see setFileChip) handles unloading.
@@ -363,6 +371,13 @@ export function createViewer(mountTarget) {
     const markerController = displayFolder.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
     displayFolder.add(actions, "resetView").name("Reset View");
 
+    // On a phone the panel is most of the screen, so it starts collapsed to its
+    // title bar rather than opening over the layout: the point of arriving is
+    // to see the design, and one tap on the bar brings the controls back. Left
+    // open everywhere a pointer hovers, where it costs a corner of a much
+    // larger window.
+    if (touchOnly) gui.close();
+
     // ---- Interaction mode (Pan / Measure) ----
     // The canvas can only do one thing with a click, so the two are exclusive
     // modes rather than an "on top of panning" toggle: in Pan mode a drag moves
@@ -399,6 +414,16 @@ export function createViewer(mountTarget) {
         btn.type = "button";
         btn.textContent = mode.label;
         btn.title = mode.title;
+        // Measuring is left to the compatibility mouse events a tap produces
+        // (the canvas's touch handlers in renderer.cpp bow out while the mode
+        // is on), and on a touch-only device that is a poor tool: with no
+        // hover the snap indicator only appears after the tap that already
+        // used it, and the point it snapped to is under a fingertip. Offered
+        // greyed out rather than half-working.
+        if (mode.id === "measure" && touchOnly) {
+            btn.disabled = true;
+            btn.title = "Measuring needs a pointer that hovers: use a mouse or a trackpad.";
+        }
         btn.addEventListener("click", () => setMode(mode.id));
         modeWidget.appendChild(btn);
         modeButtons.set(mode.id, btn);
@@ -413,6 +438,8 @@ export function createViewer(mountTarget) {
     gui.$children.prepend(modeRow);
 
     function setMode(id) {
+        // Also guards the M key, which calls straight in here.
+        if (id === "measure" && touchOnly) return;
         if (currentMode === id) return;
         currentMode = id;
         for (const [modeId, btn] of modeButtons) {
@@ -470,6 +497,167 @@ export function createViewer(mountTarget) {
             if (currentMode !== "measure") return;
             setTimeout(() => modulePromise.then(refreshRulerRow), 0);
         });
+
+        // ---- Touch: one finger pans, two pinch about their midpoint ----
+        //
+        // Here rather than in renderer.cpp, where the mouse and wheel handlers
+        // live, because Emscripten's touch marshalling never reaches the C++
+        // callback on iOS Safari: the events arrive at the canvas, and the
+        // handler behind emscripten_set_touchstart_callback does not run.
+        // Driving the camera through getCamera/setCamera is the same
+        // arithmetic (see zoom_about_canvas_point in renderer.cpp) with
+        // nothing between the DOM event and the state it changes.
+        //
+        // Bound to the host element and filtered by composedPath rather than
+        // bound to the canvas: a touch sequence keeps the target it started
+        // on, so this sees a whole gesture that began on the layout, and never
+        // sees one that began on the control panel -- which is what leaves the
+        // layer list scrollable.
+        //
+        // Fingers are tracked by identifier, never by their index in the touch
+        // list: that list is rebuilt on every event, so the slot a gesture
+        // started in can hold a different finger a frame later.
+        let panId = null;
+        let pinch = null;       // { a, b, dist } while two fingers are down
+        let lastX = 0, lastY = 0;   // client px: the pan finger, or the midpoint
+
+        // Below this the fingers are close enough that the distance ratio is
+        // mostly noise, and one jittery frame would multiply the zoom by an
+        // arbitrary amount.
+        const MIN_PINCH_PX = 8;
+
+        const touchById = (list, id) => {
+            for (const touch of list) if (touch.identifier === id) return touch;
+            return null;
+        };
+        const spread = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+        const onCanvas = (event) => event.composedPath().includes(glCanvas);
+
+        // Holds the world point under a canvas pixel still across a zoom
+        // change: the same inverse the vertex shader applies, solved for the
+        // pan that puts that point back under the same pixel.
+        function zoomAbout(camera, newZoom, pixelX, pixelY) {
+            const dx = pixelX - glCanvas.clientWidth / 2;
+            const dy = glCanvas.clientHeight / 2 - pixelY;
+            const worldX = camera.panX + dx / camera.zoom;
+            const worldY = camera.panY + dy / camera.zoom;
+            return { zoom: newZoom, panX: worldX - dx / newZoom, panY: worldY - dy / newZoom };
+        }
+
+        // Measure mode places its ruler by tapping, which arrives as the
+        // compatibility mouse events renderer.cpp already handles, so the
+        // gesture is left alone while it is on.
+        const touchIdle = () => currentMode === "measure" || !resolvedModule;
+
+        hostElement.addEventListener("touchstart", (event) => {
+            if (touchIdle() || !onCanvas(event)) return;
+            const touches = event.touches;
+            if (touches.length >= 2) {
+                // A third finger is ignored rather than reseating the pinch,
+                // which would jump the view mid-zoom.
+                if (!pinch) {
+                    const [a, b] = touches;
+                    pinch = { a: a.identifier, b: b.identifier, dist: spread(a, b) };
+                    panId = null;
+                    lastX = (a.clientX + b.clientX) / 2;
+                    lastY = (a.clientY + b.clientY) / 2;
+                }
+            } else if (touches.length === 1) {
+                panId = touches[0].identifier;
+                lastX = touches[0].clientX;
+                lastY = touches[0].clientY;
+            }
+            // Without this the browser takes the gesture for page scrolling or
+            // its own pinch zoom, whatever touch-action says.
+            event.preventDefault();
+        }, { passive: false });
+
+        hostElement.addEventListener("touchmove", (event) => {
+            if (touchIdle() || !onCanvas(event)) return;
+            let camera = resolvedModule.getCamera();
+
+            if (pinch) {
+                const a = touchById(event.touches, pinch.a);
+                const b = touchById(event.touches, pinch.b);
+                if (a && b) {
+                    // Two things at once, and both are wanted: the midpoint
+                    // travelling across the glass drags the layout exactly as
+                    // one finger would, and the fingers' separation changing
+                    // zooms about that midpoint. Panning first, at the
+                    // pre-zoom scale, keeps the two independent.
+                    const midX = (a.clientX + b.clientX) / 2;
+                    const midY = (a.clientY + b.clientY) / 2;
+                    camera = {
+                        zoom: camera.zoom,
+                        panX: camera.panX - (midX - lastX) / camera.zoom,
+                        panY: camera.panY + (midY - lastY) / camera.zoom
+                    };
+                    lastX = midX;
+                    lastY = midY;
+
+                    const dist = spread(a, b);
+                    if (dist >= MIN_PINCH_PX && pinch.dist >= MIN_PINCH_PX) {
+                        const rect = glCanvas.getBoundingClientRect();
+                        camera = zoomAbout(camera, camera.zoom * dist / pinch.dist,
+                                           midX - rect.left, midY - rect.top);
+                        pinch.dist = dist;
+                    }
+                    // setCamera clamps both zoom and pan and asks for a redraw,
+                    // so the next getCamera reads back what was allowed rather
+                    // than what was asked for, and nothing drifts.
+                    resolvedModule.setCamera(camera.zoom, camera.panX, camera.panY);
+                    event.preventDefault();
+                }
+                return;
+            }
+
+            const finger = panId === null ? null : touchById(event.touches, panId);
+            if (!finger) return;
+            resolvedModule.setCamera(camera.zoom,
+                                     camera.panX - (finger.clientX - lastX) / camera.zoom,
+                                     camera.panY + (finger.clientY - lastY) / camera.zoom);
+            lastX = finger.clientX;
+            lastY = finger.clientY;
+            event.preventDefault();
+        }, { passive: false });
+
+        // touchend and touchcancel want the same thing: forget the fingers that
+        // are gone, and keep whatever gesture the ones still down can support.
+        // event.touches is already only the fingers still on the glass.
+        const endTouch = (event) => {
+            if (pinch) {
+                const a = touchById(event.touches, pinch.a);
+                const b = touchById(event.touches, pinch.b);
+                if (a && b) return;
+                // Lifting one finger of a pinch hands the gesture to the other
+                // rather than ending it. Otherwise the survivor is picked up as
+                // a fresh pan only at its next move, and the view jumps by
+                // however far it travelled since the lift.
+                const survivor = a || b;
+                pinch = null;
+                panId = survivor ? survivor.identifier : null;
+                if (survivor) {
+                    lastX = survivor.clientX;
+                    lastY = survivor.clientY;
+                }
+                return;
+            }
+            if (panId !== null && !touchById(event.touches, panId)) panId = null;
+        };
+        hostElement.addEventListener("touchend", endTouch);
+        hostElement.addEventListener("touchcancel", endTouch);
+
+        // iOS Safari answers a two-finger pinch with its own page zoom,
+        // delivered as a proprietary GestureEvent rather than through the touch
+        // events, and it can do that over an element that has already claimed
+        // the gesture with touch-action: none. Refused here so the pinch
+        // reaches the touch handlers in renderer.cpp instead -- and refused on
+        // the canvas alone, never on the page, so a pinch anywhere else in an
+        // embedding page still zooms it. A no-op in every other browser:
+        // nothing else fires these.
+        for (const type of ["gesturestart", "gesturechange", "gestureend"]) {
+            glCanvas.addEventListener(type, (event) => event.preventDefault());
+        }
     }
 
     // Reflects a loaded-file state in a lil-gui button row (used by both the
