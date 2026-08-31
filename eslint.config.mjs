@@ -89,7 +89,7 @@ export default [
         files: ["test/browser-smoke.test.js", "test/custom-element.test.js",
             "test/host-contract.test.js", "test/viewer-ui.test.js",
             "test/esm-bundle.test.js", "test/react.test.js",
-            "scripts/check-site.mjs"],
+            "scripts/check-site.mjs", "scripts/make-og-image.mjs"],
         languageOptions: {
             globals: { ...globals.node, ...globals.browser },
             ecmaVersion: 2022,

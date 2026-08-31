@@ -81,9 +81,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _site
-          # The page, its script, and the demo layout. The generator script is
-          # left behind: it is how the .gds was made, not part of the site.
-          cp site/index.html site/demo.js site/demo-layout.gds _site/
+          # Everything site/ holds except two things: the asset generator,
+          # which is how the demo files were made rather than part of the site,
+          # and any local copy of the payload, which comes from the tarball
+          # below. A loop rather than a list of filenames, so adding an asset
+          # does not silently fail to deploy.
+          for f in site/*; do
+            case "$(basename "$f")" in
+              *.py|gds-lens*) continue ;;
+            esac
+            cp "$f" _site/
+          done
+
+          # What the footer reads. The page has no other way to know which
+          # published version it is running, and "which version is this?" is
+          # the first thing anyone asks of a live demo.
+          printf '{"version":"%s","built":"%s"}\n' \
+            "$(node -p 'require("/tmp/pkg/package/package.json").version')" \
+            "$(date -u +%Y-%m-%d)" > _site/build.json
           # The payload has to sit beside the page, not in a subdirectory: the
           # parse Worker resolves its own scripts against document.baseURI.
           cp /tmp/pkg/package/dist/web/gds-lens-engine.js \
