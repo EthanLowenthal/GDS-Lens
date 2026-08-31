@@ -83,10 +83,13 @@ export default [
     {
         // The browser tests straddle both: the files run in Node, but the
         // bodies they hand to page.evaluate() are serialized and run inside
-        // Chromium, so `window` and `document` in them are real.
+        // Chromium, so `window` and `document` in them are real. The Pages
+        // deploy check drives a browser the same way and belongs here too,
+        // even though it lives under scripts/.
         files: ["test/browser-smoke.test.js", "test/custom-element.test.js",
             "test/host-contract.test.js", "test/viewer-ui.test.js",
-            "test/esm-bundle.test.js", "test/react.test.js"],
+            "test/esm-bundle.test.js", "test/react.test.js",
+            "scripts/check-site.mjs"],
         languageOptions: {
             globals: { ...globals.node, ...globals.browser },
             ecmaVersion: 2022,
