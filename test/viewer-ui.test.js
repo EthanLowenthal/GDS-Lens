@@ -369,3 +369,78 @@ test("the marker browser spells out its warnings, not just a count", { skip }, a
         assert.equal(clipped, 0, "a warning row is clipping its text");
     });
 });
+
+test("[ / ] step within the selected marker's category even when it is hidden", { skip }, async () => {
+    await withLoadedViewer(async (page) => {
+        // Categories start hidden and their item rows stay clickable, so
+        // selecting a marker in a hidden category is the ordinary way in.
+        // stepMarker used to build its candidate list from visible categories
+        // only: the selection was absent from that list, findIndex returned
+        // -1, and [ / ] restarted at the first item of whichever *other*
+        // category happened to be visible. From the user's side the selection
+        // teleported to an unrelated rulecheck.
+        await page.evaluate(async () => {
+            const text = await (await fetch("sample.lyrdb")).text();
+            await window.gdsLens.setMarkers("sample.lyrdb", text);
+        });
+        await page.locator(".lil-gui .lil-title", { hasText: "width_check" })
+            .waitFor({ timeout: 10_000 });
+
+        // Driven through the DOM rather than with real clicks: the folders
+        // nest, and this test is about what ] does, not about opening panels.
+        const setup = await page.evaluate(() => {
+            const sr = document.querySelector("gds-lens").shadowRoot;
+            const folderOf = (name) => [...sr.querySelectorAll("button.lil-title")]
+                .find((t) => t.textContent.trim().startsWith(name))?.parentElement;
+            const rows = (f) => [...f.querySelectorAll(":scope > .lil-children > .lil-controller")];
+            const named = (f, text) => rows(f).find(
+                (r) => (r.querySelector(".lil-name")?.textContent || "").includes(text));
+
+            const hidden = folderOf("width_check");
+            const shown = folderOf("space.m2");
+            if (!hidden || !shown) return "missing a category folder";
+            // space.m2 visible; width_check deliberately left hidden.
+            named(shown, "visible").querySelector("input[type=checkbox]").click();
+            // Select the first marker inside the hidden one.
+            rows(hidden).find((r) => (r.querySelector(".lil-name")?.textContent || "")
+                .trim().startsWith("#")).querySelector("button").click();
+            return "ok";
+        });
+        assert.equal(setup, "ok", setup);
+
+        const selected = () => page.evaluate(() => {
+            const row = document.querySelector("gds-lens").shadowRoot.querySelector(".marker-selected");
+            if (!row) return null;
+            const title = row.closest(".lil-children")?.parentElement
+                ?.querySelector("button.lil-title")?.textContent.trim();
+            return `${title} ${(row.querySelector(".lil-name")?.textContent || "").trim()}`;
+        });
+
+        const first = await selected();
+        assert.match(first ?? "", /width_check/,
+            `expected a width_check row to be selected, got ${first}`);
+
+        await page.keyboard.press("]");
+        const next = await selected();
+        assert.match(next ?? "", /width_check/,
+            `] left the selected marker's own category: ${first} -> ${next}`);
+        assert.notEqual(next, first, "] did not move the selection");
+
+        await page.keyboard.press("[");
+        assert.equal(await selected(), first, "[ did not step back to where ] started");
+
+        // And it has to hold at the ends, which is the other half of the same
+        // fault: width_check has two items, so a third ] has to wrap back to
+        // its own first one rather than spill into the visible category.
+        await page.keyboard.press("]");
+        await page.keyboard.press("]");
+        const wrapped = await selected();
+        assert.equal(wrapped, first,
+            `] off the end of a hidden category did not wrap inside it: ${wrapped}`);
+
+        await page.keyboard.press("[");
+        const back = await selected();
+        assert.match(back ?? "", /width_check/,
+            `[ off the start of a hidden category left it: ${back}`);
+    });
+});

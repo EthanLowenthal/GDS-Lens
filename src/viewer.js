@@ -1850,13 +1850,34 @@ export function createViewer(mountTarget) {
     // category visibility, so stepping is never a dead key.
     function stepMarker(direction) {
         if (!currentMarkers) return;
-        let items = [];
-        for (const cat of currentMarkers.categories) {
-            if (cat.uiVisible === false) continue;
-            items.push(...cat.items);
-        }
-        if (items.length === 0) {
-            items = currentMarkers.categories.flatMap((cat) => cat.items);
+        // Which category the selection sits in decides what [ / ] traverse.
+        //
+        // Rows stay clickable in a hidden category, and categories start
+        // hidden, so selecting a marker in one is the ordinary way in rather
+        // than an edge case. Doing that is a focused browse of a single
+        // rulecheck: stepping stays inside it and wraps at the ends. Letting
+        // it run on into the categories that *are* switched on was the whole
+        // complaint -- the selection jumps to an unrelated check, either
+        // immediately (the selection is missing from a visible-only list, so
+        // findIndex returns -1 and stepping restarts at its first item) or on
+        // reaching the end of the one being read.
+        //
+        // A selection in a visible category still traverses every visible
+        // category, which is what the hidden-category skip is for.
+        const anchor = currentMarkers.categories.find(
+            (cat) => cat.items.some((it) => it.id === selectedMarkerId));
+        let items;
+        if (anchor && anchor.uiVisible === false) {
+            items = anchor.items;
+        } else {
+            items = [];
+            for (const cat of currentMarkers.categories) {
+                if (cat.uiVisible === false) continue;
+                items.push(...cat.items);
+            }
+            if (items.length === 0) {
+                items = currentMarkers.categories.flatMap((cat) => cat.items);
+            }
         }
         if (items.length === 0) return;
         let idx = items.findIndex((it) => it.id === selectedMarkerId);
