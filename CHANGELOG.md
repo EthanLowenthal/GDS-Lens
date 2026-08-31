@@ -7,6 +7,47 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [1.1.0] - 2026-08-31
+
+### Added
+
+- Touch: one finger pans the layout, two pinch to zoom about the point between
+  them and drag the view with it. Lifting one finger of a pinch hands the
+  gesture to the other rather than ending it, so a pinch that relaxes into a
+  drag does not jump.
+
+### Changed
+
+- On a touch-only device (a coarse pointer *and* no hover, so a touchscreen
+  laptop is not one) the control panel starts collapsed to its title bar, and
+  both it and the cell hierarchy are capped at 85% of the viewport width. A
+  panel sized for a window is most of a phone screen, and the layout is what
+  someone opening the viewer came for.
+- Measure mode is offered greyed out where there is no hovering pointer. It is
+  placed by clicking two points, and without hover the snap indicator only
+  appears after the tap that already used it, under a fingertip.
+- The demo page drops its tagline, its file button, its status line and its
+  what-this-is-built-from footer line below 620px. Two of those cannot work on
+  touch anyway: there is no drag-and-drop, and the file picker's extension
+  filter greys out `.gds`/`.oas` in the iOS Files app.
+
+### Fixed
+
+- Touch input did not work at all on iOS. The gestures were handled in the
+  renderer, through `emscripten_set_touchstart_callback`, and that callback
+  never runs on iOS Safari: the events reach the canvas and the handler behind
+  them does not fire. Emscripten resolves mouse and touch targets through the
+  same code path, so the mouse handlers next to them were fine, which is what
+  made this invisible from a desktop. The gestures are now ordinary listeners
+  on the element, driving the camera through the exported `getCamera` /
+  `setCamera` -- the same arithmetic, with nothing between the DOM event and
+  the state it changes. Covered by a test that spells out the touch lists.
+- A two-finger pinch over the viewer zoomed the page on iOS instead of the
+  layout. Safari answers a pinch with its own page zoom, delivered as a
+  proprietary `GestureEvent`, and it does that over an element that has already
+  claimed the gesture with `touch-action: none`. Refused on the canvas alone,
+  so a pinch anywhere else in an embedding page still zooms it.
+
 ## [1.0.3] - 2026-08-31
 
 ### Fixed
@@ -348,7 +389,9 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.3...v1.1.0
+[1.0.3]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v0.1.1...v1.0.0
