@@ -12,7 +12,33 @@
     content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self' https:; img-src 'self' data:;">
 <title>GDS Lens - GDSII and OASIS layouts in your browser</title>
 <meta name="description" content="Open a GDSII or OASIS chip layout in your browser. No install, no server, and nothing is uploaded.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230f1720'/><rect x='3' y='3' width='6' height='6' fill='%2338bdf8'/><rect x='7' y='7' width='6' height='6' fill='%23f472b6' fill-opacity='.75'/></svg>">
+<link rel="canonical" href="https://lowenth.al/GDS-Lens/">
+
+<!-- The extension's mark, which is what the Marketplace listing already shows.
+     One identity across the three places people meet this. -->
+<link rel="icon" type="image/png" href="logo.png">
+<link rel="apple-touch-icon" href="logo.png">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f7f9">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0f1720">
+
+<!-- Link preview. This page exists to be pasted into a pull request, a Slack
+     channel and a Show HN, and without these it renders as a bare URL. The
+     image is a real screenshot of the viewer (scripts/make-og-image.mjs), not
+     a mockup, so the card shows the thing itself. Absolute URLs: scrapers do
+     not resolve relative ones. -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="GDS Lens">
+<meta property="og:url" content="https://lowenth.al/GDS-Lens/">
+<meta property="og:title" content="GDS Lens - chip layouts in your browser">
+<meta property="og:description" content="Open a GDSII or OASIS layout in your browser. No install, no server, and nothing is uploaded: it parses and renders in the tab.">
+<meta property="og:image" content="https://lowenth.al/GDS-Lens/og-preview.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The GDS Lens viewer showing a dense photonic chip layout, with a cell hierarchy and layer panel.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="GDS Lens - chip layouts in your browser">
+<meta name="twitter:description" content="Open a GDSII or OASIS layout in your browser. No install, no server, and nothing is uploaded.">
+<meta name="twitter:image" content="https://lowenth.al/GDS-Lens/og-preview.png">
 <style>
     /* The viewer decides its own theme from the OS preference (its host's
        isLightTheme default), and it is most of the page. So the chrome follows
@@ -56,29 +82,20 @@
 
     header {
         display: flex;
-        align-items: baseline;
-        gap: 16px;
+        align-items: center;
+        gap: 10px 16px;
         flex-wrap: wrap;
-        padding: 12px 18px;
+        padding: 10px 18px;
         border-bottom: 1px solid var(--line);
         background: var(--panel);
     }
     .brand { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
     .brand span { color: var(--accent); }
-    .tagline { color: var(--dim); flex: 1 1 260px; min-width: 0; }
-    nav { display: flex; gap: 14px; align-items: center; }
+    .tagline { color: var(--dim); min-width: 0; }
+    nav { display: flex; gap: 14px; align-items: center; margin-left: auto; }
     nav a { color: var(--dim); text-decoration: none; white-space: nowrap; }
     nav a:hover, nav a:focus-visible { color: var(--text); text-decoration: underline; }
 
-    .bar {
-        display: flex;
-        align-items: center;
-        gap: 10px 16px;
-        flex-wrap: wrap;
-        padding: 9px 18px;
-        border-bottom: 1px solid var(--line);
-        color: var(--dim);
-    }
     button {
         font: inherit;
         font-weight: 550;
@@ -89,18 +106,32 @@
         padding: 5px 12px;
         cursor: pointer;
     }
-    button:hover { background: var(--btn-hover); }
+    button:hover:not(:disabled) { background: var(--btn-hover); }
+    button:disabled { opacity: .5; cursor: default; }
     button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-    .note strong { color: var(--text); font-weight: 600; }
-    .bar a, .bar code { color: var(--accent); }
-    .bar code { font-size: 0.92em; }
+    .note { color: var(--dim); min-width: 0; }
+    .note code { color: var(--accent); font-size: 0.92em; }
 
     main { flex: 1; min-height: 0; position: relative; }
     gds-lens { display: block; width: 100%; height: 100%; }
 
+    footer {
+        display: flex;
+        gap: 6px 14px;
+        flex-wrap: wrap;
+        padding: 6px 18px;
+        border-top: 1px solid var(--line);
+        background: var(--panel);
+        color: var(--dim);
+        font-size: 12px;
+    }
+    footer a { color: var(--dim); }
+    footer a:hover { color: var(--text); }
+
     @media (max-width: 620px) {
-        .tagline { flex-basis: 100%; }
-        .bar { font-size: 13px; }
+        .tagline { flex: 1 1 100%; }
+        .note { flex: 1 1 auto; }
+        nav { margin-left: 0; }
     }
 </style>
 </head>
@@ -109,6 +140,9 @@
 <header>
     <div class="brand">GDS<span>&nbsp;Lens</span></div>
     <div class="tagline">GDSII and OASIS chip layouts, parsed and rendered in the browser.</div>
+    <button id="open" type="button">Open a layout</button>
+    <input id="file" type="file" accept=".gds,.gds.gz,.oas,.oasis,.oas.gz,.oasis.gz" hidden>
+    <span class="note" id="status">Starting the viewer...</span>
     <nav>
         <a href="https://github.com/EthanLowenthal/GDS-Lens">GitHub</a>
         <a href="https://www.npmjs.com/package/gds-lens">npm</a>
@@ -116,21 +150,18 @@
     </nav>
 </header>
 
-<div class="bar">
-    <button id="open" type="button">Open a layout</button>
-    <input id="file" type="file" accept=".gds,.gds.gz,.oas,.oasis,.oas.gz,.oasis.gz" hidden>
-    <span class="note" id="status">
-        Showing a synthetic demo layout. Drop a <code>.gds</code> or
-        <code>.oas</code> onto the viewer to open your own.
-    </span>
-    <span class="note" style="margin-left:auto">
-        <strong>Nothing is uploaded.</strong> Parsing and rendering happen in this tab.
-    </span>
-</div>
-
 <main>
     <gds-lens id="viewer"></gds-lens>
 </main>
+
+<footer>
+    <span id="build">gds-lens</span>
+    <span>Parsing is <a href="https://github.com/heitzmann/gdstk">gdstk</a>
+        compiled to WebAssembly; rendering is WebGL2.</span>
+    <span style="margin-left:auto">
+        <a href="https://github.com/EthanLowenthal/GDS-Lens/blob/main/LICENCE.md">MIT</a>
+    </span>
+</footer>
 
 <!-- Emscripten's output, loaded as a classic script for the global it
      defines. Both of these must precede gds-lens.js, which reads them as it

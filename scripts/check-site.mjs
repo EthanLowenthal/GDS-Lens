@@ -82,11 +82,11 @@ try {
     const tree = await page.evaluate(
         () => document.querySelector("gds-lens")?.shadowRoot
             ?.getElementById("hierarchyTree")?.textContent || "");
-    if (!tree.includes("DEMO_DIE")) await fail(`the cell tree does not mention DEMO_DIE: ${tree.slice(0, 120)}`);
+    if (!tree.includes("RANDOM_CIRCUIT")) await fail(`the cell tree does not mention RANDOM_CIRCUIT: ${tree.slice(0, 120)}`);
 
     if (errors.length) await fail(`the page logged errors:\n  ${errors.join("\n  ")}`);
 
-    console.log("OK the demo page renders demo-layout.gds with no errors");
+    console.log("OK the demo page renders the demo layout with no errors");
 } finally {
     await browser.close();
     server.close();
