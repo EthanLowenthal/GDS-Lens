@@ -1,0 +1,113 @@
+# Deploys site/ to GitHub Pages: the drop-a-file demo page.
+#
+# The page is assembled from the *published* npm package rather than from a
+# local build, and that is the whole point. dist/ is gitignored, so a workflow
+# building from source would prove the working tree renders and say nothing
+# about what a consumer gets from `npm install gds-lens`. Pulling the tarball
+# instead makes the live page a standing check on the real artifact: if a
+# publish ships a payload whose scripts do not wire together, the deploy fails
+# here rather than the demo quietly breaking.
+#
+# Which is also why this runs after a successful Publish, not only on a push to
+# site/. A release changes what the page is made of without touching a file in
+# this repo.
+#
+# Note that no Emscripten toolchain appears below. The package ships prebuilt,
+# so the demo needs Node and nothing else, and the deploy takes about a minute.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "scripts/check-site.mjs"
+      - ".github/workflows/pages.yml"
+  # A new version on npm changes the payload the page serves.
+  workflow_run:
+    workflows: ["Publish"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version of gds-lens to deploy (a dist-tag or an exact version)"
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    # A failed Publish leaves the registry as it was, so there is nothing new
+    # to deploy and the old page is still correct.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `npm pack` rather than `npm install`: this repo *is* gds-lens, so
+      # installing it here would resolve to the working tree and defeat the
+      # point. Downloading the tarball is also the only step that would notice
+      # a version missing from the registry.
+      - name: Fetch the published payload
+        env:
+          VERSION: ${{ inputs.version || 'latest' }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pkg && cd /tmp/pkg
+          tarball="$(npm pack "gds-lens@${VERSION}" --silent)"
+          tar xzf "$tarball"
+          echo "deploying gds-lens $(node -p 'require("/tmp/pkg/package/package.json").version')"
+
+      - name: Stage the site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          # The page, its script, and the demo layout. The generator script is
+          # left behind: it is how the .gds was made, not part of the site.
+          cp site/index.html site/demo.js site/demo-layout.gds _site/
+          # The payload has to sit beside the page, not in a subdirectory: the
+          # parse Worker resolves its own scripts against document.baseURI.
+          cp /tmp/pkg/package/dist/web/gds-lens-engine.js \
+             /tmp/pkg/package/dist/web/gds-lens-engine.wasm \
+             /tmp/pkg/package/dist/web/gds-lens-host.js \
+             /tmp/pkg/package/dist/web/gds-lens-worker.js \
+             /tmp/pkg/package/dist/web/gds-lens.js \
+             _site/
+          ls -l _site
+
+      - run: npm ci
+
+      - run: npx playwright install --with-deps chromium
+
+      # Renders the staged site in headless Chromium and fails if the viewer
+      # does not come up. Deploying a broken demo is worse than not deploying.
+      - name: Check the page renders
+        run: node scripts/check-site.mjs _site
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

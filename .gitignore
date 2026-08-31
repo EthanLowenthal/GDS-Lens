@@ -10,3 +10,11 @@ src/wasm/build/
 
 # The Emscripten SDK, when the CI action unpacks it into the working tree.
 emsdk-cache/
+
+# The demo page's copy of the payload. It is not committed: the Pages workflow
+# fetches it from the published npm package, so the deployed page is a check on
+# what consumers actually get rather than on this working tree. Copy dist/web/
+# in by hand to work on site/ locally.
+site/gds-lens*.js
+site/gds-lens*.wasm
+site/gds-lens.html

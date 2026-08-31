@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 'wasm-unsafe-eval' is the whole reason the engine is built with
+     -sDYNAMIC_EXECUTION=0: it compiles WebAssembly without needing
+     'unsafe-eval'. worker-src blob: is the parse worker. connect-src allows
+     https: so a ?src= link can point at a layout hosted anywhere, which is
+     what makes a demo shareable. -->
+<meta http-equiv="Content-Security-Policy"
+    content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self' https:; img-src 'self' data:;">
+<title>GDS Lens - GDSII and OASIS layouts in your browser</title>
+<meta name="description" content="Open a GDSII or OASIS chip layout in your browser. No install, no server, and nothing is uploaded.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230f1720'/><rect x='3' y='3' width='6' height='6' fill='%2338bdf8'/><rect x='7' y='7' width='6' height='6' fill='%23f472b6' fill-opacity='.75'/></svg>">
+<style>
+    /* The viewer decides its own theme from the OS preference (its host's
+       isLightTheme default), and it is most of the page. So the chrome follows
+       the same signal rather than picking a side: a dark shell around a light
+       canvas reads as a bug. */
+    :root {
+        color-scheme: light;
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --line: #dde2e8;
+        --text: #16202b;
+        --dim: #5b6b7b;
+        --accent: #0a72b3;
+        --btn: #f0f3f6;
+        --btn-hover: #e4e9ee;
+        --btn-line: #cfd6de;
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            color-scheme: dark;
+            --bg: #0f1720;
+            --panel: #16202b;
+            --line: #24313f;
+            --text: #e6edf3;
+            --dim: #8b9aab;
+            --accent: #38bdf8;
+            --btn: #1f2b38;
+            --btn-hover: #26333f;
+            --btn-line: #33445600;
+        }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+        display: flex;
+        flex-direction: column;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+
+    header {
+        display: flex;
+        align-items: baseline;
+        gap: 16px;
+        flex-wrap: wrap;
+        padding: 12px 18px;
+        border-bottom: 1px solid var(--line);
+        background: var(--panel);
+    }
+    .brand { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+    .brand span { color: var(--accent); }
+    .tagline { color: var(--dim); flex: 1 1 260px; min-width: 0; }
+    nav { display: flex; gap: 14px; align-items: center; }
+    nav a { color: var(--dim); text-decoration: none; white-space: nowrap; }
+    nav a:hover, nav a:focus-visible { color: var(--text); text-decoration: underline; }
+
+    .bar {
+        display: flex;
+        align-items: center;
+        gap: 10px 16px;
+        flex-wrap: wrap;
+        padding: 9px 18px;
+        border-bottom: 1px solid var(--line);
+        color: var(--dim);
+    }
+    button {
+        font: inherit;
+        font-weight: 550;
+        color: var(--text);
+        background: var(--btn);
+        border: 1px solid var(--btn-line);
+        border-radius: 6px;
+        padding: 5px 12px;
+        cursor: pointer;
+    }
+    button:hover { background: var(--btn-hover); }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .note strong { color: var(--text); font-weight: 600; }
+    .bar a, .bar code { color: var(--accent); }
+    .bar code { font-size: 0.92em; }
+
+    main { flex: 1; min-height: 0; position: relative; }
+    gds-lens { display: block; width: 100%; height: 100%; }
+
+    @media (max-width: 620px) {
+        .tagline { flex-basis: 100%; }
+        .bar { font-size: 13px; }
+    }
+</style>
+</head>
+<body>
+
+<header>
+    <div class="brand">GDS<span>&nbsp;Lens</span></div>
+    <div class="tagline">GDSII and OASIS chip layouts, parsed and rendered in the browser.</div>
+    <nav>
+        <a href="https://github.com/EthanLowenthal/GDS-Lens">GitHub</a>
+        <a href="https://www.npmjs.com/package/gds-lens">npm</a>
+        <a href="https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens">VS&nbsp;Code&nbsp;extension</a>
+    </nav>
+</header>
+
+<div class="bar">
+    <button id="open" type="button">Open a layout</button>
+    <input id="file" type="file" accept=".gds,.gds.gz,.oas,.oasis,.oas.gz,.oasis.gz" hidden>
+    <span class="note" id="status">
+        Showing a synthetic demo layout. Drop a <code>.gds</code> or
+        <code>.oas</code> onto the viewer to open your own.
+    </span>
+    <span class="note" style="margin-left:auto">
+        <strong>Nothing is uploaded.</strong> Parsing and rendering happen in this tab.
+    </span>
+</div>
+
+<main>
+    <gds-lens id="viewer"></gds-lens>
+</main>
+
+<!-- Emscripten's output, loaded as a classic script for the global it
+     defines. Both of these must precede gds-lens.js, which reads them as it
+     starts. -->
+<script src="gds-lens-engine.js"></script>
+<script src="gds-lens-host.js"></script>
+<script src="gds-lens.js"></script>
+<script src="demo.js"></script>
+</body>
+</html>
