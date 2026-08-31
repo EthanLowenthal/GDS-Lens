@@ -7,6 +7,12 @@
 GDSII and OASIS chip layouts, parsed and rendered in the browser. A drop-in
 custom element compiled to pure JS+WASM with a WebGL2 renderer.
 
+**[Open a layout in your browser](https://lowenth.al/GDS-Lens/)** to see it
+work: drop a `.gds` or `.oas` onto the page, or look at the demo layout it
+starts with. Nothing is uploaded, and there is nothing to install. The page is
+built from the published package, so it is also the quickest way to check what
+a given release does.
+
 ![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](https://raw.githubusercontent.com/EthanLowenthal/GDS-Lens/main/images/example.png)
 
 > **Status**: 1.0. The element's API is stable, and breaking changes wait
