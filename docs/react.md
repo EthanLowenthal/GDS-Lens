@@ -7,8 +7,7 @@ server rendering, and what happens when React remounts the element.
 For the element's own API, see [the README](../README.md#the-gds-lens-element).
 Other embedders are covered in [Embed the viewer](embedding.md).
 
-`<gds-lens>` is a custom element, so React renders it directly — there is no
-wrapper package to install. Import once, anywhere in your app:
+Import once, anywhere in your app:
 
 ```jsx
 import "gds-lens";
@@ -29,19 +28,33 @@ methods rather than attributes.
 import { useEffect, useRef } from "react";
 import "gds-lens";
 
-export function LayoutViewer({ bytes, lyp, markers, onError }) {
+export function LayoutViewer({ bytes, lyp, markers, onLoad, onError }) {
     const ref = useRef(null);
 
     useEffect(() => {
         if (!bytes) return;
-        let cancelled = false;
         // load() rejects on a bad fetch or a file the parser refuses, and an
         // unhandled rejection in an effect is invisible. Route it out instead.
+        // A newer load superseding this one rejects too, with an AbortError;
+        // that is the normal course of a prop changing, not a problem.
         ref.current.load(bytes).catch((err) => {
-            if (!cancelled) onError?.(err);
+            if (err?.name !== "AbortError") onError?.(err);
         });
-        return () => { cancelled = true; };
     }, [bytes, onError]);
+
+    // The events are the other way to hear about a load -- the one that also
+    // covers loads this component did not start, such as a host pushing bytes.
+    useEffect(() => {
+        const el = ref.current;
+        const loaded = (event) => onLoad?.(event.detail);
+        const failed = (event) => onError?.(new Error(event.detail.message));
+        el.addEventListener("gds-load", loaded);
+        el.addEventListener("gds-error", failed);
+        return () => {
+            el.removeEventListener("gds-load", loaded);
+            el.removeEventListener("gds-error", failed);
+        };
+    }, [onLoad, onError]);
 
     useEffect(() => {
         if (lyp) ref.current.setLyp(lyp.name, lyp.text);

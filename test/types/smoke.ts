@@ -5,7 +5,8 @@
 // in CI rather than in a consumer's editor.
 
 import type {
-    GdsLens, ViewerHost, ViewerSurface, PickedFile, NamedView, GotoResult, LayoutSource,
+    GdsLens, GdsLensEventMap, ViewerHost, ViewerSurface, PickedFile, NamedView, GotoResult,
+    LayoutSource,
 } from "../../types/gds-lens.js";
 import type { MarkerModel, FlatMarkerModel, DOMParserConstructor } from "../../types/parsers.js";
 import type { CellNode } from "../../types/cell-search.js";
@@ -20,6 +21,25 @@ const landed: boolean = await element.goToPoint(120.5, -40);
 await element.setLyp("layers.lyp", "<layer-properties/>");
 await element.setMarkers("drc.lyrdb", "<report-database/>");
 await element.showError("nope");
+await element.showLoading();
+await element.showLoading("Reading chip.gds...");
+// The events, typed through GdsLensEventMap: detail must come out typed, and
+// the built-in events must still be reachable through the same overload.
+element.addEventListener("gds-load", (event) => {
+    const layers: number = event.detail.layerCount;
+    const cells: number = event.detail.cellCount;
+    void (layers + cells);
+});
+element.addEventListener("gds-error", (event) => {
+    const message: string = event.detail.message;
+    void message;
+});
+element.addEventListener("click", (event) => {
+    const x: number = event.clientX;
+    void x;
+});
+const loadDetail: GdsLensEventMap["gds-load"]["detail"] = { layerCount: 1, cellCount: 2 };
+void loadDetail;
 const surface: ViewerSurface = await element.ready;
 surface.element.addEventListener("drop", () => {});
 void landed;

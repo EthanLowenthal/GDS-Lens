@@ -15,9 +15,6 @@ a given release does.
 
 ![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](https://raw.githubusercontent.com/EthanLowenthal/GDS-Lens/main/images/example.png)
 
-> **Status**: 1.0. The element's API is stable, and breaking changes wait
-> for a major version. See [the changelog](CHANGELOG.md).
-
 ## Quick start
 
 ```sh
@@ -106,13 +103,53 @@ The element exposes the following members:
 
 | Member | Returns | Description |
 |---|---|---|
-| `ready` | `Promise<Viewer>` | Resolves once the engine has mounted. Every method in the following table awaits this, so you rarely need it directly. |
-| `load(source, options?)` | `Promise<void>` | `source` is a URL string, a `Uint8Array`, or an `ArrayBuffer`. `options.reload` keeps the current camera and layer visibility instead of framing the design. |
+| `ready` | `Promise<ViewerSurface>` | Resolves once the engine has mounted. Every method in the following table awaits this, so you rarely need it directly. |
+| `load(source, options?)` | `Promise<void>` | `source` is a URL string, a `Uint8Array`, or an `ArrayBuffer`. `options.reload` keeps the current camera and layer visibility instead of framing the design. Resolves once the layout is on screen; rejects on a failed fetch, a file the parser refuses, or — with an error named `AbortError` — when a later load superseded this one. |
+| `showLoading(label?)` | `Promise<void>` | Shows the loading overlay, for the wait before a `load()` of bytes the page is fetching itself. `load(url)` does this on its own. |
 | `goToPoint(x, y)` | `Promise<boolean>` | Centers on a coordinate in microns and flashes a crosshair. Resolves `true` if the point is inside the layout. |
 | `setLyp(name, text)` | `Promise<void>` | Applies a `.lyp` layer-properties file. Pass `""` to clear. |
 | `setMarkers(name, text)` | `Promise<void>` | Applies a marker database. The viewer detects the format from the content. |
 | `showError(message)` | `Promise<void>` | Replaces the view with an error message. |
 | `destroy()` | `Promise<void>` | Releases the viewer's WebAssembly instance and WebGL context for good. Rarely needed — see [Removal parks the viewer](#removal-parks-the-viewer). |
+
+Every `load()` cancels the one before it, so two quick changes to `src` show
+the second layout even when the first is the slower download.
+
+#### Events
+
+The element dispatches two events on itself, whichever way a load was started
+— the `src` attribute, `load()`, or a host pushing bytes through its surface.
+Neither bubbles.
+
+| Event | `detail` | When |
+|---|---|---|
+| `gds-load` | `{ layerCount, cellCount }` | A layout finished loading and is on screen. |
+| `gds-error` | `{ message }` | A load failed, or `showError()` was called. `message` is the text the viewer shows. |
+
+```js
+viewer.addEventListener("gds-load", (event) => {
+    console.log(`${event.detail.layerCount} layers, ${event.detail.cellCount} cells`);
+});
+viewer.addEventListener("gds-error", (event) => {
+    reportProblem(event.detail.message);
+});
+```
+
+The names carry a prefix because `load` and `error` already have meanings —
+and types — on every HTML element.
+
+#### Keyboard shortcuts
+
+The keys act on the viewer that was last pointed at, so on a page with several
+they go to the one under the mouse.
+
+| Key | Action |
+|---|---|
+| `[` / `]` | Previous / next marker in the selected marker's category. |
+| `m` | Toggle measure mode. Click two points to place a ruler. |
+| `Esc` | Abandon a ruler being placed; with none in progress, clear the finished ones and return to pan mode. Also closes the coordinate menu. |
+| `h` | Show or hide the cell hierarchy. |
+| `/` | Focus the cell filter box. |
 
 #### Several viewers on one page
 

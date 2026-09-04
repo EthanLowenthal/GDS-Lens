@@ -520,6 +520,10 @@ constexpr float kGotoRingPx = 14.0f;    // radius of the ring the arms cross
 constexpr int kGotoRingSegments = 24;
 
 bool g_frame_requested = false;
+// The pending frame's handle, so destroyRenderer() can cancel it: a frame
+// requested just before the context is destroyed would otherwise run its GL
+// calls against a context that no longer exists.
+long g_frame_handle = 0;
 
 // Toggles the hatched polygon fill (the "infill") on/off for every layer at
 // once -- see draw_frame and setShowInfill. Outlines are unaffected.
@@ -698,6 +702,9 @@ GLuint link_program(const char* vs_src, const char* fs_src) {
 // non-graphical testing still works after this file's GL init runs
 // automatically at module load.
 bool g_gl_ready = false;
+// The context init_gl created, kept so destroyRenderer() can release it
+// explicitly rather than waiting for the canvas to be collected.
+EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_ctx = 0;
 
 bool init_gl() {
     EmscriptenWebGLContextAttributes attrs;
@@ -707,6 +714,7 @@ bool init_gl() {
     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE ctx = emscripten_webgl_create_context(kCanvasTarget, &attrs);
     if (ctx <= 0) return false;
     if (emscripten_webgl_make_context_current(ctx) != EMSCRIPTEN_RESULT_SUCCESS) return false;
+    g_ctx = ctx;
 
     g_program = link_program(shaders::kVertexShaderSrc, shaders::kFragmentShaderSrc);
 
@@ -2337,6 +2345,9 @@ void draw_goto_flash(double now_ms) {
 
 bool draw_frame(double time, void* /*userData*/) {
     g_frame_requested = false;
+    g_frame_handle = 0;
+    // Destroyed between the request and the frame (see destroyRenderer).
+    if (!g_gl_ready) return false;
     // `time` is the rAF timestamp (ms); the delta between consecutive frames
     // is the real end-to-end frame time while interaction keeps frames
     // coming. Gaps over 500ms are idle time between interactions, not
@@ -2486,7 +2497,7 @@ bool draw_frame(double time, void* /*userData*/) {
 void request_redraw() {
     if (!g_gl_ready || g_frame_requested) return;
     g_frame_requested = true;
-    emscripten_request_animation_frame(draw_frame, nullptr);
+    g_frame_handle = emscripten_request_animation_frame(draw_frame, nullptr);
 }
 
 // Sizes the drawing buffer to the canvas *element*, not to the window.
@@ -4865,6 +4876,42 @@ int main() {
     return 0;
 }
 
+// Whether init_gl() got a WebGL2 context. main() returns silently when it did
+// not -- that is what lets the parse worker and headless Node runs use this
+// module with no canvas at all -- so viewer.js asks here, and tells the user,
+// rather than presenting a canvas nothing will ever draw into.
+bool isGlReady() {
+    return g_gl_ready;
+}
+
+// The teardown for <gds-lens>.destroy(). Two things main() installs outlive
+// the viewer's JS otherwise: the mouseup and resize callbacks on *window*, which
+// hold this module's JS glue (and through it the whole instance) for the life
+// of the page, and the WebGL context, which a browser reclaims only once the
+// canvas is collected -- lazily, and not at all while anything still reaches
+// the canvas. Both are released here, so a page hitting the per-page context
+// cap gets its slot back the moment it asks. A null callback is Emscripten's
+// unregister.
+void destroyRenderer() {
+    if (!g_gl_ready) return;
+    emscripten_set_mousedown_callback(kCanvasTarget, nullptr, false, nullptr);
+    emscripten_set_mousemove_callback(kCanvasTarget, nullptr, false, nullptr);
+    emscripten_set_mouseup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, nullptr);
+    emscripten_set_mouseleave_callback(kCanvasTarget, nullptr, false, nullptr);
+    emscripten_set_wheel_callback(kCanvasTarget, nullptr, false, nullptr);
+    emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, false, nullptr);
+    if (g_frame_handle) {
+        emscripten_cancel_animation_frame(g_frame_handle);
+        g_frame_handle = 0;
+        g_frame_requested = false;
+    }
+    g_gl_ready = false;
+    if (g_ctx > 0) {
+        emscripten_webgl_destroy_context(g_ctx);
+        g_ctx = 0;
+    }
+}
+
 EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("parseGdsToLayers", &parseGdsToLayers);
     function("uploadLayers", &uploadLayers);
@@ -4901,4 +4948,8 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     // window doing anything (a flex layout reflowing, a panel opening, a card
     // grid rewrapping), and the window resize event says nothing about that.
     function("resizeCanvas", &resize_canvas);
+    // See the two functions above main()'s bindings: one tells viewer.js
+    // whether there is a context to draw into, the other gives it back.
+    function("isGlReady", &isGlReady);
+    function("destroyRenderer", &destroyRenderer);
 }

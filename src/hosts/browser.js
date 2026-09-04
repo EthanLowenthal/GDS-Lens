@@ -171,7 +171,14 @@ export function createBrowserHost() {
             // one obvious handle and a page with two viewers has the elements.
             window.gdsLens = viewer;
 
-            const loadBytes = (bytes) => viewer.load(bytes, { reload: false });
+            // load() settles on the outcome, and a failure has already been
+            // shown by the viewer itself -- so the rejection is taken here
+            // rather than letting it fall into the fetch/read catch blocks
+            // below, which would paint the parser's message over again with a
+            // "could not fetch" it did not earn.
+            const loadBytes = (bytes) => {
+                viewer.load(bytes, { reload: false }).catch(() => {});
+            };
 
             const src = new URLSearchParams(location.search).get("src");
             if (src) {

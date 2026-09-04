@@ -100,6 +100,23 @@ export interface ViewerHost {
 export type LayoutSource = string | Uint8Array | ArrayBuffer;
 
 /**
+ * The events a `<gds-lens>` dispatches, on itself. Neither bubbles nor
+ * crosses a shadow boundary. They fire however the load was started -- the
+ * `src` attribute, `load()`, or a host pushing bytes through its surface --
+ * which is what makes them the way to observe a load you did not call.
+ *
+ * Prefixed rather than the bare `load` / `error`, which `HTMLElementEventMap`
+ * already types as `Event` / `ErrorEvent`; a `CustomEvent` under those names
+ * would be typed wrongly for everyone.
+ */
+export interface GdsLensEventMap extends HTMLElementEventMap {
+    /** A layout finished loading and is on screen. */
+    "gds-load": CustomEvent<{ layerCount: number; cellCount: number }>;
+    /** A load failed, or `showError()` was called. `message` is what the viewer shows. */
+    "gds-error": CustomEvent<{ message: string }>;
+}
+
+/**
  * The `<gds-lens>` element. Importing `gds-lens` registers it; the engine,
  * the wasm module and the WebGL context are all deferred until an element
  * actually connects.
@@ -118,8 +135,23 @@ export declare class GdsLens extends HTMLElement {
      */
     readonly ready: Promise<ViewerSurface>;
 
-    /** `options.reload` keeps the current camera and layer visibility. */
+    /**
+     * `options.reload` keeps the current camera and layer visibility.
+     *
+     * Resolves once the layout is on screen. Rejects on a failed fetch, a
+     * file the parser refuses, or -- with an error whose `name` is
+     * `"AbortError"` -- when a later `load()` (or a change to `src`)
+     * superseded this one before it finished.
+     */
     load(source: LayoutSource, options?: { reload?: boolean }): Promise<void>;
+
+    /**
+     * Says that a layout is on its way, for the wait before a `load()` of
+     * bytes the page is fetching itself. Without it the viewer shows "No
+     * layout loaded" for the length of the download. `load(url)` does this
+     * on its own. `label` replaces the default "Fetching layout...".
+     */
+    showLoading(label?: string): Promise<void>;
 
     /**
      * Centres on a coordinate in microns and flashes a crosshair. Resolves
@@ -147,6 +179,27 @@ export declare class GdsLens extends HTMLElement {
      * is running into the browser's per-page context limit.
      */
     destroy(): Promise<void>;
+
+    addEventListener<K extends keyof GdsLensEventMap>(
+        type: K,
+        listener: (this: GdsLens, ev: GdsLensEventMap[K]) => unknown,
+        options?: boolean | AddEventListenerOptions,
+    ): void;
+    addEventListener(
+        type: string,
+        listener: EventListenerOrEventListenerObject,
+        options?: boolean | AddEventListenerOptions,
+    ): void;
+    removeEventListener<K extends keyof GdsLensEventMap>(
+        type: K,
+        listener: (this: GdsLens, ev: GdsLensEventMap[K]) => unknown,
+        options?: boolean | EventListenerOptions,
+    ): void;
+    removeEventListener(
+        type: string,
+        listener: EventListenerOrEventListenerObject,
+        options?: boolean | EventListenerOptions,
+    ): void;
 }
 
 declare global {

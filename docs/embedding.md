@@ -69,6 +69,11 @@ rather than answering it:
 | `applyTheme()` | Re-ask `isLightTheme()` after a theme change. |
 | `element` | The `<gds-lens>` the viewer is mounted in. Bind anything of your own to this rather than to `window`, so it stays inside the component. |
 
+`load()` resolves once the layout is on screen and rejects when it fails (or
+when a newer load supersedes it, with an `AbortError`). The viewer also
+dispatches `gds-load` and `gds-error` on `element` for every load, however it
+was started; see [Events](../README.md#events).
+
 ### Saved views on a page with several viewers
 
 Both view methods are handed the viewer asking, which is the same surface

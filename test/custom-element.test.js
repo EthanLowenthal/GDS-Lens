@@ -442,3 +442,243 @@ test("a viewer with nothing to show says so rather than showing a progress bar",
             { timeout: 60_000 });
     });
 });
+
+// ---- What a load reports ----
+// load() used to resolve as soon as the file reached the parse worker, so a
+// parser refusal never rejected it; and a load that came from `src` had no
+// promise at all. The promise now settles on the outcome, and the two events
+// say the same thing for every load however it was started.
+
+test("load() settles on the outcome, and the events say the same", opts, async () => {
+    await withPage(async (page, port) => {
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        const result = await page.evaluate(async () => {
+            const el = document.createElement("gds-lens");
+            el.style.cssText = "width:400px;height:300px";
+            const events = [];
+            el.addEventListener("gds-load", (e) => events.push(["gds-load", e.detail]));
+            el.addEventListener("gds-error", (e) => events.push(["gds-error", e.detail]));
+            document.body.appendChild(el);
+            const shadow = () => el.shadowRoot;
+
+            // A DRC report is not a layout.
+            let rejected = null;
+            try {
+                await el.load("sample_drc.txt");
+            } catch (err) {
+                rejected = err.message;
+            }
+            const shownAfterFailure = shadow().getElementById("loadError").textContent;
+
+            await el.load("sample_layout.gds");
+            // "Resolves once the layout is on screen": the overlay is already
+            // down and the error gone by the time the promise settles.
+            const overlayHidden = shadow().getElementById("loadingOverlay").classList.contains("hidden");
+            const errorAfterSuccess = shadow().getElementById("loadError").textContent;
+            return { rejected, shownAfterFailure, overlayHidden, errorAfterSuccess, events };
+        });
+
+        assert.ok(result.rejected, "a file the parser refuses must reject load()");
+        assert.ok(result.shownAfterFailure.includes(result.rejected),
+            "the rejection carries the message the viewer shows");
+        assert.equal(result.overlayHidden, true, "load() resolved before the layout was on screen");
+        assert.equal(result.errorAfterSuccess, "");
+        assert.equal(result.events.length, 2, `expected one error and one load, got ${JSON.stringify(result.events)}`);
+        assert.equal(result.events[0][0], "gds-error");
+        assert.equal(result.events[0][1].message, result.rejected);
+        assert.equal(result.events[1][0], "gds-load");
+        assert.ok(result.events[1][1].layerCount > 0, "gds-load should report the layers");
+        assert.ok(result.events[1][1].cellCount > 0, "gds-load should report the cells");
+    });
+});
+
+test("a load superseded by a newer one is dropped, however slow it was", opts, async () => {
+    await withPage(async (page, port) => {
+        // The fixture, half a second late: long enough for the layout asked for
+        // second to be on screen before the first one's bytes even arrive.
+        const bytes = fs.readFileSync(path.join(fixtures, "sample_layout.gds"));
+        await page.route("**/slow.gds", async (route) => {
+            await new Promise((r) => setTimeout(r, 500));
+            await route.fulfill({ status: 200, contentType: "application/octet-stream", body: bytes });
+        });
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        const result = await page.evaluate(async () => {
+            const make = () => {
+                const el = document.createElement("gds-lens");
+                el.style.cssText = "width:300px;height:200px";
+                el.loads = 0;
+                el.errors = [];
+                el.addEventListener("gds-load", () => el.loads++);
+                el.addEventListener("gds-error", (e) => el.errors.push(e.detail.message));
+                document.body.appendChild(el);
+                return el;
+            };
+            // Through load(): the first must reject with AbortError, the
+            // second resolve.
+            const byMethod = make();
+            const outcomes = await Promise.all([
+                byMethod.load("slow.gds").then(() => "resolved", (err) => err.name),
+                byMethod.load("sample_layout.gds").then(() => "resolved", (err) => err.name)
+            ]);
+            // Through src: nothing to await, so the events are the record.
+            const byAttribute = make();
+            byAttribute.setAttribute("src", "slow.gds");
+            byAttribute.setAttribute("src", "sample_layout.gds");
+            await new Promise((resolve) => byAttribute.addEventListener("gds-load", resolve, { once: true }));
+            // Past when slow.gds would have landed, had it not been cancelled.
+            await new Promise((r) => setTimeout(r, 900));
+            return {
+                outcomes,
+                methodLoads: byMethod.loads,
+                attributeLoads: byAttribute.loads,
+                attributeErrors: byAttribute.errors
+            };
+        });
+        assert.deepEqual(result.outcomes, ["AbortError", "resolved"]);
+        assert.equal(result.methodLoads, 1, "the superseded load must not land later");
+        assert.equal(result.attributeLoads, 1, "the superseded src must not land later");
+        assert.deepEqual(result.attributeErrors, [], "a superseded src is not an error to show");
+    });
+});
+
+test("showLoading() on the element puts up the overlay with its label", opts, async () => {
+    await withPage(async (page, port) => {
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        const result = await page.evaluate(async () => {
+            const el = document.createElement("gds-lens");
+            el.style.cssText = "width:300px;height:200px";
+            document.body.appendChild(el);
+            await el.showLoading("Reading chip.gds...");
+            const overlay = el.shadowRoot.getElementById("loadingOverlay");
+            return {
+                idle: overlay.classList.contains("idle"),
+                hidden: overlay.classList.contains("hidden"),
+                label: el.shadowRoot.getElementById("loadingPhase").textContent
+            };
+        });
+        assert.deepEqual(result, { idle: false, hidden: false, label: "Reading chip.gds..." });
+    });
+});
+
+// ---- Letting go, and having nothing to hold ----
+
+test("destroy() releases the viewer's listeners and its WebGL context", opts, async () => {
+    await withPage(async (page, port) => {
+        // Every listener anything puts on window, and whether it is gone
+        // after destroy(): aborted through the signal it was added with (the
+        // viewer's own) or removed outright (Emscripten's mouseup and resize,
+        // which destroyRenderer unregisters). A listener on window holds its
+        // closure, and the closure holds the whole viewer, wasm instance
+        // included, so one left behind is the whole leak.
+        await page.addInitScript(() => {
+            const recorded = [];
+            const add = EventTarget.prototype.addEventListener;
+            const remove = EventTarget.prototype.removeEventListener;
+            const capture = (options) => !!(typeof options === "object" ? options?.capture : options);
+            EventTarget.prototype.addEventListener = function (type, listener, options) {
+                if (this === window) {
+                    const signal = options && typeof options === "object" ? options.signal : undefined;
+                    recorded.push({ type, listener, capture: capture(options), signal, removed: false });
+                }
+                return add.call(this, type, listener, options);
+            };
+            EventTarget.prototype.removeEventListener = function (type, listener, options) {
+                if (this === window) {
+                    for (const entry of recorded) {
+                        if (entry.type === type && entry.listener === listener &&
+                            entry.capture === capture(options)) entry.removed = true;
+                    }
+                }
+                return remove.call(this, type, listener, options);
+            };
+            window.__windowListeners = recorded;
+        });
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        await page.evaluate(() => {
+            const el = document.createElement("gds-lens");
+            el.style.cssText = "width:400px;height:300px";
+            document.body.appendChild(el);
+            window.el = el;
+            return el.load("sample_layout.gds");
+        });
+        const result = await page.evaluate(async () => {
+            const gl = window.el.shadowRoot.getElementById("glCanvas").getContext("webgl2");
+            const lostBefore = gl.isContextLost();
+            window.el.remove();
+            await window.el.destroy();
+            // The context goes on the module promise's next tick.
+            await new Promise((r) => setTimeout(r, 100));
+            // The page-level error hooks are installed once and stay: they
+            // report failures no single viewer owns.
+            const own = window.__windowListeners.filter(
+                (l) => l.type !== "error" && l.type !== "unhandledrejection");
+            return {
+                lostBefore,
+                lostAfter: gl.isContextLost(),
+                total: own.length,
+                leftBehind: own.filter((l) => !l.removed && !(l.signal && l.signal.aborted))
+                    .map((l) => l.type)
+            };
+        });
+        assert.equal(result.lostBefore, false, "the context should be live before destroy()");
+        assert.equal(result.lostAfter, true, "destroy() should release the WebGL context");
+        // Five from the viewer (the keyboard, the coordinate menu's dismissal)
+        // and two from the renderer (mouseup, resize).
+        assert.ok(result.total >= 7, `expected the viewer's window listeners to be recorded, saw ${result.total}`);
+        assert.deepEqual(result.leftBehind, [],
+            "destroy() must abort or remove every listener the viewer put on window");
+    });
+});
+
+test("a browser without WebGL2 is told so, and load() fails with the reason", opts, async () => {
+    await withPage(async (page, port) => {
+        await page.addInitScript(() => {
+            const original = HTMLCanvasElement.prototype.getContext;
+            HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
+                if (type === "webgl2" || type === "webgl" || type === "experimental-webgl") return null;
+                return original.call(this, type, ...rest);
+            };
+        });
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        await page.evaluate(() => {
+            const el = document.createElement("gds-lens");
+            el.style.cssText = "width:400px;height:300px";
+            document.body.appendChild(el);
+            window.el = el;
+        });
+        await page.waitForFunction(
+            () => window.el.shadowRoot?.getElementById("loadError")?.textContent.includes("WebGL2"),
+            { timeout: 60_000 });
+        const rejected = await page.evaluate(
+            () => window.el.load("sample_layout.gds").then(() => null, (err) => err.message));
+        assert.ok(rejected && rejected.includes("WebGL2"), `load() should fail with the reason, got: ${rejected}`);
+    });
+});
+
+test("a lost WebGL context is reported rather than left as a black canvas", opts, async () => {
+    await withPage(async (page, port) => {
+        await page.goto(`http://127.0.0.1:${port}/bare.html`);
+        await page.evaluate(() => {
+            const el = document.createElement("gds-lens");
+            el.style.cssText = "width:400px;height:300px";
+            document.body.appendChild(el);
+            window.el = el;
+            return el.load("sample_layout.gds");
+        });
+        const result = await page.evaluate(async () => {
+            const errors = [];
+            window.el.addEventListener("gds-error", (e) => errors.push(e.detail.message));
+            const gl = window.el.shadowRoot.getElementById("glCanvas").getContext("webgl2");
+            gl.getExtension("WEBGL_lose_context").loseContext();
+            // webglcontextlost is dispatched asynchronously.
+            await new Promise((r) => setTimeout(r, 200));
+            const shown = window.el.shadowRoot.getElementById("loadError").textContent;
+            const rejected = await window.el.load("sample_layout.gds").then(() => null, (err) => err.message);
+            return { shown, errors, rejected };
+        });
+        assert.ok(result.shown.includes("context was lost"), `expected the loss to be shown, got: ${result.shown}`);
+        assert.equal(result.errors.length >= 1, true, "gds-error should fire for the loss");
+        assert.ok(result.rejected && result.rejected.includes("context was lost"),
+            `a load after the loss should fail with the reason, got: ${result.rejected}`);
+    });
+});

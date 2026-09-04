@@ -254,14 +254,64 @@ export function createViewer(mountTarget) {
     // rather than the shadow root, so this still fires for a click on the
     // lil-gui panel; and pointerdown rather than focus, because a drag on the
     // canvas never moves focus at all.
+    // Every listener this viewer puts on `window` or on its element carries
+    // this signal, and dispose() aborts it. Listeners are the one thing that
+    // would otherwise outlive destroy(): a handler on window holds its closure,
+    // the closure holds this whole scope, and the scope holds the wasm
+    // instance -- so a destroyed viewer stayed resident (and its keydown
+    // handler kept running) for the life of the page.
+    const disposeController = new AbortController();
+    const disposeSignal = disposeController.signal;
+
+    // ---- The outcome of a load ----
+    // loadLayout() hands work to a worker and returns; the result arrives as a
+    // message some time later. So that load() can nonetheless be awaited for
+    // what actually happened, the promise it returns is settled from here:
+    // resolved when the geometry is on screen (see startWorker), rejected from
+    // showFatalError, which every failure path already funnels through. One
+    // load in flight at a time -- a newer one supersedes the older, which is
+    // told so with an AbortError, the same name fetch() uses for the same
+    // thing, so a caller can tell "you were replaced" from "this file is bad".
+    let pendingLoad = null;
+    let loadGeneration = 0;
+
+    function abortError(message) {
+        const err = new Error(message);
+        err.name = "AbortError";
+        return err;
+    }
+
+    function settleLoad(kind, value) {
+        const pending = pendingLoad;
+        if (!pending) return;
+        pendingLoad = null;
+        pending[kind](value);
+    }
+
+    // Set once it is known that nothing will ever be drawn: no WebGL2 context
+    // could be made, or the one there was has been lost. A load after that
+    // fails fast with the reason instead of parsing a file into a void.
+    let glUnavailable = false;
+    const GL_UNAVAILABLE =
+        "WebGL2 is not available: this browser does not support it, has it " +
+        "disabled, or the page has reached its limit on live WebGL contexts. " +
+        "GDS Lens needs a WebGL2 context to draw.";
+    const GL_LOST =
+        "The graphics context was lost — the GPU was reset or the browser " +
+        "reclaimed it. Reload the page to continue.";
+
     if (!activeViewer) activeViewer = hostElement;
-    hostElement.addEventListener("pointerdown", () => { activeViewer = hostElement; }, true);
+    hostElement.addEventListener("pointerdown", () => { activeViewer = hostElement; },
+                                 { capture: true, signal: disposeSignal });
     const hasKeyboard = () => activeViewer === hostElement;
 
-    // Detaches what would otherwise outlive the viewer. The wasm instance and
-    // the GL context are not freed here -- there is no Emscripten teardown
-    // that reliably reclaims a module -- but dropping the last reference to
-    // this viewer lets the browser collect both.
+    // Detaches what would otherwise outlive the viewer, and gives the GL
+    // context back (destroyRenderer in renderer.cpp) rather than waiting for
+    // the canvas to be collected -- which is the point for a page that is
+    // calling destroy() because it hit the per-page context cap. The wasm
+    // heap itself is not freed by any Emscripten call; dropping the last
+    // reference to this viewer is what lets the browser collect it, and the
+    // abort above is what makes that reference actually the last.
     // Watches the canvas's own box so the renderer can resize its drawing
     // buffer to match (see watchCanvasSize). Null until the module is live,
     // since there is nothing to tell before then.
@@ -272,11 +322,29 @@ export function createViewer(mountTarget) {
         lightMediaQuery.removeEventListener("change", applyTheme);
         themeObserver.disconnect();
         canvasResizeObserver?.disconnect();
+        disposeController.abort();
         if (activeViewer === hostElement) activeViewer = null;
         if (activeWorker) {
             activeWorker.terminate();
             activeWorker = null;
         }
+        settleLoad("reject", abortError("the viewer was destroyed"));
+        // Through the promise rather than resolvedModule: a viewer destroyed
+        // while its module is still instantiating must still let go of the
+        // context that instantiation is about to create.
+        modulePromise.then((Module) => {
+            if (typeof Module.destroyRenderer === "function") Module.destroyRenderer();
+            // destroyRenderer drops Emscripten's side of the context; this is
+            // what hands the browser its slot back. WEBGL_lose_context is the
+            // one sanctioned way to release a context on purpose, and it is
+            // why the listeners were aborted first: the `webglcontextlost`
+            // this fires is not an error on a viewer that asked for it.
+            if (!glUnavailable && glCanvas && typeof glCanvas.getContext === "function") {
+                glCanvas.getContext("webgl2")?.getExtension("WEBGL_lose_context")?.loseContext();
+            }
+        }).catch(() => {
+            // Never came up, so there is nothing to give back.
+        });
         trace("[GDS] viewer disposed");
     }
 
@@ -570,7 +638,7 @@ export function createViewer(mountTarget) {
             // Without this the browser takes the gesture for page scrolling or
             // its own pinch zoom, whatever touch-action says.
             event.preventDefault();
-        }, { passive: false });
+        }, { passive: false, signal: disposeSignal });
 
         hostElement.addEventListener("touchmove", (event) => {
             if (touchIdle() || !onCanvas(event)) return;
@@ -619,7 +687,7 @@ export function createViewer(mountTarget) {
             lastX = finger.clientX;
             lastY = finger.clientY;
             event.preventDefault();
-        }, { passive: false });
+        }, { passive: false , signal: disposeSignal });
 
         // touchend and touchcancel want the same thing: forget the fingers that
         // are gone, and keep whatever gesture the ones still down can support.
@@ -644,8 +712,8 @@ export function createViewer(mountTarget) {
             }
             if (panId !== null && !touchById(event.touches, panId)) panId = null;
         };
-        hostElement.addEventListener("touchend", endTouch);
-        hostElement.addEventListener("touchcancel", endTouch);
+        hostElement.addEventListener("touchend", endTouch, { signal: disposeSignal });
+        hostElement.addEventListener("touchcancel", endTouch, { signal: disposeSignal });
 
         // iOS Safari answers a two-finger pinch with its own page zoom,
         // delivered as a proprietary GestureEvent rather than through the touch
@@ -656,7 +724,7 @@ export function createViewer(mountTarget) {
         // embedding page still zooms it. A no-op in every other browser:
         // nothing else fires these.
         for (const type of ["gesturestart", "gesturechange", "gestureend"]) {
-            glCanvas.addEventListener(type, (event) => event.preventDefault());
+            glCanvas.addEventListener(type, (event) => event.preventDefault(), { signal: disposeSignal });
         }
     }
 
@@ -2175,10 +2243,10 @@ export function createViewer(mountTarget) {
             // menu (display: none) on the press that was landing on the menu
             // item, so the button never got a click and the copy never ran.
             if (!event.composedPath().includes(canvasMenuEl)) hideCanvasMenu();
-        }, true);
-        window.addEventListener("wheel", hideCanvasMenu, { passive: true });
-        window.addEventListener("resize", hideCanvasMenu);
-        window.addEventListener("blur", hideCanvasMenu);
+        }, { capture: true, signal: disposeSignal });
+        window.addEventListener("wheel", hideCanvasMenu, { passive: true, signal: disposeSignal });
+        window.addEventListener("resize", hideCanvasMenu, { signal: disposeSignal });
+        window.addEventListener("blur", hideCanvasMenu, { signal: disposeSignal });
     }
 
     // Capture phase, because every lil-gui controller stopPropagation()s keydown
@@ -2236,7 +2304,7 @@ export function createViewer(mountTarget) {
             event.preventDefault();
             focusFindBox();
         }
-    }, true);
+    }, { capture: true, signal: disposeSignal });
 
     // ---- "Newer version on disk" banner ----
     // A host that watches the layout file calls viewer.showStale() when it changes
@@ -2473,6 +2541,7 @@ export function createViewer(mountTarget) {
     // staring at a stalled progress bar with no explanation. The wasm side is
     // then told separately, best-effort, so it can clear any half-loaded layers.
     function showFatalError(message) {
+        message = String(message);
         fail("[GDS] load failed:", message);
         loadError.textContent = "Could not open this layout\n\n" + message;
         endProgress();
@@ -2480,6 +2549,11 @@ export function createViewer(mountTarget) {
         // previous file's one up beside the error would invite clicking rows that
         // frame geometry no longer on screen.
         renderHierarchy(null);
+        // The load that was in flight, if any, has failed with this. Also
+        // announced on the element, for a page that did not call load() itself
+        // (a `src` attribute, a host pushing bytes) and so has no promise.
+        settleLoad("reject", new Error(message));
+        hostElement.dispatchEvent(new CustomEvent("gds-error", { detail: { message } }));
         modulePromise.then((Module) => {
             Module.showLoadError(message);
             renderLayerList(Module.getLayers());
@@ -2645,7 +2719,26 @@ export function createViewer(mountTarget) {
     modulePromise.then(
         (Module) => {
             resolvedModule = Module;
+            // main() returns quietly when it could not get a WebGL2 context
+            // -- that is what lets the same module run in the worker and in
+            // Node, where there is no canvas -- so here, where there is one,
+            // ask. Otherwise the user gets a canvas nothing will ever draw
+            // into, and a "load" that reports success.
+            if (typeof Module.isGlReady === "function" && !Module.isGlReady()) {
+                glUnavailable = true;
+                showFatalError(GL_UNAVAILABLE);
+                return;
+            }
             watchCanvasSize(Module);
+            // A GPU reset, or the browser reclaiming the context past its
+            // per-page cap. The renderer's GL state cannot be rebuilt in place,
+            // so this is terminal for the viewer: say so rather than leaving a
+            // black canvas. Not preventDefault()ed, deliberately -- with no
+            // restore handler there is nothing for `webglcontextrestored` to do.
+            glCanvas?.addEventListener("webglcontextlost", () => {
+                glUnavailable = true;
+                showFatalError(GL_LOST);
+            }, { signal: disposeSignal });
             trace("[GDS] main-thread createGdstkModule() resolved OK");
         },
         (err) => {
@@ -2785,7 +2878,8 @@ export function createViewer(mountTarget) {
         viewerRoot = next;
 
         themeObserver.observe(rootEl, { attributes: true, attributeFilter: ["class"] });
-        element.addEventListener("pointerdown", () => { activeViewer = element; }, true);
+        element.addEventListener("pointerdown", () => { activeViewer = element; },
+                                 { capture: true, signal: disposeSignal });
         if (hadKeyboard) activeViewer = element;
 
         // One assignment covers both a live module and one still starting:
@@ -2842,6 +2936,22 @@ export function createViewer(mountTarget) {
             activeWorker.terminate();
             activeWorker = null;
         }
+        // ...and tell whoever was awaiting it. The generation is for the load
+        // that has not reached its worker yet: one parked on the gzip await
+        // below finds on waking that it is no longer the newest, and stops.
+        settleLoad("reject", abortError("superseded by a newer load"));
+        const generation = ++loadGeneration;
+        const outcome = new Promise((resolve, reject) => {
+            pendingLoad = { resolve, reject };
+        });
+        // Marks the rejection handled for callers who do not await it (a host
+        // that fires and forgets). Awaiting callers still see it.
+        outcome.catch(() => {});
+        if (glUnavailable) {
+            showFatalError(glCanvas && typeof glCanvas.getContext === "function" &&
+                           glCanvas.getContext("webgl2")?.isContextLost() ? GL_LOST : GL_UNAVAILABLE);
+            return outcome;
+        }
         showStaleBanner(false);
 
         // Only meaningful on a reload: on first open there's nothing to keep,
@@ -2875,10 +2985,13 @@ export function createViewer(mountTarget) {
         if (looksGzipped(bytes)) {
             updateProgress("decompressing", 0, 0);
             const decoded = await decodeLayoutBytes(bytes, MAX_LAYOUT_BYTES);
+            // Superseded while decompressing; the newer load already rejected
+            // this one's promise.
+            if (generation !== loadGeneration) return outcome;
             if (!decoded.ok) {
                 fail(`[GDS] gzip expansion failed (${decoded.reason}):`, decoded.detail);
                 showFatalError(describeDecodeFailure(decoded));
-                return;
+                return outcome;
             }
             trace("[GDS] expanded gzip:", bytes.byteLength, "->", decoded.bytes.byteLength, "bytes");
             parseBytes = decoded.bytes;
@@ -2891,9 +3004,10 @@ export function createViewer(mountTarget) {
         } catch (err) {
             fail("[GDS] failed to build/start worker:", err);
             showFatalError(`Failed to create worker: ${err.message || err}`);
-            return;
+            return outcome;
         }
         startWorker(worker, parseBytes);
+        return outcome;
     }
 
     function applyLyp(name, text) {
@@ -3056,6 +3170,13 @@ export function createViewer(mountTarget) {
                 }
                 trace("[GDS] load succeeded, layer count:", workerMessage.layers.length);
                 modulePromise.then((Module) => {
+                    // A load started before the module came up and found out it
+                    // has no context: uploadLayers would no-op and the load
+                    // would report success with nothing on screen.
+                    if (glUnavailable) {
+                        showFatalError(GL_UNAVAILABLE);
+                        return;
+                    }
                     // uploadLayers is the other place a big layout can run out of
                     // memory -- the parse fit in the worker, but this thread's
                     // module now has to hold the same geometry plus its VBOs. An
@@ -3088,6 +3209,13 @@ export function createViewer(mountTarget) {
                     refreshRulerRow(Module);
                     endProgress();
                     trace("[GDS] done, progress hidden");
+                    hostElement.dispatchEvent(new CustomEvent("gds-load", {
+                        detail: {
+                            layerCount: workerMessage.layers.length,
+                            cellCount: workerMessage.hierarchy ? workerMessage.hierarchy.cellCount : 0
+                        }
+                    }));
+                    settleLoad("resolve");
                 }, (err) => {
                     showFatalError(`WebAssembly module failed to load: ${err && err.message ? err.message : err}`);
                 });
@@ -3108,8 +3236,10 @@ export function createViewer(mountTarget) {
         } else {
             transfer = fileData.slice().buffer;
         }
+        // `debug` is whether the worker may write to the real console as well
+        // as relaying to the panel; see the console patch in wasm-worker.js.
         worker.postMessage(
-            { type: "parse", fileData: transfer },
+            { type: "parse", fileData: transfer, debug: traceToConsole },
             [transfer]
         );
         trace("[GDS] worker.postMessage('parse') call returned");

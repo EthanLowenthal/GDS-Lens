@@ -71,7 +71,10 @@ test("the host page's console is left alone", { skip }, async () => {
         assert.equal(leaked, 0, "host console output landed in the viewer's debug panel");
 
         // The breadcrumbs are opt-in, so a successful load says nothing.
-        assert.deepEqual(consoleLogs.filter((line) => line.includes("[GDS]")), [],
+        // "[GDS" rather than "[GDS]": the worker's lines are prefixed
+        // "[GDS worker]", and they reach the page's console too. The narrower
+        // filter let a dozen of those per load through unnoticed.
+        assert.deepEqual(consoleLogs.filter((line) => line.includes("[GDS")), [],
                          "trace output reached the console without being asked for");
     });
 });

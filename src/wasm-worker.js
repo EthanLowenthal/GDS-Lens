@@ -40,6 +40,15 @@ import { describeLoadFailure } from "./load-errors.js";
 // this specific webview (which has proven fiddly to get right). Args are
 // stringified defensively since not everything passed to console.log here
 // (e.g. Error objects, the Module object) is guaranteed structured-cloneable.
+//
+// The relay is unconditional; the *real* console is not. A worker's console
+// output lands in the embedding page's DevTools, and a dozen breadcrumbs per
+// load is noise in an application that merely has a viewer on it. So log lines
+// reach the console only when the main thread asked for tracing (the `debug`
+// flag on the parse message -- the element's `debug` attribute or ?gdsDebug=1,
+// see debugRequested in viewer.js). Errors always go through: a failed load is
+// worth a console line whoever is looking.
+let debugToConsole = false;
 function safeStringify(arg) {
     if (typeof arg === "string") return arg;
     if (arg instanceof Error) return arg.stack || arg.message;
@@ -52,7 +61,7 @@ function safeStringify(arg) {
 const originalLog = console.log.bind(console);
 const originalError = console.error.bind(console);
 console.log = (...args) => {
-    originalLog(...args);
+    if (debugToConsole) originalLog(...args);
     try {
         postMessage({type: "gdsLog", level: "log", text: args.map(safeStringify).join(" ")});
     } catch {
@@ -93,6 +102,7 @@ self.onmessage = (event) => {
     const message = event.data;
     console.log("[GDS worker] received message, type:", message.type);
     if (message.type !== "parse") return;
+    debugToConsole = !!message.debug;
 
     console.log("[GDS worker] fileData byteLength:", message.fileData && message.fileData.byteLength);
     console.log("[GDS worker] calling createGdstkModule()...");
@@ -113,7 +123,7 @@ self.onmessage = (event) => {
             return;
         }
 
-        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "labels:", result.totalLabels, "cells:", result.hierarchy.cellCount, "-- posting gdsResult back to main thread");
+        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "cells:", result.hierarchy.cellCount, "-- posting gdsResult back to main thread");
         const transferList = [];
         for (const layer of result.layers) {
             transferList.push(layer.outlineVertices.buffer, layer.outlineRanges.buffer,

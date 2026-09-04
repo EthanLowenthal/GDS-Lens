@@ -108,6 +108,14 @@ export class GdsLens extends ElementBase {
     // in flight.
     #viewer = null;
 
+    // The load most recently asked for, so the next one can cancel it. Two
+    // quick changes to `src` are two fetches, and without this the one that
+    // happened to finish last was the one that got displayed -- which, with a
+    // slow first file and a small second one, is the layout nobody asked for
+    // any more. The viewer already supersedes an in-flight *parse*; this
+    // covers the fetch in front of it, which is this side's work.
+    #inflight = null;
+
     // True while #mount() is in flight. An element removed and re-added before
     // its engine arrives must not start a second mount: both would finish
     // against the same element, and the loser's wasm instance and GL context
@@ -153,6 +161,9 @@ export class GdsLens extends ElementBase {
                 // Removed before it ever mounted: the reason there is no
                 // layout is that there is no viewer, and the page moved on.
                 if (!this.isConnected) return;
+                // Superseded by a newer load, which is now the one on screen.
+                // Not an error to show over it.
+                if (err && err.name === "AbortError") return;
                 this.showError(`Could not load ${src}: ${err && err.message ? err.message : err}`)
                     .catch(() => console.error(`[GDS] could not load ${src}:`, err));
             });
@@ -228,7 +239,16 @@ export class GdsLens extends ElementBase {
 
     // Accepts what a caller is likely to already have: a URL to fetch, or the
     // bytes themselves in either of the two shapes they usually arrive in.
+    //
+    // Settles on the outcome: resolves once the layout is drawn, rejects on a
+    // failed fetch, a file the parser refuses, or -- with an error named
+    // "AbortError" -- when a later load() superseded this one. Every load
+    // cancels the one before it, bytes included: bytes handed over now must
+    // not be overwritten by a URL that was asked for earlier and arrives later.
     async load(source, options) {
+        this.#inflight?.abort();
+        const controller = new AbortController();
+        this.#inflight = controller;
         const viewer = await this.ready;
         if (typeof source === "string") {
             // The fetch is this side's work, so the viewer has no way to know
@@ -236,11 +256,23 @@ export class GdsLens extends ElementBase {
             // loaded". Tell it, or a slow download looks like a viewer that
             // was never asked for anything.
             viewer.showLoading?.();
-            const response = await fetch(source);
+            const response = await fetch(source, { signal: controller.signal });
             if (!response.ok) throw new Error(`${source}: HTTP ${response.status}`);
-            return viewer.load(new Uint8Array(await response.arrayBuffer()), options);
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            // The abort lands in fetch() or arrayBuffer() while either is
+            // pending; this covers a cancel that arrived between the last
+            // await and here, when there is nothing left to interrupt.
+            controller.signal.throwIfAborted();
+            return viewer.load(bytes, options);
         }
         return viewer.load(source, options);
+    }
+
+    // For the wait before a load() of bytes the page is fetching itself: says
+    // that a layout is on its way, so the viewer does not sit on "No layout
+    // loaded" for the length of the download. load(url) does this on its own.
+    async showLoading(label) {
+        return (await this.ready).showLoading(label);
     }
 
     async goToPoint(x, y) {
