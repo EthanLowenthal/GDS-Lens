@@ -7,6 +7,67 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [1.2.0] - 2026-09-03
+
+### Added
+
+- `gds-load` and `gds-error` events on the element, dispatched however a load
+  was started -- the `src` attribute, `load()`, or a host pushing bytes through
+  its surface. Until now a load that came from `src` could fail only into the
+  viewer's own error panel, with nothing for the embedding page to observe.
+  `detail` carries `{ layerCount, cellCount }` and `{ message }` respectively.
+  Prefixed rather than `load` / `error`, which every HTML element already has
+  with other types attached.
+- `showLoading(label?)` on the element. The surface had it; a page fetching its
+  own bytes and calling `load(bytes)` could not reach it without `ready`, so it
+  sat on "No layout loaded" for the length of the download.
+- A message when WebGL2 cannot be had: unsupported, disabled, or the page over
+  its limit on live contexts. The renderer's `main()` returns quietly when its
+  context creation fails -- which is what lets the same module run in the parse
+  worker and under Node, where there is no canvas -- and nothing on the other
+  side ever asked, so the result was a canvas that never drew and a `load()`
+  that reported success. The viewer now asks (`isGlReady`) and says so, and a
+  lost context (`webglcontextlost`, after a GPU reset or the browser reclaiming
+  it) is reported the same way rather than left as a black canvas.
+
+### Changed
+
+- `load()` settles on the outcome. It used to resolve as soon as the file had
+  been handed to the parse worker, so it never rejected on a file the parser
+  refused -- contrary to what the React docs claimed of it. It now resolves
+  once the layout is on screen and rejects with the same message the viewer
+  shows. A load superseded by a newer one rejects with an error named
+  `AbortError`, the name `fetch()` uses for the same thing.
+
+- The demo page's layout is served as gzipped OASIS rather than gzipped GDSII:
+  the same design, 4.4 MB down from 8.1 MB. `site/make-demo-assets.py` writes
+  OASIS now.
+
+### Fixed
+
+- The parse worker wrote a dozen lines to the console on every load, into the
+  embedding page's DevTools, whether or not tracing had been asked for. The
+  relay to the on-screen debug panel was always meant to be unconditional; the
+  copy to the real console was not. It is now gated on the same flag as the
+  main thread's breadcrumbs (the `debug` attribute or `?gdsDebug=1`). The test
+  meant to catch this filtered on `[GDS]`, and the worker's prefix is
+  `[GDS worker]`.
+- `destroy()` did not release the viewer. Six listeners on `window` (the
+  keyboard shortcuts and the coordinate menu's dismissal) were never removed,
+  and a listener's closure holds the whole viewer, wasm instance included; the
+  renderer's own `mouseup` and `resize` callbacks on `window` did the same from
+  the other side, and the WebGL context waited on garbage collection. Every
+  listener now carries an abort signal that `dispose()` fires, and the renderer
+  exports a `destroyRenderer()` that unregisters its callbacks and destroys the
+  context outright -- so a page calling `destroy()` because it hit the per-page
+  context cap gets its slot back when it asks, not when the collector gets to
+  it.
+- Two quick changes to `src` (or two `load(url)` calls) could show the older
+  layout: the viewer superseded an in-flight *parse*, but the fetch in front of
+  it was nobody's to cancel, so a slow first file landing after a small second
+  one won. Each `load()` now aborts the fetch before it, and a load parked on
+  gzip expansion notices it has been superseded when it wakes.
+
 ## [1.1.0] - 2026-08-31
 
 ### Added
@@ -389,7 +450,8 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.1...v1.0.2
