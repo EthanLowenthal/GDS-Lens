@@ -8,7 +8,7 @@
 const viewer = document.getElementById("viewer");
 const status = document.getElementById("status");
 
-const LAYOUT = "demo-layout.gds.gz";
+const LAYOUT = "demo-layout.oas.gz";
 const LAYERS = "demo-layers.lyp";
 const MARKERS = "demo-markers.drc";
 

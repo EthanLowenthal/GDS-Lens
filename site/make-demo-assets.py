@@ -16,10 +16,12 @@ page that happens to be serving it.
 
 Why each output looks the way it does:
 
-  demo-layout.gds.gz  Gzipped, because the raw file is 20 MB and the repository
-                      has to carry it. The viewer sniffs gzip from the leading
-                      bytes rather than the extension, so this also exercises
-                      that path on every page load.
+  demo-layout.oas.gz  OASIS rather than GDSII, because the repository has to
+                      carry it and the page has to download it: the same layout
+                      is 20 MB as GDSII, 8 MB gzipped, and 4.4 MB as gzipped
+                      OASIS. Still gzipped, for the last 0.3 MB and because the
+                      viewer sniffs gzip from the leading bytes rather than the
+                      extension, so this exercises that path on every page load.
   demo-layers.lyp     gdsfactory's generic layer properties, plus the six
                       doping layers it omits. Without those, a sixth of the
                       layers in this layout render in fallback colours.
@@ -229,7 +231,14 @@ def build_layout(source: pathlib.Path, out: pathlib.Path) -> dict:
     top.name = TOP_CELL_NAME
 
     raw = out.with_suffix("")          # strip .gz
-    layout.write(str(raw))
+    # klayout picks the format from the extension; the options only apply to
+    # OASIS. Level 10 is its maximum compression -- worth it for a file that
+    # is downloaded on every visit and rewritten almost never.
+    opts = kdb.SaveLayoutOptions()
+    if raw.suffix == ".oas":
+        opts.format = "OASIS"
+        opts.oasis_compression_level = 10
+    layout.write(str(raw), opts)
     data = raw.read_bytes()
     # mtime=0: the gzip header otherwise carries a timestamp, so rebuilding an
     # unchanged layout would produce a different file and a pointless diff.
@@ -366,7 +375,8 @@ def run_drc(layout_path: pathlib.Path) -> tuple:
     """
     layout = kdb.Layout()
     with gzip.open(layout_path, "rb") as fh:
-        raw = layout_path.with_suffix(".tmp.gds")
+        # Keeps the real extension, which is how klayout picks the reader.
+        raw = layout_path.with_name("tmp-" + layout_path.name.removesuffix(".gz"))
         raw.write_bytes(fh.read())
     layout.read(str(raw))
     raw.unlink()
@@ -437,7 +447,7 @@ def main() -> None:
     if not args.source.exists():
         raise SystemExit(f"no such layout: {args.source}")
 
-    layout_out = HERE / "demo-layout.gds.gz"
+    layout_out = HERE / "demo-layout.oas.gz"
     info = build_layout(args.source, layout_out)
     props, groups = build_lyp(HERE / "demo-layers.lyp")
 
