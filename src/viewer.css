@@ -232,6 +232,23 @@
         /* The soloed layer's own row, so it's clear which of the hidden
            hundred is the one still on screen. */
         .lil-gui .lil-controller.layer-row.layer-soloed .layer-solo { color: var(--accent-fg); background: var(--accent); }
+        /* A / B badge, on anything that belongs to only one of two loaded
+           layouts: a layer one revision has and the other does not, a root
+           cell, a search hit. Never rendered with a single layout loaded (see
+           slotChip in viewer.js), so it costs nothing in the ordinary case.
+           The two hues match the optional source tints. */
+        .slot-chip { flex: none; margin-left: 4px; padding: 0 3px; border-radius: 2px;
+                     font-size: 9px; font-weight: 600; line-height: 14px; letter-spacing: 0.02em;
+                     color: var(--panel-bg); }
+        .slot-chip-a { background: #e07358; }
+        .slot-chip-b { background: #59a5d8; }
+        /* Which file is A and which is B, at the top of the Compare folder.
+           Hand-built rather than a lil-gui row: it is a label, not a control. */
+        .lil-gui .lil-controller.compare-file-row { display: flex; align-items: center; gap: 4px;
+                                                    padding-left: 8px; }
+        .lil-gui .lil-controller.compare-file-row .slot-chip { margin-left: 0; }
+        .compare-file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                             white-space: nowrap; color: var(--fg-faint); font-size: 11px; }
         /* Filter box at the top of the Layers folder. lil-gui styles the inputs
            belonging to its own controllers; this one is hand-built, so it
            borrows the same widget fill. */

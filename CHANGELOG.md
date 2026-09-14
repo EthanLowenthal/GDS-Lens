@@ -7,6 +7,71 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [1.3.0] - 2026-09-14
+
+### Added
+
+- **Two layouts in one viewer.** A `<gds-lens>` can hold two layouts at once
+  and draw them through one camera into one canvas, for comparing two
+  revisions of a design:
+
+  ```js
+  await element.load(oldBytes);
+  await element.load(newBytes, { slot: "b", name: "rev-b.gds" });
+  await element.setBlend(0.5);
+  ```
+
+  - `load(source, { slot })` picks which layout to replace -- `"a"` (the
+    default, and the only one a single-layout viewer ever uses) or `"b"`. A
+    second layout arriving does not move the camera off what is already being
+    read, and loading either slot leaves the other alone.
+  - `unload(slot)` drops one again; `setBlend(t)` / `getBlend()` crossfade
+    between them, `0` showing only A, `1` only B, between overlaying them.
+  - With two loaded, the panel grows a **Compare** folder: the blend slider,
+    an optional per-layout tint, and **Highlight differences**, which marks
+    per (layer, datatype) where the two disagree -- one colour where only A
+    has geometry, another where only B does. Both rasterize through the same
+    camera into the same coverage mask in the same frame, so identical
+    geometry cancels exactly. It is a difference of what is drawn at the zoom
+    being viewed, not a geometric XOR, and differences under about half a
+    pixel are ignored; zoom in to resolve a smaller one.
+  - The layer list shows the **union** of both layouts' layers, chipped A or B
+    where only one has it, so an added or removed layer is visible as a row
+    rather than absent. The hierarchy browser roots both cell trees, and cell
+    and label searches run over both with the same chips on the hits.
+  - `getLayers()` entries gain `source` (0 for slot A, 1 for B), and
+    `gds-load`'s detail gains `slot`.
+
+  See [docs/embedding.md](docs/embedding.md#two-layouts-in-one-viewer). The
+  single-layout case is unchanged in every respect: no attribute, no mode
+  flag, and the Compare folder is not built at all until a second layout is
+  loaded.
+
+- **gdsfactory / kfactory ports.** kfactory records each cell's ports as
+  KLayout meta info, which KLayout writes into the layout file itself: a
+  `$$$CONTEXT_INFO$$$` cell in GDSII, `KLAYOUT_CONTEXT` properties in OASIS,
+  each holding strings like `META('kfactory:ports:0')={'name'=>'o1',...}`. The
+  viewer now reads those back (`src/wasm/kfactory_ports.cpp`) -- name, type,
+  position, direction, width and layer, through the named cross-section --
+  and expands them through every placement, so a component's ports are marked
+  wherever it sits in the design: a bar across the port, an arrow the way it
+  faces, and its name once few enough are on screen to read. Optical ports
+  are orange, electrical green, anything else the highlight blue. A **Ports**
+  toggle in Display turns the overlay off; a **Ports** folder lists the top
+  cell's ports and centers the view on one when clicked. Each hierarchy cell
+  entry carries a `ports` array and the hierarchy a `portCount`, the
+  `gds-load` event's detail gains `portCount`, and the element exposes nothing
+  new otherwise -- a file without the metadata looks exactly as before. The
+  expansion stops at 200,000 port placements and says so in the panel.
+
+- **`getCamera()` / `setCamera({zoom, panX, panY})`,
+  `getMeasurements()` / `addMeasurement(x0, y0, x1, y1)` /
+  `clearMeasurements()`, and `getLayers()` / `setLayerVisible(...)`** on the
+  viewer surface and the element, for an app that wants to frame the view,
+  place a ruler or drive layer visibility itself. Thin pass-throughs over
+  behavior that already existed internally; `getLayers()` is also the only way
+  to read a layer's name, group, colors and shape counts.
+
 ## [1.2.0] - 2026-09-03
 
 ### Added

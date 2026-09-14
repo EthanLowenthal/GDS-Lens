@@ -108,13 +108,16 @@ export class GdsLens extends ElementBase {
     // in flight.
     #viewer = null;
 
-    // The load most recently asked for, so the next one can cancel it. Two
-    // quick changes to `src` are two fetches, and without this the one that
-    // happened to finish last was the one that got displayed -- which, with a
-    // slow first file and a small second one, is the layout nobody asked for
-    // any more. The viewer already supersedes an in-flight *parse*; this
-    // covers the fetch in front of it, which is this side's work.
-    #inflight = null;
+    // The load most recently asked for *per slot*, so the next one can cancel
+    // it. Two quick changes to `src` are two fetches, and without this the one
+    // that happened to finish last was the one that got displayed -- which,
+    // with a slow first file and a small second one, is the layout nobody
+    // asked for any more. The viewer already supersedes an in-flight *parse*;
+    // this covers the fetch in front of it, which is this side's work.
+    //
+    // Keyed by slot because a comparison loads both layouts at once, and one
+    // shared slot would have the second load cancel the first one's fetch.
+    #inflight = { a: null, b: null };
 
     // True while #mount() is in flight. An element removed and re-added before
     // its engine arrives must not start a second mount: both would finish
@@ -242,13 +245,20 @@ export class GdsLens extends ElementBase {
     //
     // Settles on the outcome: resolves once the layout is drawn, rejects on a
     // failed fetch, a file the parser refuses, or -- with an error named
-    // "AbortError" -- when a later load() superseded this one. Every load
-    // cancels the one before it, bytes included: bytes handed over now must
-    // not be overwritten by a URL that was asked for earlier and arrives later.
+    // "AbortError" -- when a later load() superseded this one. A load cancels
+    // the one before it *for the same slot*, bytes included: bytes handed over
+    // now must not be overwritten by a URL that was asked for earlier and
+    // arrives later.
+    //
+    // options.slot picks which of the two layouts this one is: "a" (the
+    // default, and the only one a single-layout viewer ever uses) or "b", the
+    // second layout a comparison draws alongside it through the same camera.
+    // options.name is the filename to show for it in the Compare folder.
     async load(source, options) {
-        this.#inflight?.abort();
+        const slot = options?.slot === "b" ? "b" : "a";
+        this.#inflight[slot]?.abort();
         const controller = new AbortController();
-        this.#inflight = controller;
+        this.#inflight[slot] = controller;
         const viewer = await this.ready;
         if (typeof source === "string") {
             // The fetch is this side's work, so the viewer has no way to know
@@ -289,6 +299,53 @@ export class GdsLens extends ElementBase {
 
     async showError(message) {
         return (await this.ready).showError(message);
+    }
+
+    // Drops the second layout, leaving the viewer showing one again.
+    async unload(slot = "b") {
+        return (await this.ready).unload(slot);
+    }
+
+    // Crossfade between two loaded layouts: 0 shows only the first, 1 only the
+    // second, and anything between overlays them. Meaningless, and harmless,
+    // with a single layout loaded.
+    async setBlend(value) {
+        return (await this.ready).setBlend(value);
+    }
+
+    async getBlend() {
+        return (await this.ready).getBlend();
+    }
+
+    // Thin pass-throughs to the surface, same as everything above, for a page
+    // that wants to frame the view, read the layer table or place a ruler
+    // itself (see docs/embedding.md).
+    async getCamera() {
+        return (await this.ready).getCamera();
+    }
+
+    async setCamera(camera) {
+        return (await this.ready).setCamera(camera);
+    }
+
+    async getLayers() {
+        return (await this.ready).getLayers();
+    }
+
+    async setLayerVisible(layer, datatype, visible) {
+        return (await this.ready).setLayerVisible(layer, datatype, visible);
+    }
+
+    async getMeasurements() {
+        return (await this.ready).getMeasurements();
+    }
+
+    async addMeasurement(x0, y0, x1, y1) {
+        return (await this.ready).addMeasurement(x0, y0, x1, y1);
+    }
+
+    async clearMeasurements() {
+        return (await this.ready).clearMeasurements();
     }
 
     // Parks the viewer without tearing anything down. The element is very

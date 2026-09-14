@@ -38,10 +38,21 @@ element.addEventListener("click", (event) => {
     const x: number = event.clientX;
     void x;
 });
-const loadDetail: GdsLensEventMap["gds-load"]["detail"] = { layerCount: 1, cellCount: 2 };
+const loadDetail: GdsLensEventMap["gds-load"]["detail"] =
+    { slot: "a", layerCount: 1, cellCount: 2, portCount: 0 };
 void loadDetail;
 const surface: ViewerSurface = await element.ready;
 surface.element.addEventListener("drop", () => {});
+
+// --- two layouts in one viewer ---
+await element.load("new.gds", { slot: "b", name: "new.gds" });
+await element.setBlend(0.5);
+const blend: number = await element.getBlend();
+void blend;
+// getLayers says which of the two each entry came from.
+const sources: Array<0 | 1> = (await element.getLayers()).map((layer) => layer.source);
+void sources;
+await element.unload("b");
 void landed;
 
 // createElement must come back typed, via HTMLElementTagNameMap.

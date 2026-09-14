@@ -272,8 +272,37 @@ export function createViewer(mountTarget) {
     // load in flight at a time -- a newer one supersedes the older, which is
     // told so with an AbortError, the same name fetch() uses for the same
     // thing, so a caller can tell "you were replaced" from "this file is bad".
-    let pendingLoad = null;
-    let loadGeneration = 0;
+    // ---- Comparison slots ----
+    // A viewer holds up to two layouts at once, drawn through one camera into
+    // one canvas: slot "a" is the ordinary single-file case, slot "b" is the
+    // second layout a comparison loads alongside it. Everything that is per
+    // *layout* rather than per viewer lives in these two records -- the load
+    // in flight, its generation, the promise load() returned, the filename.
+    //
+    // Everything else (the camera, the layer panel, the rulers, the mode) is
+    // deliberately NOT per slot. There is one of each, so there is nothing to
+    // keep in step between the two layouts: they cannot disagree about where
+    // the view is because there is only one view. That is the entire reason
+    // this is one viewer with two documents rather than two viewers.
+    const SLOT_IDS = ["a", "b"];
+    const slotOf = (id) => (id === "b" ? slots[1] : slots[0]);
+    const slots = SLOT_IDS.map((id, index) => ({
+        id,
+        index,
+        // The load in flight for this slot, so a reload can cancel it. Per slot
+        // rather than shared: a comparison loads both layouts at once, and a
+        // single "active worker" would have the second load terminate the
+        // first one's parse.
+        worker: null,
+        generation: 0,
+        pending: null,
+        // View state captured for this slot's in-flight reload, re-applied
+        // once its geometry is uploaded. Null on a first open.
+        viewState: null,
+        name: null,
+        hierarchy: null,
+        loaded: false
+    }));
 
     function abortError(message) {
         const err = new Error(message);
@@ -281,12 +310,19 @@ export function createViewer(mountTarget) {
         return err;
     }
 
-    function settleLoad(kind, value) {
-        const pending = pendingLoad;
-        if (!pending) return;
-        pendingLoad = null;
-        pending[kind](value);
+    // Settles one slot's load promise, or every outstanding one when no slot
+    // is named -- which is what a fatal error or a destroyed viewer is: not
+    // one layout failing, but the viewer no longer drawing anything.
+    function settleLoad(kind, value, slot = null) {
+        for (const candidate of slot ? [slot] : slots) {
+            const pending = candidate.pending;
+            if (!pending) continue;
+            candidate.pending = null;
+            pending[kind](value);
+        }
     }
+
+    const anyLoadInFlight = () => slots.some((slot) => slot.worker !== null);
 
     // Set once it is known that nothing will ever be drawn: no WebGL2 context
     // could be made, or the one there was has been lost. A load after that
@@ -324,9 +360,9 @@ export function createViewer(mountTarget) {
         canvasResizeObserver?.disconnect();
         disposeController.abort();
         if (activeViewer === hostElement) activeViewer = null;
-        if (activeWorker) {
-            activeWorker.terminate();
-            activeWorker = null;
+        for (const slot of slots) {
+            if (slot.worker) slot.worker.terminate();
+            slot.worker = null;
         }
         settleLoad("reject", abortError("the viewer was destroyed"));
         // Through the promise rather than resolvedModule: a viewer destroyed
@@ -399,6 +435,10 @@ export function createViewer(mountTarget) {
         resetView: () => modulePromise.then((Module) => Module.resetView()),
         showInfill: false,
         showText: false,
+        // On by default, unlike the text: a port is a handful of pixels a
+        // photonics layout is read by, and a file without kfactory metadata
+        // draws none, so the toggle costs nothing where it doesn't apply.
+        showPorts: true,
         mergeOverlaps: false,
         // On by default -- matches g_show_grid in renderer.cpp, which is the
         // renderer's own initial state (nothing pushes this value down at startup).
@@ -413,22 +453,44 @@ export function createViewer(mountTarget) {
     const displayFolder = gui.addFolder("Display");
     displayFolder.close();
 
+    // What each render toggle means in wasm. One table rather than the call
+    // inlined into each row's onChange, so the set of toggles reads as a set.
+    const DISPLAY_SETTERS = {
+        showInfill: (Module, on) => Module.setShowInfill(on),
+        showText: (Module, on) => Module.setShowText(on),
+        showPorts: (Module, on) => Module.setShowPorts(on),
+        mergeOverlaps: (Module, on) => Module.setMergeMode(on),
+        showGrid: (Module, on) => Module.setShowGrid(on)
+    };
+
+    function setDisplay(key, value) {
+        actions[key] = value;
+        return modulePromise.then((Module) => DISPLAY_SETTERS[key](Module, value));
+    }
+
     displayFolder.add(actions, "showInfill").name("Infill")
-        .onChange((show) => modulePromise.then((Module) => Module.setShowInfill(show)));
+        .onChange((show) => setDisplay("showInfill", show));
     // Draw the layout's own labels (GDSII/OASIS TEXT elements) at a fixed
     // on-screen size, in each label's layer color -- off by default because a
     // full chip's worth of text buries the geometry it sits on.
     const textController = displayFolder.add(actions, "showText").name("Text")
-        .onChange((show) => modulePromise.then((Module) => Module.setShowText(show)));
+        .onChange((show) => setDisplay("showText", show));
     textController.domElement.title = "Show layout text labels, drawn in their layer's color";
+    // The ports gdsfactory / kfactory wrote into the file (see kfactory_ports.hpp):
+    // a bar across each port's width, an arrow the way it faces, and its name
+    // once few enough are on screen to read.
+    const portsController = displayFolder.add(actions, "showPorts").name("Ports")
+        .onChange((show) => setDisplay("showPorts", show));
+    portsController.domElement.title =
+        "Show the ports a gdsfactory / kfactory layout declares: a bar across each, an arrow the way it faces, its name close in";
     // Draw each layer as the union of its polygons (boundary + fill only, no
     // internal edges) -- a pure render-mode toggle, no re-parse involved.
     displayFolder.add(actions, "mergeOverlaps").name("Merge Overlaps")
-        .onChange((on) => modulePromise.then((Module) => Module.setMergeMode(on)));
+        .onChange((on) => setDisplay("mergeOverlaps", on));
     // Background reference grid, pitched at a power-of-ten nm/µm/mm step that
     // follows the zoom (see draw_grid).
     const gridController = displayFolder.add(actions, "showGrid").name("Grid")
-        .onChange((show) => modulePromise.then((Module) => Module.setShowGrid(show)));
+        .onChange((show) => setDisplay("showGrid", show));
     gridController.domElement.title = "Show the background grid, spaced at a round step that follows the zoom";
 
     // The two file loaders live under the toggles because that's the order they're
@@ -822,6 +884,48 @@ export function createViewer(mountTarget) {
         return `${item.layer}/${item.datatype}`;
     }
 
+    // The little A / B badge that says which of two loaded layouts something
+    // belongs to. Only ever rendered while comparing -- with one layout there
+    // is nothing to disambiguate and a chip on every row is just noise.
+    function slotChip(slotId) {
+        const chip = document.createElement("span");
+        chip.className = `slot-chip slot-chip-${slotId}`;
+        chip.textContent = slotId.toUpperCase();
+        chip.title = slotId === "a"
+            ? `Only in ${slots[0].name || "the first layout"}`
+            : `Only in ${slots[1].name || "the second layout"}`;
+        return chip;
+    }
+
+    // One row per (layer, datatype) across both loaded layouts, rather than one
+    // per wasm entry -- getLayers() returns 10/0 twice when both layouts have
+    // it (see LayerBuffer::source in renderer.cpp).
+    //
+    // The union, deliberately, not the intersection: a layer only one revision
+    // has is exactly what a comparison is looking for, and dropping its row
+    // would hide the most interesting thing on screen behind no row at all.
+    // `sources` is what the A/B chip reads; a row with both is unchipped.
+    function foldLayersByTag(layers) {
+        const byTag = new Map();
+        for (const layer of layers) {
+            const tag = layerTag(layer);
+            const slotId = SLOT_IDS[layer.source] || "a";
+            const existing = byTag.get(tag);
+            if (!existing) {
+                byTag.set(tag, { ...layer, sources: [slotId] });
+                continue;
+            }
+            // Counts are summed so the row's shape count describes the row.
+            // Colors, name and group come from the first entry, which
+            // getLayers() sorts to be slot A's: both come from the same .lyp,
+            // so they agree anyway.
+            existing.sources.push(slotId);
+            existing.polygonCount = (existing.polygonCount || 0) + (layer.polygonCount || 0);
+            existing.labelCount = (existing.labelCount || 0) + (layer.labelCount || 0);
+        }
+        return [...byTag.values()];
+    }
+
     // Compact count for a row ("1.2k", "3M") -- the exact number goes in the
     // tooltip. A 260px panel has no room for seven digits per row.
     function fmtCount(n) {
@@ -1002,6 +1106,11 @@ export function createViewer(mountTarget) {
             toggleSolo(item);
         });
         controller.domElement.append(count, solo);
+        // A layer only one of the two layouts has: added or removed between
+        // the revisions, which is the first thing worth noticing about it.
+        if (comparing() && item.sources && item.sources.length === 1) {
+            controller.domElement.append(slotChip(item.sources[0]));
+        }
 
         return { controller, state, item, matches: true, haystack: `${label} ${item.group || ""}`.toLowerCase() };
     }
@@ -1085,7 +1194,7 @@ export function createViewer(mountTarget) {
         // Ungrouped layers collect under a single trailing "Other layers" bucket.
         const OTHER = "Other layers";
         const categories = new Map();
-        for (const layer of layers) {
+        for (const layer of foldLayersByTag(layers)) {
             const key = layer.group || OTHER;
             if (!categories.has(key)) categories.set(key, []);
             categories.get(key).push(layer);
@@ -1308,6 +1417,10 @@ export function createViewer(mountTarget) {
         lines.push(`${cell.polygons} own shape${cell.polygons === 1 ? "" : "s"}, ` +
                    `${cell.labels} label${cell.labels === 1 ? "" : "s"}, ` +
                    `${cell.refs.length} child cell${cell.refs.length === 1 ? "" : "s"}`);
+        if (cell.ports && cell.ports.length > 0) {
+            lines.push(`${cell.ports.length} port${cell.ports.length === 1 ? "" : "s"}: ` +
+                       cell.ports.map((p) => p.name).join(", "));
+        }
         if (box) {
             lines.push(`${fmtCoord(box.maxX - box.minX)} × ${fmtCoord(box.maxY - box.minY)} µm ` +
                        `at (${fmtCoord((box.minX + box.maxX) / 2)}, ${fmtCoord((box.minY + box.maxY) / 2)}) — ` +
@@ -1334,7 +1447,7 @@ export function createViewer(mountTarget) {
             const cell = hierarchyModel.cells[node.cell];
             if (!cell) continue;
 
-            const path = parentPath ? `${parentPath}/${cell.name}` : cell.name;
+            const path = node.pathKey || (parentPath ? `${parentPath}/${cell.name}` : cell.name);
             const box = node.bbox ? transformBox(parentXform, node.bbox) : null;
             const boxes = hierarchyBoxes(node, cell, parentXform, box);
             const childXform = composeXform(parentXform, node.xform);
@@ -1361,6 +1474,9 @@ export function createViewer(mountTarget) {
             count.className = "hier-count";
             if (node.count > 1) count.textContent = `×${node.count}`;
             row.append(twisty, name, count);
+            // Only on the roots, and only while comparing: below the top the
+            // branch you are in already says which design you are reading.
+            if (depth === 0 && comparing()) row.append(slotChip(cell.slot));
             row.title = hierarchyTooltip(cell, node, box, boxes);
 
             const children = document.createElement("div");
@@ -1439,9 +1555,70 @@ export function createViewer(mountTarget) {
             cell: index,
             count: 1,
             bbox: cells[index].bbox,
-            xform: HIERARCHY_IDENTITY
+            xform: HIERARCHY_IDENTITY,
+            pathKey: rootPathKey(cells[index])
         }));
         addHierarchyRows(hierarchyTree, rootNodes, 0, "", HIERARCHY_IDENTITY);
+    }
+
+    // True while a second layout is loaded alongside the first.
+    const comparing = () => slots[1].loaded;
+
+    // One tree over both loaded layouts: each design's cells concatenated, with
+    // the second's reference indices shifted past the first's so every `refs`
+    // entry still names a row of `cells`. Every cell carries the slot it came
+    // from, which is what the A/B chips on the root rows read.
+    //
+    // Merging here rather than giving the panel two trees keeps one selection,
+    // one set of open branches and one search over both designs -- and the
+    // outlines a selected row draws are world-space boxes either way, so a
+    // cell picked out of either design frames correctly with no extra work.
+    function mergedHierarchy() {
+        const loaded = slots.filter((slot) => slot.loaded && slot.hierarchy);
+        if (loaded.length === 0) return null;
+        if (loaded.length === 1) {
+            const model = loaded[0].hierarchy;
+            return { ...model, cells: (model.cells || []).map((cell) => ({ ...cell, slot: loaded[0].id })) };
+        }
+        // A design too big to browse as a tree suppresses the whole panel, the
+        // same as it does on its own: half a comparison's cells is not a tree
+        // worth showing, and saying which half is suppressed is more confusing
+        // than saying the design is too big.
+        if (loaded.some((slot) => slot.hierarchy.omitted)) {
+            return {
+                cells: [], roots: [], omitted: true,
+                cellCount: loaded.reduce((n, slot) => n + (slot.hierarchy.cellCount || 0), 0)
+            };
+        }
+        const cells = [];
+        const roots = [];
+        for (const slot of loaded) {
+            const offset = cells.length;
+            for (const cell of slot.hierarchy.cells || []) {
+                cells.push({
+                    ...cell,
+                    slot: slot.id,
+                    refs: (cell.refs || []).map((ref) => ({ ...ref, cell: ref.cell + offset }))
+                });
+            }
+            for (const root of slot.hierarchy.roots || []) roots.push(root + offset);
+        }
+        return {
+            cells,
+            roots,
+            cellCount: cells.length,
+            omitted: false,
+            portCount: loaded.reduce((n, slot) => n + (slot.hierarchy.portCount || 0), 0),
+            kfactory: loaded.some((slot) => slot.hierarchy.kfactory)
+        };
+    }
+
+    // Rows are keyed by the path of cell names leading to them, which two
+    // designs can collide on -- two revisions of one layout have the same top
+    // cell name by definition. Rooting each design's paths at its own slot is
+    // what keeps their branches, selections and expansions apart.
+    function rootPathKey(cell) {
+        return comparing() ? `${cell.slot}:${cell.name}` : cell.name;
     }
 
     // The tree's half of a cell search: cellPathToTarget (cell-search.js, loaded
@@ -1461,6 +1638,9 @@ export function createViewer(mountTarget) {
         if (!path) return false;
 
         const names = path.map((index) => hierarchyModel.cells[index].name);
+        // The root's key rather than its bare name, so a revealed cell opens
+        // the branch under the design it actually belongs to.
+        names[0] = rootPathKey(hierarchyModel.cells[path[0]]);
         // Every ancestor of the target row has to be open for it to exist, and
         // rows are keyed by the path of names leading to them.
         for (let i = 1; i < names.length; i++) {
@@ -1480,8 +1660,9 @@ export function createViewer(mountTarget) {
 
     // Rebuilds the tree from a freshly loaded design (or clears it, for model
     // null -- a load that failed has no hierarchy to browse).
-    function renderHierarchy(model) {
+    function renderHierarchy() {
         if (!hierarchyTree) return;
+        const model = mergedHierarchy();
         hierarchyModel = model;
         // Every row is about to be thrown away. The selected *path* is kept -- the
         // rows rebuilt below re-select it, which puts the canvas outlines back at
@@ -1516,7 +1697,7 @@ export function createViewer(mountTarget) {
 
         // A different design: drop the previous one's open branches and selection
         // rather than matching them against unrelated cell names.
-        const rootKey = roots.map((i) => cells[i].name).join(" ");
+        const rootKey = roots.map((i) => rootPathKey(cells[i])).join(" ");
         const sameDesign = rootKey === hierarchyRootKey;
         if (!sameDesign) {
             hierarchyRootKey = rootKey;
@@ -1541,7 +1722,7 @@ export function createViewer(mountTarget) {
         // First look at a design: open the top cell, so the panel shows what it's
         // made of instead of a single row you have to click to learn anything.
         if (hierarchyExpanded.size === 0 && roots.length > 0) {
-            hierarchyExpanded.add(cells[roots[0]].name);
+            hierarchyExpanded.add(rootPathKey(cells[roots[0]]));
         }
 
         rebuildHierarchyRows();
@@ -1674,7 +1855,7 @@ export function createViewer(mountTarget) {
     // One result row: `name` on the left, `meta` on the right, `activate(row)` on
     // click or Enter. Rows are appended in the order they're built, which is the
     // order the arrow keys walk them in.
-    function addFindRow(name, meta, title, activate) {
+    function addFindRow(name, meta, title, activate, slotId = null) {
         if (!hierarchyResults) return;
         const element = document.createElement("div");
         element.className = "find-row";
@@ -1685,6 +1866,11 @@ export function createViewer(mountTarget) {
         metaEl.className = "find-meta";
         metaEl.textContent = meta;
         element.append(nameEl, metaEl);
+        // With two layouts loaded one search runs over both, so a hit has to
+        // say which design it is in -- two revisions have most of their cell
+        // and label names in common, which is exactly what makes an unlabelled
+        // list of hits useless here.
+        if (slotId && comparing()) element.append(slotChip(slotId));
         element.title = title;
         const index = findRows.length;
         element.addEventListener("click", () => activateFindRow(index));
@@ -1769,7 +1955,7 @@ export function createViewer(mountTarget) {
                 `${cell.refs.length} child cell${cell.refs.length === 1 ? "" : "s"}`,
                 "Click to open the tree down to it, frame it and outline every placement"
             ].join("\n");
-            addFindRow(cell.name, meta, title, (row) => chooseCell(index, row));
+            addFindRow(cell.name, meta, title, (row) => chooseCell(index, row), cell.slot);
         }
         if (matches.length > MAX_FIND_ROWS) {
             findNote(`… ${matches.length - MAX_FIND_ROWS} more — narrow the query`);
@@ -1831,7 +2017,7 @@ export function createViewer(mountTarget) {
                 `on layer ${tag}${hit.visible ? "" : " — currently hidden, but the label is still marked"}`,
                 `at (${fmtCoord(hit.x)}, ${fmtCoord(hit.y)}) µm — click to pan there and mark it`
             ].join("\n");
-            addFindRow(hit.text, meta, title, () => goToLabel(hit));
+            addFindRow(hit.text, meta, title, () => goToLabel(hit), SLOT_IDS[hit.source] || "a");
         }
         if (total > hits.length) {
             findNote(`… ${(total - hits.length).toLocaleString()} more — narrow the query`);
@@ -1989,6 +2175,85 @@ export function createViewer(mountTarget) {
     // capped-off items (it lives in wasm per-category), and [ / ] key stepping
     // reaches them too.
     const MAX_MARKER_ROWS_PER_CATEGORY = 200;
+
+    // ---- Ports panel ----
+    // The ports gdsfactory / kfactory declared on the design's top cell(s):
+    // where the chip connects to the outside, which is what someone opening a
+    // photonics component wants to see first. Nested cells' ports are drawn on
+    // the canvas (every placement of them -- see collect_world_ports) but not
+    // listed: a top cell's dozen ports is a list, ten thousand straights' o1/o2
+    // is not. Rebuilt on every load like the hierarchy, and absent entirely for
+    // a file with no kfactory metadata.
+    let portsFolder = null;
+    const MAX_PORT_ROWS = 200;
+    const EMPTY_PORTS = {
+        xydw: new Float32Array(0), type: new Uint32Array(0), nameChars: new Uint8Array(0),
+        nameOffsets: new Uint32Array([0]), typeNames: [], capped: false, count: 0
+    };
+
+    function removePortsPanel() {
+        if (!portsFolder) return;
+        portsFolder.destroy();
+        portsFolder = null;
+    }
+
+    // Pushes a load's ports into the renderer (always, so the previous file's
+    // are cleared by a file that has none) and rebuilds the panel.
+    function applyPorts(Module, ports, hierarchy) {
+        Module.setPorts(ports || EMPTY_PORTS);
+        renderPortsPanel(ports, hierarchy);
+    }
+
+    function renderPortsPanel(ports, hierarchy) {
+        removePortsPanel();
+        const declared = hierarchy && hierarchy.portCount ? hierarchy.portCount : 0;
+        if (!declared) return;
+
+        const cells = hierarchy.cells || [];
+        const roots = (hierarchy.roots || []).filter((index) => cells[index]);
+        const topPorts = [];
+        for (const index of roots) {
+            for (const port of cells[index].ports || []) topPorts.push(port);
+        }
+
+        portsFolder = gui.addFolder(`Ports (${topPorts.length})`);
+        portsFolder.domElement.title = `${declared} port${declared === 1 ? "" : "s"} declared in this file's ` +
+            `kfactory metadata; the ${topPorts.length} on the top cell are listed here, every placement is drawn`;
+        // Open: the list is the design's own interface, and short.
+        portsFolder.open();
+
+        if (topPorts.length === 0) {
+            const note = portsFolder.add({ n: () => {} }, "n")
+                .name(`${declared} port${declared === 1 ? "" : "s"} inside placed cells, none on the top cell`);
+            note.domElement.classList.add("marker-warning-row");
+        }
+        for (const port of topPorts.slice(0, MAX_PORT_ROWS)) {
+            const label = `${port.name}  (${fmtCoord(port.x)}, ${fmtCoord(port.y)})  ${Math.round(port.angle)}°`;
+            // Center on the port and drop the crosshair on it, as Go to
+            // Coordinate does -- without telling the host, since nothing was
+            // typed for it to answer about.
+            const controller = portsFolder.add({
+                go: () => modulePromise.then((Module) => {
+                    Module.goToPoint(port.x, port.y);
+                    Module.flashPoint(port.x, port.y);
+                })
+            }, "go").name(label);
+            const details = [port.type ? `${port.type} port` : "port"];
+            if (port.width > 0) details.push(`${fmtCoord(port.width)} µm wide`);
+            if (port.layer >= 0) details.push(`layer ${port.layer}/${port.datatype}`);
+            details.push("click to center the view on it");
+            controller.domElement.title = details.join(", ");
+        }
+        if (topPorts.length > MAX_PORT_ROWS) {
+            const more = portsFolder.add({ m: () => {} }, "m").name(`… ${topPorts.length - MAX_PORT_ROWS} more`);
+            more.domElement.classList.add("marker-more-row");
+        }
+        if (ports && ports.capped) {
+            const capped = portsFolder.add({ c: () => {} }, "c")
+                .name(`The canvas shows the first ${ports.count} port placements; the rest are not drawn`);
+            capped.domElement.classList.add("marker-warning-row");
+        }
+    }
 
     function removeMarkerBrowser() {
         if (markersFolder) {
@@ -2392,6 +2657,98 @@ export function createViewer(mountTarget) {
     // Restoring is the reload path's restore, reused as-is: keeping the camera and
     // the layer set across a re-read of the file is the same problem as putting
     // them back from a name, and captureViewState/restoreViewState already are it.
+    // ---- Compare ----
+    // Only built once a second layout is loaded, and taken down again when one
+    // is unloaded: with a single layout every control in here is a no-op, and a
+    // folder full of no-ops is worse than no folder.
+    //
+    // There is no "comparison mode" flag behind this. The viewer holds one or
+    // two layouts; the panel grows the controls that mean something for two.
+    let compareFolder = null;
+    // blend: 0 shows only the first layout, 1 only the second, and the middle
+    // overlays them. A plain crossfade rather than two independent opacity
+    // sliders: the question being asked is "what is different between these
+    // two", and the way you answer it is by moving between them, which one
+    // control does and two make you coordinate.
+    //
+    // The object is what the lil-gui rows are bound to, and is therefore the
+    // only copy of these values -- a second one alongside it would be a thing
+    // to keep in step, which is the shape of bug this whole design exists to
+    // stop having.
+    const compareState = { blend: 0.5, tint: false, diff: false };
+    let compareBlendRow = null;
+
+    function applyBlend() {
+        return modulePromise.then((Module) => {
+            Module.setSlotAlpha(0, 1 - compareState.blend);
+            Module.setSlotAlpha(1, compareState.blend);
+        });
+    }
+
+    function setCompareBlend(value) {
+        compareState.blend = Math.min(1, Math.max(0, Number(value) || 0));
+        compareBlendRow?.updateDisplay();
+        return applyBlend();
+    }
+
+    function renderCompareFolder() {
+        if (compareFolder) {
+            compareFolder.destroy();
+            compareFolder = null;
+            compareBlendRow = null;
+        }
+        if (!comparing()) {
+            // Back to one layout: whatever the slider was left at must not keep
+            // fading the only thing on screen.
+            compareState.blend = 0.5;
+            modulePromise.then((Module) => {
+                Module.setSlotAlpha(0, 1);
+                Module.setSlotAlpha(1, 1);
+                Module.setDiffHighlight(false);
+                Module.setSlotTint(false);
+            });
+            compareState.tint = false;
+            compareState.diff = false;
+            return;
+        }
+
+        compareFolder = gui.addFolder("Compare");
+        compareFolder.open();
+
+        // Which file is which, since every other control here says "A" and "B".
+        for (const slot of slots) {
+            const row = document.createElement("div");
+            row.className = "lil-controller compare-file-row";
+            const chip = slotChip(slot.id);
+            chip.title = "";
+            const name = document.createElement("span");
+            name.className = "compare-file-name";
+            name.textContent = slot.name || (slot.id === "a" ? "first layout" : "second layout");
+            row.title = name.textContent;
+            row.append(chip, name);
+            compareFolder.$children.append(row);
+        }
+
+        compareBlendRow = compareFolder.add(compareState, "blend", 0, 1, 0.01).name("A ↔ B")
+            .onChange((value) => setCompareBlend(value));
+        compareBlendRow.domElement.title =
+            "Crossfade between the two layouts: left shows only A, right only B, the middle overlays them";
+
+        const tintRow = compareFolder.add(compareState, "tint").name("Tint sources")
+            .onChange((on) => modulePromise.then((Module) => Module.setSlotTint(on)));
+        tintRow.domElement.title =
+            "Tint each layout toward its own hue. Off by default: it trades away the layer colors, " +
+            "which is how layers are told apart";
+
+        const diffRow = compareFolder.add(compareState, "diff").name("Highlight differences")
+            .onChange((on) => modulePromise.then((Module) => Module.setDiffHighlight(on)));
+        diffRow.domElement.title =
+            "Mark where the two layouts disagree, per layer: red where only A has geometry, green where only B does. " +
+            "Resolved at the zoom you are viewing -- zoom in to resolve smaller differences";
+
+        applyBlend();
+    }
+
     const viewsFolder = gui.addFolder("Views");
     viewsFolder.close();
     // Nothing loaded yet has no view to save, so the folder isn't there to be
@@ -2548,7 +2905,12 @@ export function createViewer(mountTarget) {
         // Nothing loaded, so there's no cell tree to browse -- and leaving the
         // previous file's one up beside the error would invite clicking rows that
         // frame geometry no longer on screen.
-        renderHierarchy(null);
+        for (const slot of slots) {
+            slot.loaded = false;
+            slot.hierarchy = null;
+        }
+        renderCompareFolder();
+        renderHierarchy();
         // The load that was in flight, if any, has failed with this. Also
         // announced on the element, for a page that did not call load() itself
         // (a `src` attribute, a host pushing bytes) and so has no promise.
@@ -2643,11 +3005,6 @@ export function createViewer(mountTarget) {
     // 'init' handler needs to read the *current* camera/layer state before the
     // incoming parse replaces it, and a .then() would run too late for that.
     let resolvedModule = null;
-    // The load currently in flight, so a reload can cancel it (see 'init').
-    let activeWorker = null;
-    // View state captured for the in-flight reload, re-applied once its geometry
-    // is uploaded. Null on a first open.
-    let pendingViewState = null;
     // The object handed to createGdstkModule, kept rather than passed inline.
     //
     // Emscripten's MODULARIZE output uses it *as* the Module -- `var Module =
@@ -2714,6 +3071,21 @@ export function createViewer(mountTarget) {
             Module.resizeCanvas();
         });
         canvasResizeObserver.observe(glCanvas);
+    }
+
+    // ---- Camera read/write, for an embedder framing the view itself ----
+    // getCamera()/setCamera() already exist in wasm (used above for touch
+    // pinch, and for reload view-state restore in captureViewState/
+    // restoreViewState); these expose them. There is deliberately no
+    // camera-*change* notification: interactive pan and zoom live entirely in
+    // renderer.cpp's on_mousemove/on_wheel and never call back into JS, and
+    // nothing in the viewer needs them to.
+    function getCameraFromHost() {
+        return modulePromise.then((Module) => Module.getCamera());
+    }
+
+    function setCameraFromHost(camera) {
+        return modulePromise.then((Module) => Module.setCamera(camera.zoom, camera.panX, camera.panY));
     }
 
     modulePromise.then(
@@ -2924,25 +3296,29 @@ export function createViewer(mountTarget) {
         return source;
     }
 
-    async function loadLayout(source, { reload = false } = {}) {
+    async function loadLayout(source, { reload = false, slot: slotId = "a", name = null } = {}) {
+        const slot = slotOf(slotId);
         const bytes = asBytes(source);
         trace("[GDS] init payload: fileData byteLength =", bytes && bytes.byteLength,
-                    "reload:", !!reload);
-        // A reload supersedes any load still running (the file can change
-        // again while a slow one is in flight) -- drop the old worker rather
-        // than letting two of them race to upload geometry.
-        if (activeWorker) {
-            trace("[GDS] superseding an in-flight load");
-            activeWorker.terminate();
-            activeWorker = null;
+                    "reload:", !!reload, "slot:", slot.id);
+        if (name !== null) slot.name = name;
+        // A reload supersedes any load still running *for this slot* (the file
+        // can change again while a slow one is in flight) -- drop the old
+        // worker rather than letting two of them race to upload geometry. The
+        // other slot's load is untouched, which is what lets a comparison
+        // start both layouts at once.
+        if (slot.worker) {
+            trace("[GDS] superseding an in-flight load for slot", slot.id);
+            slot.worker.terminate();
+            slot.worker = null;
         }
         // ...and tell whoever was awaiting it. The generation is for the load
         // that has not reached its worker yet: one parked on the gzip await
         // below finds on waking that it is no longer the newest, and stops.
-        settleLoad("reject", abortError("superseded by a newer load"));
-        const generation = ++loadGeneration;
+        settleLoad("reject", abortError("superseded by a newer load"), slot);
+        const generation = ++slot.generation;
         const outcome = new Promise((resolve, reject) => {
-            pendingLoad = { resolve, reject };
+            slot.pending = { resolve, reject };
         });
         // Marks the rejection handled for callers who do not await it (a host
         // that fires and forgets). Awaiting callers still see it.
@@ -2959,10 +3335,10 @@ export function createViewer(mountTarget) {
         // Captured synchronously off resolvedModule rather than through
         // modulePromise: the geometry has to be read *before* the new parse
         // lands, and a .then() would run after this handler returns.
-        pendingViewState = null;
+        slot.viewState = null;
         if (reload && resolvedModule) {
             try {
-                pendingViewState = captureViewState(resolvedModule);
+                slot.viewState = captureViewState(resolvedModule);
             } catch (err) {
                 // Nothing loaded yet, or the module is wedged -- reload as if
                 // it were a first open (framed on the design) rather than
@@ -2974,7 +3350,7 @@ export function createViewer(mountTarget) {
         // Captured state doubles as the test for "is there a view worth
         // keeping on screen": it's null exactly when nothing is drawn yet, and
         // an empty viewport behind a hairline bar reads as a hung viewer.
-        beginProgress(pendingViewState !== null);
+        beginProgress(slot.viewState !== null);
 
         // Gzip comes off here rather than inside the wasm module. Detection is by
         // magic number, not by filename, so a ".gds" that is secretly gzipped
@@ -2987,7 +3363,7 @@ export function createViewer(mountTarget) {
             const decoded = await decodeLayoutBytes(bytes, MAX_LAYOUT_BYTES);
             // Superseded while decompressing; the newer load already rejected
             // this one's promise.
-            if (generation !== loadGeneration) return outcome;
+            if (generation !== slot.generation) return outcome;
             if (!decoded.ok) {
                 fail(`[GDS] gzip expansion failed (${decoded.reason}):`, decoded.detail);
                 showFatalError(describeDecodeFailure(decoded));
@@ -3006,8 +3382,32 @@ export function createViewer(mountTarget) {
             showFatalError(`Failed to create worker: ${err.message || err}`);
             return outcome;
         }
-        startWorker(worker, parseBytes);
+        startWorker(worker, parseBytes, slot);
         return outcome;
+    }
+
+    // Drops the second layout, leaving the viewer showing one again. The
+    // camera stays where the user left it: unloading the layout they were
+    // comparing against is no reason to move the view off what they were
+    // reading.
+    function unloadSlot(slotId = "b") {
+        const slot = slotOf(slotId);
+        if (slot.worker) {
+            slot.worker.terminate();
+            slot.worker = null;
+        }
+        settleLoad("reject", abortError("the slot was unloaded"), slot);
+        slot.loaded = false;
+        slot.name = null;
+        slot.hierarchy = null;
+        slot.viewState = null;
+        return modulePromise.then((Module) => {
+            Module.clearSlot(slot.index);
+            renderCompareFolder();
+            renderLayerList(Module.getLayers());
+            renderHierarchy();
+            refreshRulerRow(Module);
+        });
     }
 
     function applyLyp(name, text) {
@@ -3104,7 +3504,47 @@ export function createViewer(mountTarget) {
         applyTheme,
         // For a host whose stored views can change after open (another editor on
         // the same layout saving one, say) rather than only being read once.
-        setNamedViews
+        setNamedViews,
+        // Camera read/write, for an embedder framing the view itself -- a
+        // deep link, a minimap, a "show me this cell" button. Thin
+        // pass-throughs over wasm exports that already existed for other
+        // reasons (touch pinch, reload view-state restore).
+        getCamera: getCameraFromHost,
+        setCamera: setCameraFromHost,
+        // The layer table, and a programmatic way to toggle one. getLayers is
+        // the only way to read a layer's name, group, colors and counts, which
+        // is what an embedder building its own layer UI needs.
+        getLayers: () => modulePromise.then((Module) => Module.getLayers()),
+        // Keeps the layer panel's own checkboxes in step with the change, the
+        // same way restoreViewState already does after a reload.
+        setLayerVisible: (layer, datatype, visible) =>
+            modulePromise.then((Module) => {
+                Module.setLayerVisible(layer, datatype, visible);
+                syncLayerRowsFromModule(Module);
+            }),
+        // Rulers, for an embedder that wants to place or read them itself --
+        // annotating a review, say. addMeasurement appends a finished ruler;
+        // see renderer.cpp for why it never disturbs measure mode or a ruler
+        // the user is part-way through placing.
+        getMeasurements: () => modulePromise.then((Module) => Module.getMeasurements()),
+        addMeasurement: (x0, y0, x1, y1) =>
+            modulePromise.then((Module) => {
+                Module.addMeasurement(x0, y0, x1, y1);
+                refreshRulerRow(Module);
+            }),
+        clearMeasurements: () =>
+            modulePromise.then((Module) => {
+                Module.clearMeasurements();
+                refreshRulerRow(Module);
+            }),
+        // ---- Comparison ----
+        // Unloads the second layout, dropping back to a single-layout viewer.
+        // load(data, { slot: "b" }) is what put it there; see loadLayout.
+        unload: unloadSlot,
+        // 0 shows only the first layout, 1 only the second, and anything
+        // between crossfades them. The Compare folder's slider is this.
+        setBlend: setCompareBlend,
+        getBlend: () => compareState.blend
     };
 
     // Controls whose host service is missing have nothing behind them, so they
@@ -3125,8 +3565,8 @@ export function createViewer(mountTarget) {
 
     hostCall("connect", viewer);
 
-    function startWorker(worker, fileData) {
-        activeWorker = worker;
+    function startWorker(worker, fileData, slot) {
+        slot.worker = worker;
         // Only fires for the Worker failing to start at all (e.g. its script
         // URL rejected by CSP) -- failures inside the worker's own async code
         // are reported via a 'gdsResult' message instead (see wasm-worker.js),
@@ -3163,7 +3603,7 @@ export function createViewer(mountTarget) {
                 // on a big design both threads holding it at once is what tips a
                 // borderline load over the edge.
                 worker.terminate();
-                if (activeWorker === worker) activeWorker = null;
+                if (slot.worker === worker) slot.worker = null;
                 if (!workerMessage.ok) {
                     showFatalError(workerMessage.error);
                     return;
@@ -3183,7 +3623,8 @@ export function createViewer(mountTarget) {
                     // unhandled throw here would leave the progress bar spinning
                     // forever, so surface it like any other load failure.
                     try {
-                        Module.uploadLayers(workerMessage.layers, workerMessage.instanceGroups, workerMessage.bbox);
+                        Module.uploadLayers(workerMessage.layers, workerMessage.instanceGroups,
+                                            workerMessage.bbox, slot.index);
                     } catch (err) {
                         showFatalError(describeLoadFailure(err));
                         return;
@@ -3192,30 +3633,40 @@ export function createViewer(mountTarget) {
                     // Put the camera and per-layer visibility back before the
                     // panel is rebuilt, so renderLayerList reflects the restored
                     // checkboxes rather than the fresh load's defaults.
-                    if (pendingViewState) {
+                    if (slot.viewState) {
                         try {
-                            restoreViewState(Module, pendingViewState);
+                            restoreViewState(Module, slot.viewState);
                         } catch (err) {
                             fail("[GDS] could not restore view state:", err);
                         }
-                        pendingViewState = null;
+                        slot.viewState = null;
                     }
+                    slot.loaded = true;
+                    slot.hierarchy = workerMessage.hierarchy || null;
+                    renderCompareFolder();
                     renderLayerList(Module.getLayers());
-                    renderHierarchy(workerMessage.hierarchy);
+                    renderHierarchy();
+                    applyPorts(Module, workerMessage.ports, workerMessage.hierarchy);
                     // There's a view to save from now on (see viewsFolder.hide()).
                     viewsFolder.show();
                     // uploadLayers drops the rulers -- they were anchored to the
                     // geometry this load just replaced.
                     refreshRulerRow(Module);
-                    endProgress();
+                    // The other slot may still be parsing: a comparison starts
+                    // both layouts at once, and taking the progress overlay
+                    // down on the first one to land would report a load that
+                    // is only half done.
+                    if (!anyLoadInFlight()) endProgress();
                     trace("[GDS] done, progress hidden");
                     hostElement.dispatchEvent(new CustomEvent("gds-load", {
                         detail: {
+                            slot: slot.id,
                             layerCount: workerMessage.layers.length,
-                            cellCount: workerMessage.hierarchy ? workerMessage.hierarchy.cellCount : 0
+                            cellCount: workerMessage.hierarchy ? workerMessage.hierarchy.cellCount : 0,
+                            portCount: workerMessage.hierarchy ? workerMessage.hierarchy.portCount || 0 : 0
                         }
                     }));
-                    settleLoad("resolve");
+                    settleLoad("resolve", undefined, slot);
                 }, (err) => {
                     showFatalError(`WebAssembly module failed to load: ${err && err.message ? err.message : err}`);
                 });

@@ -74,6 +74,70 @@ when a newer load supersedes it, with an `AbortError`). The viewer also
 dispatches `gds-load` and `gds-error` on `element` for every load, however it
 was started; see [Events](../README.md#events).
 
+### Two layouts in one viewer
+
+A viewer holds up to two layouts at once, to compare two revisions of a design.
+They are drawn through one camera into one canvas, by one control panel, with
+one set of rulers over both:
+
+```js
+const element = document.querySelector("gds-lens");
+await element.load(oldBytes);                                   // slot "a"
+await element.load(newBytes, { slot: "b", name: "rev-b.gds" }); // alongside it
+await element.setBlend(0.5);                                    // overlay them
+```
+
+That is the whole of it. There is no second element, nothing to keep in step
+and no event to listen for, because there is only one of everything: the two
+layouts cannot disagree about where the view is, which layers are on, or what
+mode the viewer is in.
+
+| Method | Does |
+|---|---|
+| `load(source, { slot })` | `"a"` (the default) or `"b"`. Replaces only that slot. A second layout arriving does not move the camera off what you are reading. |
+| `unload(slot)` | Drops that layout, leaving a single-layout viewer. |
+| `setBlend(t)` / `getBlend()` | Crossfade: `0` shows only A, `1` only B, between overlays them. |
+
+With two loaded, the panel grows a **Compare** folder holding the blend
+slider, an optional per-layout tint, and the difference highlight. The layer
+list lists the **union** of both layouts' layers, and marks with an A or B chip
+any layer only one of them has -- which is how an added or removed layer shows
+up at all. The hierarchy browser roots both designs' cell trees, and cell and
+label searches run over both, with the same chips on the hits.
+
+`getLayers()` reports a `source` (`0` for slot A, `1` for slot B) on every
+entry, and returns `10/0` twice when both layouts have it; the two are not
+merged, because the comparison has to draw and difference them against each
+other. `setLayerVisible()` applies to both, deliberately: a layer visible in
+one layout and hidden in the other would make them look different for a reason
+that has nothing to do with the designs.
+
+#### The difference highlight
+
+The Compare folder's "Highlight differences" marks, per (layer, datatype),
+where the two layouts disagree: one colour where only A has geometry, another
+where only B does. Both rasterize through the same camera into the same
+coverage mask in the same frame, so geometry that is genuinely identical
+cancels exactly and leaves no fringe along shared edges.
+
+It is a difference of what is *drawn*, at the resolution you are viewing, not
+a geometric XOR. Differences below about half a pixel at the current zoom are
+ignored -- otherwise a full-chip view lights up every edge in the design -- so
+zoom in to resolve a smaller one, where the same comparison re-runs at the new
+scale. It will tell you where to look; it cannot give you an area.
+
+#### What is shared, and what that costs
+
+One camera means one pan-clamp box, computed over the **union** of both
+layouts' extents, so neither design has a corner the view refuses to reach.
+One set of rulers means a load into *either* slot clears them, as a load
+always has, because they anchor to geometry that may be the geometry being
+replaced. And one marker overlay and one `.lyp` apply to both, since both are
+about how a layout is drawn rather than about which layout it is.
+
+Overlaying assumes the two layouts share a coordinate origin. Two revisions of
+one design normally do; there is no per-layout offset.
+
 ### Saved views on a page with several viewers
 
 Both view methods are handed the viewer asking, which is the same surface

@@ -344,6 +344,53 @@ inline const char* const kPickFragmentShaderSrc =
     "    fragId = uvec4(u_pickId, floatBitsToUint(v_world.x), floatBitsToUint(v_world.y), 1u);\n"
     "}";
 
+// The screen-space difference highlight's composite pass (see
+// draw_diff_highlight). Reads one (layer, datatype)'s coverage from both
+// loaded layouts out of a single RG8 mask -- red is the first layout's
+// coverage, green the second's, written in two passes under glColorMask -- and
+// paints only where they disagree.
+//
+// Both sides rasterize through the same camera into the same texture in the
+// same frame, so geometry that is genuinely identical produces bit-identical
+// red and green and cancels exactly. There is no anti-aliasing fringe along
+// shared edges to suppress, which is the thing that makes a screen-space diff
+// worth doing at all here.
+//
+// What the threshold is for is the other case: coverage values that differ a
+// little because an edge moved a fraction of a pixel, or because a trace too
+// thin to cover a texel landed on one side of a boundary in one layout and the
+// other side in the other. Those are real differences, but below the
+// resolution being viewed, and drawing them would light up every edge in the
+// design at a full-chip zoom. Ignoring differences under kDiffThreshold is the
+// screen-space equivalent of the sliver tolerance an offline XOR runs with,
+// and it means the honest way to resolve a smaller difference is to zoom in,
+// where the same comparison re-runs at the new scale and resolves it exactly.
+//
+// This is a difference of what is *drawn*, not a geometric XOR: it says where
+// to look at the scale you are looking, and it cannot give you an area.
+inline const char* const kDiffFragmentShaderSrc =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "uniform sampler2D u_mask;\n"
+    "uniform int u_maskScale;\n"
+    "uniform vec4 u_colorA;\n"
+    "uniform vec4 u_colorB;\n"
+    "uniform float u_threshold;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    // Same addressing as the merge composite: at scale 2 the canvas pixel
+    // center sits exactly between its 2x2 mask block, so one bilinear tap is
+    // that block's average, i.e. the pixel's fractional coverage.
+    "    vec2 texSize = vec2(textureSize(u_mask, 0));\n"
+    "    vec2 uv = gl_FragCoord.xy * (float(u_maskScale) / texSize);\n"
+    "    vec2 cov = texture(u_mask, uv).rg;\n"
+    "    float d = cov.r - cov.g;\n"
+    "    if (abs(d) < u_threshold) discard;\n"
+    // Positive means the first layout covers this pixel and the second does
+    // not: present in A, gone in B.
+    "    fragColor = d > 0.0 ? u_colorA : u_colorB;\n"
+    "}";
+
 inline const char* const kTextFragmentShaderSrc =
     "#version 300 es\n"
     "precision mediump float;\n"

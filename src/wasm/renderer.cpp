@@ -57,6 +57,7 @@ struct nth<1, gdstk::Vec2> {
 }  // namespace mapbox
 
 #include "gds_common.hpp"
+#include "kfactory_ports.hpp"
 #include "lyp_util.hpp"
 #include "shaders.hpp"
 #include "stroke_font.hpp"
@@ -155,6 +156,13 @@ struct TextLabel {
 };
 
 struct LayerBuffer {
+    // Which comparison slot this entry's geometry came from: 0 for the only
+    // layout a single-file viewer ever holds, 1 for the second one a
+    // comparison view loads alongside it. The (layer, datatype) pair is NOT
+    // unique across slots -- 10/0 from each of two layouts is two entries,
+    // which is the whole point: they are drawn, blended and differenced
+    // against each other rather than merged into one table.
+    int source = 0;
     uint32_t layer;
     // GDS datatype: layers are keyed on the (layer, datatype) pair, not the
     // layer number alone, since real PDKs put many distinct styles on the same
@@ -331,6 +339,22 @@ GLuint g_pick_tex = 0;
 // Readback destination, RGBA per texel: (id, world x bits, world y bits, 1).
 std::vector<uint32_t> g_pick_buffer;
 
+// Difference-highlight program state (see draw_diff_highlight). Shares the
+// mask FBO and the composite pass's attribute-free fullscreen triangle with
+// merge mode; only the fragment shader differs.
+GLuint g_diff_program = 0;
+GLint g_diff_loc_mask_scale = -1;
+GLint g_diff_loc_color_a = -1;
+GLint g_diff_loc_color_b = -1;
+GLint g_diff_loc_threshold = -1;
+// Present in the first layout and not the second, and the reverse. Red for
+// gone, green for added, following every other diff a reader has seen.
+constexpr float kDiffColorA[4] = {1.00f, 0.27f, 0.27f, 0.85f};
+constexpr float kDiffColorB[4] = {0.30f, 1.00f, 0.45f, 0.85f};
+// Coverage difference a pixel must show before it counts (see
+// kDiffFragmentShaderSrc for why this exists and what it costs).
+constexpr float kDiffThreshold = 0.2f;
+
 // Background-grid program state (see kGridFragmentShaderSrc/draw_grid).
 GLuint g_grid_program = 0;
 GLint g_grid_loc_resolution = -1;
@@ -373,6 +397,49 @@ constexpr int kPatternTypeCount = 4;  // diagonal, cross-hatch, dots, grid
 std::vector<LayerBuffer> g_layers;
 std::unordered_map<uint64_t, LypEntry> g_lyp_info;
 int g_lyp_order_counter = 0;
+
+// ---- Comparison slots -------------------------------------------------------
+// Two layouts can be loaded into one viewer at once, drawn through one camera
+// into one canvas. Slot 0 is the ordinary single-file case and behaves exactly
+// as it did before slots existed; slot 1 only ever has anything in it when the
+// embedder deliberately loads a second layout (see uploadLayers' trailing slot
+// argument).
+//
+// This is deliberately *not* two renderers side by side. There is one camera,
+// one viewport, one layer table and one set of view state, so there is nothing
+// to keep in sync between the two layouts -- they cannot disagree about where
+// the view is, because there is only one view. Everything a comparison needs
+// (crossfading between them, differencing them per layer) is then just a draw
+// decision here rather than a protocol between two independent viewers.
+constexpr int kSlotCount = 2;
+
+// Per-slot draw opacity, multiplied into every layer color at draw time. The
+// crossfade the UI exposes is alpha[0] = 1-t, alpha[1] = t, so either end of
+// the slider is a clean single-layout view and the middle is the overlay. A
+// slot at 0 is skipped before any GL call rather than drawn transparent.
+float g_slot_alpha[kSlotCount] = {1.0f, 1.0f};
+
+// Optional per-slot hue, off by default. Two revisions of one design are the
+// same colors in the same places, so at a 50/50 blend they look like one
+// layout; nudging each slot toward its own hue is the cheapest way to see
+// which is which. Off by default because the .lyp palette is how layers are
+// told apart, and this trades that away.
+bool g_slot_tint = false;
+constexpr float kSlotTint[kSlotCount][3] = {{1.00f, 0.45f, 0.35f}, {0.35f, 0.75f, 1.00f}};
+// How far toward kSlotTint a tinted layer moves. Short of 1.0 so a tinted
+// layout still carries some of its own layer colors.
+constexpr float kSlotTintMix = 0.65f;
+
+// Per-slot design bbox, whose union is g_bbox_* below. Kept separately so
+// reloading one slot can recompute the union without the other slot's extent
+// having to be re-derived from its geometry.
+float g_slot_bbox[kSlotCount][4] = {{HUGE_VALF, -HUGE_VALF, HUGE_VALF, -HUGE_VALF},
+                                    {HUGE_VALF, -HUGE_VALF, HUGE_VALF, -HUGE_VALF}};
+uint64_t g_slot_polygons[kSlotCount] = {0, 0};
+uint64_t g_slot_labels[kSlotCount] = {0, 0};
+
+// Screen-space difference highlight (see draw_diff_highlight). Off by default.
+bool g_diff_highlight = false;
 
 // Total polygon count across all layers (set once in uploadLayers), used as
 // the denominator for the "visible polygons" stat draw_frame recomputes
@@ -658,6 +725,63 @@ float g_marker_tick_zoom = -1.0f;
 
 bool markers_present() { return !g_markers.item_category.empty(); }
 
+// ---- kfactory port overlay --------------------------------------------------
+// The ports gdsfactory/kfactory wrote into the file (see kfactory_ports.hpp),
+// expanded to world space through every placement during the parse (the
+// worker's half -- collect_world_ports) and handed to this module through
+// setPorts(). Each is drawn as a bar across the port's width, an arrow along
+// the direction it faces and, close in, its name -- the same marks KLayout's
+// gdsfactory plugin makes, so a photonics layout reads the same way in both.
+//
+// Like the markers, the CPU copy is what's kept and the vertices are rebuilt
+// per frame: bar and arrow sizes are partly in pixels (a half-micron waveguide
+// port has to stay visible from across the die), so they change with every
+// zoom anyway, and culling to the view bounds the work.
+struct WorldPort {
+    float x, y;     // world position
+    float dx, dy;   // unit direction the port faces
+    float width;    // world width, 0 if unknown
+    uint32_t type;  // index into g_port_types
+};
+std::vector<WorldPort> g_ports;
+// Names packed back to back, sliced by g_port_name_offsets (size == count+1).
+std::string g_port_name_chars;
+std::vector<uint32_t> g_port_name_offsets;
+std::vector<std::string> g_port_types;
+// One RGB per type, decided once in setPorts from the type's name.
+std::vector<std::array<float, 3>> g_port_type_colors;
+bool g_ports_capped = false;
+bool g_show_ports = true;
+GLuint g_port_vbo = 0;
+GLuint g_port_text_vbo = 0;
+// Ports drawn and named in the last frame (for the stats readout and tests).
+uint32_t g_ports_drawn = 0;
+uint32_t g_port_names_drawn = 0;
+
+// Screen-space sizing. The bar is at least kPortMinBarPx long so a port is a
+// mark you can see and aim at from any zoom; the arrow is kPortArrowPx long
+// or three quarters of the width, whichever is longer, so on a wide electrical
+// pad it still reads as an arrow rather than a nick in the bar.
+constexpr float kPortStrokePx = 1.5f;      // half-thickness of the bar and shaft
+constexpr float kPortMinBarPx = 8.0f;
+constexpr float kPortArrowPx = 14.0f;
+constexpr float kPortHeadPx = 6.0f;
+constexpr float kPortLabelGapPx = 6.0f;
+// Names are only drawn while few enough ports are on screen to read them;
+// past this the labels are a mat over the geometry, and the bars alone say
+// where the ports are.
+constexpr uint32_t kMaxPortNamesPerFrame = 300;
+constexpr size_t kMaxPortVertsPerFrame = 600000;  // floats
+
+bool ports_present() { return !g_ports.empty(); }
+
+std::string port_name(size_t i) {
+    if (i + 1 >= g_port_name_offsets.size()) return std::string();
+    uint32_t a = g_port_name_offsets[i], b = g_port_name_offsets[i + 1];
+    if (b < a || b > g_port_name_chars.size()) return std::string();
+    return g_port_name_chars.substr(a, b - a);
+}
+
 GLuint compile_shader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
@@ -771,6 +895,14 @@ bool init_gl() {
     g_comp_loc_mask_scale = glGetUniformLocation(g_comp_program, "u_maskScale");
     glUseProgram(g_comp_program);
     glUniform1i(glGetUniformLocation(g_comp_program, "u_mask"), 0);
+
+    g_diff_program = link_program(shaders::kCompositeVertexShaderSrc, shaders::kDiffFragmentShaderSrc);
+    g_diff_loc_mask_scale = glGetUniformLocation(g_diff_program, "u_maskScale");
+    g_diff_loc_color_a = glGetUniformLocation(g_diff_program, "u_colorA");
+    g_diff_loc_color_b = glGetUniformLocation(g_diff_program, "u_colorB");
+    g_diff_loc_threshold = glGetUniformLocation(g_diff_program, "u_threshold");
+    glUseProgram(g_diff_program);
+    glUniform1i(glGetUniformLocation(g_diff_program, "u_mask"), 0);
 
     // Background grid (see draw_grid) -- shares the composite pass's
     // attribute-free fullscreen triangle. Array uniforms are queried by their
@@ -1769,6 +1901,136 @@ void draw_text() {
     glUseProgram(g_program);
 }
 
+// Appends a stroke from (x0,y0) to (x1,y1) of half-thickness t as two
+// triangles (12 floats).
+void append_stroke(std::vector<float>& out, float x0, float y0, float x1, float y1, float t) {
+    float dx = x1 - x0, dy = y1 - y0;
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len <= 0.0f) return;
+    float nx = -dy / len * t, ny = dx / len * t;
+    const float v[12] = {x0 + nx, y0 + ny, x1 + nx, y1 + ny, x1 - nx, y1 - ny,
+                         x0 + nx, y0 + ny, x1 - nx, y1 - ny, x0 - nx, y0 - ny};
+    out.insert(out.end(), v, v + 12);
+}
+
+// The port overlay: above the text, below the markers (a violation on a port
+// is the thing to see) -- see the state block by g_ports for what is drawn.
+void draw_ports() {
+    g_ports_drawn = 0;
+    g_port_names_drawn = 0;
+    if (!g_show_ports || !ports_present()) return;
+
+    const float px = 1.0f / g_zoom;
+    const float stroke = kPortStrokePx * px;
+    const float min_bar = kPortMinBarPx * px;
+    const float arrow_px = kPortArrowPx * px;
+    const float head = kPortHeadPx * px;
+    // Everything a port draws stays within (its width + the arrow) of its
+    // position, so a view padded by that much is what decides what's culled.
+    // The label reaches further, but a name for a port just off screen is
+    // acceptable to lose.
+    float max_reach = arrow_px + head;
+    for (const WorldPort& p : g_ports) max_reach = std::max(max_reach, p.width);
+    float half_w = (float)g_canvas_width * 0.5f * px + max_reach;
+    float half_h = (float)g_canvas_height * 0.5f * px + max_reach;
+    const ViewRect view = {g_pan_x - half_w, g_pan_x + half_w, g_pan_y - half_h, g_pan_y + half_h};
+
+    // Vertices per type, so each type is one draw in its own color.
+    std::vector<std::vector<float>> verts(g_port_type_colors.size());
+    std::vector<std::vector<float>> text(g_port_type_colors.size());
+    size_t total_verts = 0;
+
+    for (size_t i = 0; i < g_ports.size(); i++) {
+        const WorldPort& p = g_ports[i];
+        if (p.x < view.min_x || p.x > view.max_x || p.y < view.min_y || p.y > view.max_y) continue;
+        if (total_verts >= kMaxPortVertsPerFrame) break;
+        uint32_t type = p.type < verts.size() ? p.type : 0;
+        std::vector<float>& out = verts[type];
+
+        // The bar across the port, its true width where that is large enough
+        // to see and a fixed few pixels otherwise.
+        float bar = std::max(p.width, min_bar);
+        float perp_x = -p.dy, perp_y = p.dx;
+        append_stroke(out, p.x - perp_x * bar * 0.5f, p.y - perp_y * bar * 0.5f,
+                      p.x + perp_x * bar * 0.5f, p.y + perp_y * bar * 0.5f, stroke);
+
+        // The arrow out of the port along the direction it faces.
+        float len = std::max(p.width * 0.75f, arrow_px);
+        float tip_x = p.x + p.dx * len, tip_y = p.y + p.dy * len;
+        float h = std::min(head, len * 0.5f);
+        append_stroke(out, p.x, p.y, tip_x - p.dx * h * 0.6f, tip_y - p.dy * h * 0.6f, stroke);
+        float base_x = tip_x - p.dx * h, base_y = tip_y - p.dy * h;
+        const float tri[6] = {tip_x, tip_y, base_x + perp_x * h * 0.5f, base_y + perp_y * h * 0.5f,
+                              base_x - perp_x * h * 0.5f, base_y - perp_y * h * 0.5f};
+        out.insert(out.end(), tri, tri + 6);
+        total_verts += 30;
+        g_ports_drawn++;
+
+        // The name, just past the arrow's tip, centered on the direction line.
+        // Horizontal at a fixed size like every label the viewer draws.
+        if (g_port_names_drawn < kMaxPortNamesPerFrame) {
+            std::string name = port_name(i);
+            if (!name.empty()) {
+                float gap = kPortLabelGapPx * px;
+                // Push the anchor out by half the text's own extent along the
+                // direction so the glyphs clear the arrow head from any angle:
+                // cap height vertically, roughly 0.6 cap heights per character
+                // horizontally.
+                float half_text_w = 0.3f * stroke_font::kTextCapHeightPx * (float)name.size() * px;
+                float half_text_h = 0.5f * stroke_font::kTextCapHeightPx * px;
+                float shift = gap + std::fabs(p.dx) * half_text_w + std::fabs(p.dy) * half_text_h;
+                float lx = tip_x + p.dx * shift, ly = tip_y + p.dy * shift;
+                // Anchor 5 = horizontally centered, vertically middle.
+                stroke_font::append_text_vertices(name, lx, ly, 5, text[type]);
+                g_port_names_drawn++;
+            }
+        }
+    }
+    if (g_ports_drawn == 0) return;
+
+    // Bars, shafts and heads with the layer program (camera uniforms already
+    // set for this frame), one color per type.
+    glUniform1f(g_loc_use_hatch, 0.0f);
+    for (size_t t = 0; t < verts.size(); t++) {
+        if (verts[t].empty()) continue;
+        if (!g_port_vbo) glGenBuffers(1, &g_port_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, g_port_vbo);
+        buffer_data_tracked(GL_ARRAY_BUFFER, g_port_vbo, (GLsizeiptr)(verts[t].size() * sizeof(float)),
+                            verts[t].data(), GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        const std::array<float, 3>& c = g_port_type_colors[t];
+        glUniform4f(g_loc_color, c[0], c[1], c[2], 0.95f);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(verts[t].size() / 2));
+    }
+
+    // Names with the text program, as draw_text does it.
+    bool any_text = false;
+    for (const auto& t : text) any_text = any_text || !t.empty();
+    if (!any_text) return;
+    glUseProgram(g_text_program);
+    glUniform2f(g_text_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform2f(g_text_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_text_loc_zoom, g_zoom);
+    const GLsizei stride = 4 * (GLsizei)sizeof(float);
+    if (!g_port_text_vbo) glGenBuffers(1, &g_port_text_vbo);
+    for (size_t t = 0; t < text.size(); t++) {
+        if (text[t].empty()) continue;
+        glBindBuffer(GL_ARRAY_BUFFER, g_port_text_vbo);
+        buffer_data_tracked(GL_ARRAY_BUFFER, g_port_text_vbo, (GLsizeiptr)(text[t].size() * sizeof(float)),
+                            text[t].data(), GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(g_loc_position);
+        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, stride, (void*)0);
+        glEnableVertexAttribArray(kAttrTextOffset);
+        glVertexAttribPointer(kAttrTextOffset, 2, GL_FLOAT, GL_FALSE, stride, (void*)(2 * sizeof(float)));
+        const std::array<float, 3>& c = g_port_type_colors[t];
+        glUniform4f(g_text_loc_color, c[0], c[1], c[2], 0.95f);
+        glDrawArrays(GL_LINES, 0, (GLsizei)(text[t].size() / 4));
+    }
+    glDisableVertexAttribArray(kAttrTextOffset);
+    glUseProgram(g_program);
+}
+
 float clamp_zoom_value(float zoom) {
     float min_zoom = g_fit_zoom * kMinZoomRatio;
     // max() rather than the constant alone: a design small enough that framing
@@ -2084,46 +2346,58 @@ void draw_grid() {
 // ones. Coverage comes from the triangulated fill data, so polygons that
 // exceeded kMaxTriangulatePoints (rendered outline-only in normal mode)
 // don't contribute here.
-void draw_layer_merged(const LayerBuffer& layer) {
-    bool has_geometry = layer.fill_vbo != 0 || layer.outline_ebo != 0;
-    for (const InstancedBatch& batch : layer.instanced_batches) {
-        if (batch.fill_vbo || batch.outline_ebo) has_geometry = true;
+// A layer color as this slot should draw it: faded by the slot's crossfade
+// opacity, and nudged toward the slot's hue when tinting is on.
+//
+// Folded into the color rather than added as a shader uniform because every
+// path that draws geometry already uploads a vec4 color per layer -- the
+// normal fill and outline draws, their instanced counterparts, and merge
+// mode's composite pass. Scaling the alpha component here reaches all six
+// call sites with no new uniform, no new shader variant, and no chance of one
+// path silently missing the fade.
+std::array<float, 4> slot_color(const LayerBuffer& layer, const std::array<float, 4>& base) {
+    std::array<float, 4> out = base;
+    out[3] = base[3] * g_slot_alpha[layer.source];
+    if (g_slot_tint) {
+        for (int i = 0; i < 3; i++) {
+            out[i] = base[i] + (kSlotTint[layer.source][i] - base[i]) * kSlotTintMix;
+        }
     }
-    if (!has_geometry) return;
+    return out;
+}
 
-    // Pass 1: coverage mask, rasterized at g_mask_scale times the canvas
-    // resolution for anti-aliasing (see kCompositeFragmentShaderSrc). Only
-    // the viewport changes -- the camera uniforms produce clip-space
-    // coordinates, which are viewport-independent, so the same values place
-    // every vertex at exactly scale x its canvas pixel position.
-    glBindFramebuffer(GL_FRAMEBUFFER, g_mask_fbo);
-    glViewport(0, 0, g_canvas_width * g_mask_scale, g_canvas_height * g_mask_scale);
-    glDisable(GL_BLEND);
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(g_mask_program);
-    glUniform2f(g_mask_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
-    glUniform2f(g_mask_loc_offset, g_pan_x, g_pan_y);
-    glUniform1f(g_mask_loc_zoom, g_zoom);
+// True when a layer entry has anything at all to rasterize.
+bool layer_has_geometry(const LayerBuffer& layer) {
+    if (layer.fill_vbo != 0 || layer.outline_ebo != 0) return true;
+    for (const InstancedBatch& batch : layer.instanced_batches) {
+        if (batch.fill_vbo || batch.outline_ebo) return true;
+    }
+    return false;
+}
 
+// Rasterizes one layer entry's coverage into whatever framebuffer, program,
+// viewport and camera uniforms the caller has already set up. Shared by merge
+// mode (which unions a layer with itself) and the difference highlight (which
+// puts two layouts' copies of one layer into two channels of the same mask),
+// so the two always agree about what "covered" means.
+//
+// Deliberately draws boundaries as well as fill, and deliberately ignores the
+// Infill toggle. A 0.5um waveguide on a full-chip view is a few hundredths of
+// a pixel wide: it covers no sample, contributes nothing, and the layer
+// disappears exactly where it is densest. Lines have a one-fragment minimum
+// width, so drawing each polygon's boundary guarantees every shape leaves
+// coverage behind however thin it has become on screen. Safe to do
+// unconditionally -- coverage is a union, so boundaries interior to it change
+// nothing, and the outer edge gains at most half a mask texel (a quarter of a
+// canvas pixel at the default scale). It also picks up the polygons too large
+// to triangulate, which used to be missing from merged layers altogether.
+void draw_layer_coverage(const LayerBuffer& layer) {
     if (layer.fill_vbo) {
         glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
         glEnableVertexAttribArray(g_loc_position);
         glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
         glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
     }
-    // Boundaries as well as fill, because triangles alone lose thin geometry.
-    // A 0.5um waveguide on a full-chip view is a few hundredths of a pixel
-    // wide: it covers no sample, contributes nothing to the mask, and the
-    // layer disappears exactly where it is densest. Lines have a one-fragment
-    // minimum width, so drawing each polygon's boundary guarantees every
-    // shape leaves coverage behind however thin it has become on screen.
-    //
-    // Safe to do unconditionally. The mask is a union, so boundaries interior
-    // to it change nothing, and the outer edge gains at most half a mask texel
-    // (a quarter of a canvas pixel at the default scale). It also picks up the
-    // polygons too large to triangulate, which used to be missing from merged
-    // layers altogether.
     if (layer.outline_ebo) {
         glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
         glEnableVertexAttribArray(g_loc_position);
@@ -2149,6 +2423,26 @@ void draw_layer_merged(const LayerBuffer& layer) {
         }
         disable_instance_attribs();
     }
+}
+
+void draw_layer_merged(const LayerBuffer& layer) {
+    if (!layer_has_geometry(layer)) return;
+
+    // Pass 1: coverage mask, rasterized at g_mask_scale times the canvas
+    // resolution for anti-aliasing (see kCompositeFragmentShaderSrc). Only
+    // the viewport changes -- the camera uniforms produce clip-space
+    // coordinates, which are viewport-independent, so the same values place
+    // every vertex at exactly scale x its canvas pixel position.
+    glBindFramebuffer(GL_FRAMEBUFFER, g_mask_fbo);
+    glViewport(0, 0, g_canvas_width * g_mask_scale, g_canvas_height * g_mask_scale);
+    glDisable(GL_BLEND);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(g_mask_program);
+    glUniform2f(g_mask_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform2f(g_mask_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_mask_loc_zoom, g_zoom);
+    draw_layer_coverage(layer);
 
     // Pass 2: composite boundary + fill onto the canvas, back at 1:1.
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -2156,8 +2450,10 @@ void draw_layer_merged(const LayerBuffer& layer) {
     glEnable(GL_BLEND);
     glUseProgram(g_comp_program);
     glUniform1i(g_comp_loc_mask_scale, g_mask_scale);
-    glUniform4fv(g_comp_loc_fill_color, 1, layer.fill_color.data());
-    glUniform4fv(g_comp_loc_frame_color, 1, layer.frame_color.data());
+    const std::array<float, 4> comp_fill = slot_color(layer, layer.fill_color);
+    const std::array<float, 4> comp_frame = slot_color(layer, layer.frame_color);
+    glUniform4fv(g_comp_loc_fill_color, 1, comp_fill.data());
+    glUniform4fv(g_comp_loc_frame_color, 1, comp_frame.data());
     glUniform1f(g_comp_loc_pattern_type, layer.pattern_type);
     glUniform1f(g_comp_loc_hatch_angle, layer.hatch_angle);
     glUniform1f(g_comp_loc_hatch_spacing, kHatchSpacingPx);
@@ -2171,6 +2467,95 @@ void draw_layer_merged(const LayerBuffer& layer) {
     glDisableVertexAttribArray(g_loc_position);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glUseProgram(g_program);
+}
+
+// Paints, over the drawn scene, where the two loaded layouts disagree: one
+// colour for geometry the first has and the second does not, another for the
+// reverse.
+//
+// Per (layer, datatype), not over the two layouts' silhouettes, which is what
+// an offline XOR does and the only definition that answers the question being
+// asked -- a shape that moved from one layer to another is a removal on one
+// and an addition on the other, not a non-event because the ink stayed put.
+//
+// The cost is one mask clear plus one fullscreen composite per layer pair,
+// which is exactly the shape and scale of merge mode's per-layer cost, on a
+// mask allocated whether this is on or not. Both layouts rasterize through
+// the same camera into the same texture in the same frame, which is why the
+// comparison is meaningful at all: it is only possible because the two
+// layouts share one GL context, which is the thing two synced viewers could
+// never offer.
+void draw_diff_highlight() {
+    if (!g_diff_highlight || !g_mask_fbo || g_canvas_width <= 0 || g_canvas_height <= 0) return;
+
+    struct DiffPair {
+        const LayerBuffer* side[kSlotCount] = {nullptr, nullptr};
+    };
+    std::unordered_map<uint64_t, DiffPair> pairs;
+    pairs.reserve(g_layers.size());
+    for (const LayerBuffer& layer : g_layers) {
+        if (!layer.visible || !layer_has_geometry(layer)) continue;
+        pairs[layer.tag()].side[layer.source] = &layer;
+    }
+    if (pairs.empty()) return;
+
+    const ViewRect view = current_view_rect();
+    bool drew = false;
+
+    for (const auto& entry : pairs) {
+        const DiffPair& pair = entry.second;
+
+        // Cull on the union of the two sides' extents: a layer only one of
+        // them has still has to be checked against the view, and it has only
+        // one extent to check.
+        float min_x = HUGE_VALF, max_x = -HUGE_VALF, min_y = HUGE_VALF, max_y = -HUGE_VALF;
+        for (int i = 0; i < kSlotCount; i++) {
+            if (!pair.side[i]) continue;
+            min_x = std::min(min_x, pair.side[i]->min_x);
+            max_x = std::max(max_x, pair.side[i]->max_x);
+            min_y = std::min(min_y, pair.side[i]->min_y);
+            max_y = std::max(max_y, pair.side[i]->max_y);
+        }
+        if (!bbox_intersects_view(min_x, max_x, min_y, max_y, view)) continue;
+
+        // Pass 1: both layouts' coverage for this layer into one mask, the
+        // first in red and the second in green. One clear covers both, since
+        // each pass only writes its own channel.
+        glBindFramebuffer(GL_FRAMEBUFFER, g_mask_fbo);
+        glViewport(0, 0, g_canvas_width * g_mask_scale, g_canvas_height * g_mask_scale);
+        glDisable(GL_BLEND);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(g_mask_program);
+        glUniform2f(g_mask_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+        glUniform2f(g_mask_loc_offset, g_pan_x, g_pan_y);
+        glUniform1f(g_mask_loc_zoom, g_zoom);
+        for (int i = 0; i < kSlotCount; i++) {
+            if (!pair.side[i]) continue;
+            glColorMask(i == 0, i == 1, GL_FALSE, GL_FALSE);
+            draw_layer_coverage(*pair.side[i]);
+        }
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+        // Pass 2: paint the disagreement, back at 1:1.
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, g_canvas_width, g_canvas_height);
+        glEnable(GL_BLEND);
+        glUseProgram(g_diff_program);
+        glUniform1i(g_diff_loc_mask_scale, g_mask_scale);
+        glUniform4fv(g_diff_loc_color_a, 1, kDiffColorA);
+        glUniform4fv(g_diff_loc_color_b, 1, kDiffColorB);
+        glUniform1f(g_diff_loc_threshold, kDiffThreshold);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_mask_tex);
+        // Same reason as the merge composite: the fullscreen triangle comes
+        // from gl_VertexID, so a_position must not be an enabled array here.
+        glDisableVertexAttribArray(g_loc_position);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        drew = true;
+    }
+
+    if (drew) glUseProgram(g_program);
 }
 
 // Draws the selected cell's outlines: one dashed rectangle per box in
@@ -2393,7 +2778,14 @@ bool draw_frame(double time, void* /*userData*/) {
 
     for (const LayerBuffer& layer : g_layers) {
         if (!layer.visible) continue;
+        // A slot crossfaded fully out draws nothing at all, rather than
+        // drawing everything at zero alpha: at either end of the blend slider
+        // this is exactly the cost of viewing that layout on its own.
+        if (g_slot_alpha[layer.source] <= 0.0f) continue;
         if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
+
+        const std::array<float, 4> fill_color = slot_color(layer, layer.fill_color);
+        const std::array<float, 4> frame_color = slot_color(layer, layer.frame_color);
 
         frame_layers_drawn++;
         frame_visible_polygons += layer.polygon_count;
@@ -2407,7 +2799,7 @@ bool draw_frame(double time, void* /*userData*/) {
             glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
             glEnableVertexAttribArray(g_loc_position);
             glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            glUniform4fv(g_loc_color, 1, layer.fill_color.data());
+            glUniform4fv(g_loc_color, 1, fill_color.data());
             glUniform1f(g_loc_use_hatch, 1.0f);
             glUniform1f(g_loc_pattern_type, layer.pattern_type);
             glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
@@ -2423,7 +2815,7 @@ bool draw_frame(double time, void* /*userData*/) {
             glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
             glEnableVertexAttribArray(g_loc_position);
             glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            glUniform4fv(g_loc_color, 1, layer.frame_color.data());
+            glUniform4fv(g_loc_color, 1, frame_color.data());
             glUniform1f(g_loc_use_hatch, 0.0f);
             // outline_ebo holds every polygon's boundary as explicit edge
             // pairs (see upload_geometry), so this one glDrawElements call
@@ -2448,7 +2840,7 @@ bool draw_frame(double time, void* /*userData*/) {
                 glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
                 glEnableVertexAttribArray(g_loc_position);
                 glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-                glUniform4fv(g_loc_color, 1, layer.fill_color.data());
+                glUniform4fv(g_loc_color, 1, fill_color.data());
                 glUniform1f(g_loc_use_hatch, 1.0f);
                 glUniform1f(g_loc_pattern_type, layer.pattern_type);
                 glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
@@ -2461,7 +2853,7 @@ bool draw_frame(double time, void* /*userData*/) {
                 glBindBuffer(GL_ARRAY_BUFFER, batch.outline_vbo);
                 glEnableVertexAttribArray(g_loc_position);
                 glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-                glUniform4fv(g_loc_color, 1, layer.frame_color.data());
+                glUniform4fv(g_loc_color, 1, frame_color.data());
                 glUniform1f(g_loc_use_hatch, 0.0f);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
                 glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
@@ -2471,7 +2863,11 @@ bool draw_frame(double time, void* /*userData*/) {
             disable_instance_attribs();
         }
     }
+    // Over the blended geometry and under everything that has to stay
+    // readable on top of it.
+    draw_diff_highlight();
     draw_text();
+    draw_ports();
     draw_markers();
     // Over the geometry and the marker overlay (it's an answer to a question
     // about the layout, so it can't be buried by it), under the ruler.
@@ -2552,11 +2948,16 @@ void resize_canvas() {
         glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
         g_mask_scale = (2 * width <= max_tex && 2 * height <= max_tex) ? 2 : 1;
         glBindTexture(GL_TEXTURE_2D, g_mask_tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width * g_mask_scale, height * g_mask_scale, 0, GL_RED,
+        // RG8 rather than R8 because the difference highlight writes two
+        // layouts' coverage into one mask in two passes under glColorMask (see
+        // draw_diff_highlight) and needs to compare them in a single tap.
+        // Merge mode reads .r and is unaffected.
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width * g_mask_scale, height * g_mask_scale, 0, GL_RG,
                      GL_UNSIGNED_BYTE, nullptr);
-        // R8 is one byte per texel; the mask is allocated whether or not merge
-        // mode is on, so this counts unconditionally (see g_mask_tex_bytes).
-        g_mask_tex_bytes = (uint64_t)(width * g_mask_scale) * (uint64_t)(height * g_mask_scale);
+        // Two bytes per texel; the mask is allocated whether or not merge mode
+        // or the difference highlight is on, so this counts unconditionally
+        // (see g_mask_tex_bytes).
+        g_mask_tex_bytes = (uint64_t)(width * g_mask_scale) * (uint64_t)(height * g_mask_scale) * 2u;
         // Merge mode failing at the FBO level shows as a blank canvas with no
         // other symptom (the mask reads all-zero and the composite discards
         // everything) -- check loudly here instead. Never triggered on a
@@ -2577,8 +2978,20 @@ void resize_canvas() {
     request_redraw();
 }
 
-void clear_layers() {
+// Releases one comparison slot's geometry and drops its entries from the
+// layer table, leaving the other slot's untouched. `slot < 0` means every
+// slot, which is what clear_layers() below asks for.
+//
+// The shared view state cleared afterwards is deliberately *not* per slot.
+// Cell outlines are bare world rectangles with no record of which layout they
+// were drawn around, the label ranges index into g_layers and cannot survive
+// entries being erased from the middle of it, and rulers are anchored to
+// geometry that may be the geometry going away. All three are cheap for the
+// viewer to put back and misleading if they linger, so any slot load clears
+// them, exactly as any load did when there was only one slot.
+void clear_layers_for_slot(int slot) {
     for (LayerBuffer& layer : g_layers) {
+        if (slot >= 0 && layer.source != slot) continue;
         if (layer.outline_vbo) delete_buffer_tracked(&layer.outline_vbo);
         if (layer.outline_ebo) delete_buffer_tracked(&layer.outline_ebo);
         if (layer.fill_vbo) delete_buffer_tracked(&layer.fill_vbo);
@@ -2589,7 +3002,27 @@ void clear_layers() {
             if (batch.instance_vbo) delete_buffer_tracked(&batch.instance_vbo);
         }
     }
-    g_layers.clear();
+    if (slot < 0) {
+        g_layers.clear();
+        for (int i = 0; i < kSlotCount; i++) {
+            g_slot_bbox[i][0] = HUGE_VALF;
+            g_slot_bbox[i][1] = -HUGE_VALF;
+            g_slot_bbox[i][2] = HUGE_VALF;
+            g_slot_bbox[i][3] = -HUGE_VALF;
+            g_slot_polygons[i] = 0;
+            g_slot_labels[i] = 0;
+        }
+    } else {
+        g_layers.erase(std::remove_if(g_layers.begin(), g_layers.end(),
+                                      [slot](const LayerBuffer& l) { return l.source == slot; }),
+                       g_layers.end());
+        g_slot_bbox[slot][0] = HUGE_VALF;
+        g_slot_bbox[slot][1] = -HUGE_VALF;
+        g_slot_bbox[slot][2] = HUGE_VALF;
+        g_slot_bbox[slot][3] = -HUGE_VALF;
+        g_slot_polygons[slot] = 0;
+        g_slot_labels[slot] = 0;
+    }
     // The outlines point at cells in the geometry that's going away. viewer.js
     // re-selects the same row after a reload (renderHierarchy) and so puts them
     // back; dropping them here is what stops a *different* file inheriting
@@ -2600,9 +3033,52 @@ void clear_layers() {
     g_goto_start_ms = -1.0;
     // The label ranges index into g_layers -- they can't outlive it.
     g_text_ranges.clear();
-    g_total_labels = 0;
+    g_total_labels = g_slot_labels[0] + g_slot_labels[1];
+    g_total_polygons = g_slot_polygons[0] + g_slot_polygons[1];
     g_labels_drawn = 0;
     g_text_dirty = true;
+}
+
+void clear_layers() { clear_layers_for_slot(-1); }
+
+// Recomputes the pan-clamp box and the "Reset View" framing over the union of
+// whatever slots currently hold geometry.
+//
+// Over the union rather than over one layout because two revisions of a design
+// do not have identical extents, and whichever part falls outside the other's
+// box would otherwise be unreachable -- the camera would refuse to pan to it.
+// This is also the bug that could not be fixed while a comparison was two
+// separate viewers: each clamped against its own bbox, so the two panes
+// provably drifted apart at the extremes. One camera over one union has
+// nothing to drift from.
+void refit_to_union() {
+    float min_x = std::min(g_slot_bbox[0][0], g_slot_bbox[1][0]);
+    float max_x = std::max(g_slot_bbox[0][1], g_slot_bbox[1][1]);
+    float min_y = std::min(g_slot_bbox[0][2], g_slot_bbox[1][2]);
+    float max_y = std::max(g_slot_bbox[0][3], g_slot_bbox[1][3]);
+
+    if (min_x > max_x) {
+        g_bbox_min_x = HUGE_VALF;
+        g_bbox_max_x = -HUGE_VALF;
+        g_bbox_min_y = HUGE_VALF;
+        g_bbox_max_y = -HUGE_VALF;
+        g_fit_zoom = 1.0f;
+        g_fit_pan_x = 0.0f;
+        g_fit_pan_y = 0.0f;
+        return;
+    }
+
+    g_bbox_min_x = min_x;
+    g_bbox_max_x = max_x;
+    g_bbox_min_y = min_y;
+    g_bbox_max_y = max_y;
+    double width = (double)max_x - (double)min_x;
+    double height = (double)max_y - (double)min_y;
+    g_fit_pan_x = (float)(min_x + width / 2.0);
+    g_fit_pan_y = (float)(min_y + height / 2.0);
+    double zoom_x = g_canvas_width / (width > 0 ? width : 1.0);
+    double zoom_y = g_canvas_height / (height > 0 ? height : 1.0);
+    g_fit_zoom = (float)(std::min(zoom_x, zoom_y) * 0.85);
 }
 
 // A 2D affine map x' = a*x + b*y + tx, y' = c*x + d*y + ty. Used to track the
@@ -3176,11 +3652,16 @@ val hier_xform_to_val(const Affine2D& t) {
 // Builds the whole tree payload: a flat cells[] array (children reference each
 // other by index into it, so a shared cell is described once however many
 // parents place it) plus the indices of the cells rendered at top level.
-val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
+val build_hierarchy(Library& lib, const std::vector<Cell*>& roots, const kfactory_ports::CellPorts& ports) {
     val out = val::object();
     out.set("cellCount", (double)lib.cell_array.count);
     out.set("cells", val::array());
     out.set("roots", val::array());
+    // How many ports the file's kfactory metadata declared across all cells
+    // (each counted once, not per placement), and whether there was any such
+    // metadata at all -- "no ports" and "not a gdsfactory file" differ.
+    out.set("portCount", (double)ports.port_count);
+    out.set("kfactory", ports.present);
 
     if (lib.cell_array.count > kMaxHierarchyCells) {
         out.set("omitted", true);
@@ -3309,6 +3790,27 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
         cell_entry.set("labels", (double)cell->label_array.count);
         cell_entry.set("bbox", hier_box_to_val(boxes[cell]));
         cell_entry.set("refs", refs);
+        // The cell's own ports in its own frame, when kfactory declared any:
+        // what the panel lists for a top cell, and what a host can read to
+        // know where a component connects. Absent (not empty) otherwise, so
+        // the entry costs nothing for the ordinary cell.
+        auto cell_ports = ports.by_cell.find(cell);
+        if (cell_ports != ports.by_cell.end()) {
+            val port_list = val::array();
+            for (const kfactory_ports::PortDef& p : cell_ports->second) {
+                val entry = val::object();
+                entry.set("name", p.name);
+                entry.set("type", p.type);
+                entry.set("x", p.x);
+                entry.set("y", p.y);
+                entry.set("angle", p.angle_deg);
+                entry.set("width", p.width);
+                entry.set("layer", p.layer);
+                entry.set("datatype", p.datatype);
+                port_list.call<void>("push", entry);
+            }
+            cell_entry.set("ports", port_list);
+        }
         cells.call<void>("push", cell_entry);
     }
 
@@ -3320,6 +3822,128 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots) {
 
     out.set("cells", cells);
     out.set("roots", root_indices);
+    return out;
+}
+
+// ---- World-space ports ------------------------------------------------------
+// Every placement of every port, for the overlay (see g_ports in the renderer
+// half). Walks the reference DAG from the roots carrying the composed
+// transform, exactly as the flatten does, but only into subtrees that have a
+// port somewhere below them -- a fill cell arrayed a million times has none,
+// and skipping it is what keeps this a fraction of the flatten's cost.
+//
+// Bounded by kMaxWorldPorts: past it the walk stops and says so (`capped`),
+// which the panel reports. A layout with that many ports has them stacked far
+// too densely to draw one by one anyway.
+constexpr uint64_t kMaxWorldPorts = 200000;
+
+struct WorldPortSink {
+    std::vector<float> xydw;          // x, y, dx, dy, width per port
+    std::vector<uint32_t> type;       // index into type_names
+    std::string name_chars;
+    std::vector<uint32_t> name_offsets{0};
+    std::vector<std::string> type_names;
+    std::unordered_map<std::string, uint32_t> type_index;
+    uint64_t count = 0;
+    bool capped = false;
+
+    uint32_t type_for(const std::string& t) {
+        auto found = type_index.find(t);
+        if (found != type_index.end()) return found->second;
+        uint32_t idx = (uint32_t)type_names.size();
+        type_names.push_back(t);
+        type_index[t] = idx;
+        return idx;
+    }
+};
+
+bool subtree_has_ports(Cell* cell, const kfactory_ports::CellPorts& ports, std::unordered_map<Cell*, int>& memo) {
+    auto found = memo.find(cell);
+    if (found != memo.end()) return found->second > 0;
+    memo[cell] = 0;  // also guards against a reference cycle
+    bool has = ports.by_cell.find(cell) != ports.by_cell.end();
+    for (uint64_t r = 0; r < cell->reference_array.count && !has; r++) {
+        Reference* ref = cell->reference_array[r];
+        if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
+        has = subtree_has_ports(ref->cell, ports, memo);
+    }
+    memo[cell] = has ? 1 : 0;
+    return has;
+}
+
+void collect_world_ports_from(Cell* cell, const Affine2D& current, const kfactory_ports::CellPorts& ports,
+                              std::unordered_map<Cell*, int>& memo, WorldPortSink& sink, int depth) {
+    if (sink.capped || depth > 64) return;
+    auto own = ports.by_cell.find(cell);
+    if (own != ports.by_cell.end()) {
+        for (const kfactory_ports::PortDef& p : own->second) {
+            if (sink.count >= kMaxWorldPorts) {
+                sink.capped = true;
+                return;
+            }
+            Vec2 pos = current.apply_point({p.x, p.y});
+            double a = p.angle_deg * M_PI / 180.0;
+            Vec2 dir = current.apply_linear({cos(a), sin(a)});
+            double len = sqrt(dir.x * dir.x + dir.y * dir.y);
+            if (len > 0) {
+                dir.x /= len;
+                dir.y /= len;
+            } else {
+                dir = {1, 0};
+            }
+            // The width is a length across the port; a magnified placement
+            // scales it by however much it stretches that direction.
+            Vec2 across = current.apply_linear({-sin(a), cos(a)});
+            double width = p.width * sqrt(across.x * across.x + across.y * across.y);
+            sink.xydw.push_back((float)pos.x);
+            sink.xydw.push_back((float)pos.y);
+            sink.xydw.push_back((float)dir.x);
+            sink.xydw.push_back((float)dir.y);
+            sink.xydw.push_back((float)width);
+            sink.type.push_back(sink.type_for(p.type));
+            sink.name_chars += p.name;
+            sink.name_offsets.push_back((uint32_t)sink.name_chars.size());
+            sink.count++;
+        }
+    }
+    for (uint64_t r = 0; r < cell->reference_array.count; r++) {
+        Reference* ref = cell->reference_array[r];
+        if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
+        if (!subtree_has_ports(ref->cell, ports, memo)) continue;
+        Vec2 zero = {0, 0};
+        Array<Vec2> offsets = {};
+        if (ref->repetition.type != RepetitionType::None) {
+            ref->repetition.get_offsets(offsets);
+        } else {
+            offsets.count = 1;
+            offsets.items = &zero;
+        }
+        for (uint64_t k = 0; k < offsets.count && !sink.capped; k++) {
+            Affine2D placed = compose_affine(current, reference_placement(ref, offsets[k]));
+            collect_world_ports_from(ref->cell, placed, ports, memo, sink, depth + 1);
+        }
+        if (ref->repetition.type != RepetitionType::None) offsets.clear();
+        if (sink.capped) return;
+    }
+}
+
+val collect_world_ports(const std::vector<Cell*>& roots, const kfactory_ports::CellPorts& ports) {
+    WorldPortSink sink;
+    std::unordered_map<Cell*, int> memo;
+    if (ports.port_count > 0) {
+        for (Cell* root : roots) collect_world_ports_from(root, Affine2D{}, ports, memo, sink, 0);
+    }
+    val out = val::object();
+    out.set("count", (double)sink.count);
+    out.set("capped", sink.capped);
+    out.set("xydw", to_float32_array(sink.xydw));
+    out.set("type", to_uint32_array(sink.type));
+    std::vector<uint8_t> chars(sink.name_chars.begin(), sink.name_chars.end());
+    out.set("nameChars", to_uint8_array(chars));
+    out.set("nameOffsets", to_uint32_array(sink.name_offsets));
+    val type_names = val::array();
+    for (const std::string& t : sink.type_names) type_names.call<void>("push", t);
+    out.set("typeNames", type_names);
     return out;
 }
 
@@ -3861,7 +4485,13 @@ val parseGdsToLayers(const std::string& path) {
     // The cell tree for the viewer's hierarchy panel. Built here, before the
     // flatten allocates the design's worth of polygons, because it needs the
     // Library's own reference arrays and only holds a box per cell.
-    val hierarchy = build_hierarchy(lib, roots);
+    // Ports gdsfactory/kfactory wrote into the file, if any: listed per cell in
+    // the hierarchy and expanded to world space for the overlay. Positions in
+    // the metadata are in database units; the geometry is in the library unit.
+    kfactory_ports::CellPorts cell_ports =
+        kfactory_ports::read(lib, lib.unit > 0.0 ? lib.precision / lib.unit : 1.0);
+    val hierarchy = build_hierarchy(lib, roots, cell_ports);
+    val ports_js = collect_world_ports(roots, cell_ports);
 
     // Decide which cells are reused enough to GPU-instance, then split the
     // design into static geometry + one instance group per instanced cell.
@@ -4074,6 +4704,7 @@ val parseGdsToLayers(const std::string& path) {
     result.set("layers", layers);
     result.set("instanceGroups", instance_groups_js);
     result.set("hierarchy", hierarchy);
+    result.set("ports", ports_js);
     result.set("bbox", bbox);
     result.set("totalPolygons", total_polygons);
     result.set("totalLabels", labels.count);
@@ -4085,14 +4716,32 @@ val parseGdsToLayers(const std::string& path) {
 // vertex data produced by parseGdsToLayers() (either called directly, or
 // reconstructed from a Worker's 'gdsResult' postMessage) and turns it into
 // VBOs + camera framing. Must run on the main thread (owns the GL context).
-void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
+void uploadLayers(val layers_data, val instance_groups_data, val bbox_data, int slot) {
     if (!g_gl_ready) return;
-    clear_layers();
+    if (slot < 0 || slot >= kSlotCount) slot = 0;
+
+    // Whether anything was on screen before this call that is *not* what this
+    // call is replacing. It decides whether the camera is allowed to jump:
+    // framing the design is right when a load is what first put something on
+    // screen, and wrong when the user is already looking at the other layout
+    // through a camera they positioned themselves.
+    bool other_loaded = false;
+    for (int i = 0; i < kSlotCount; i++) {
+        if (i != slot && (g_slot_polygons[i] > 0 || g_slot_labels[i] > 0)) other_loaded = true;
+    }
+
+    clear_layers_for_slot(slot);
     // Rulers are anchored to the old file's geometry -- drop them rather than
     // leaving stale ones floating over the new design.
     g_measurements.clear();
     g_measure_pending = false;
     g_snap_active = false;
+    // The ports belong to the old file too; the new file's arrive through
+    // setPorts once this upload is done (viewer.js calls it right after).
+    g_ports.clear();
+    g_port_name_chars.clear();
+    g_port_name_offsets.clear();
+    g_ports_capped = false;
 
     unsigned layer_count = layers_data["length"].as<unsigned>();
     unsigned group_count = instance_groups_data["length"].as<unsigned>();
@@ -4114,6 +4763,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
     for (unsigned i = 0; i < layer_count; i++) {
         val entry = layers_data[i];
         LayerBuffer layer_buffer;
+        layer_buffer.source = slot;
         layer_buffer.layer = entry["layer"].as<uint32_t>();
         layer_buffer.datatype = entry["datatype"].as<uint32_t>();
 
@@ -4180,6 +4830,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
                 layer_buffer = &g_layers[it->second];
             } else {
                 LayerBuffer new_layer;
+                new_layer.source = slot;
                 new_layer.layer = layer_number;
                 new_layer.datatype = datatype;
                 apply_layer_colors(new_layer);
@@ -4219,40 +4870,39 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data) {
 
     // Labels count as content: a layout with nothing but text still has to be
     // framed on its bbox rather than falling back to the origin-at-zoom-1 case.
-    if ((total_polygons > 0 || total_labels > 0) && min_x <= max_x) {
-        double total_width = max_x - min_x;
-        double total_height = max_y - min_y;
-        g_pan_x = (float)(min_x + total_width / 2.0);
-        g_pan_y = (float)(min_y + total_height / 2.0);
-        double zoom_x = g_canvas_width / (total_width > 0 ? total_width : 1.0);
-        double zoom_y = g_canvas_height / (total_height > 0 ? total_height : 1.0);
-        g_zoom = (float)(std::min(zoom_x, zoom_y) * 0.85);
-        g_bbox_min_x = (float)min_x;
-        g_bbox_max_x = (float)max_x;
-        g_bbox_min_y = (float)min_y;
-        g_bbox_max_y = (float)max_y;
+    bool slot_has_content = (total_polygons > 0 || total_labels > 0) && min_x <= max_x;
+    g_slot_bbox[slot][0] = slot_has_content ? (float)min_x : HUGE_VALF;
+    g_slot_bbox[slot][1] = slot_has_content ? (float)max_x : -HUGE_VALF;
+    g_slot_bbox[slot][2] = slot_has_content ? (float)min_y : HUGE_VALF;
+    g_slot_bbox[slot][3] = slot_has_content ? (float)max_y : -HUGE_VALF;
+    g_slot_polygons[slot] = total_polygons;
+    g_slot_labels[slot] = total_labels;
+
+    // Framing and pan clamping are over the union of the loaded slots, not
+    // over the one that just arrived.
+    refit_to_union();
+
+    if (other_loaded) {
+        // A second layout arriving next to one the user is already reading:
+        // leave the camera exactly where they put it, only re-clamping in case
+        // the union just moved out from under it.
+        clamp_pan();
     } else {
-        g_zoom = 1.0f;
-        g_pan_x = 0.0f;
-        g_pan_y = 0.0f;
-        g_bbox_min_x = HUGE_VALF;
-        g_bbox_max_x = -HUGE_VALF;
-        g_bbox_min_y = HUGE_VALF;
-        g_bbox_max_y = -HUGE_VALF;
+        g_zoom = g_fit_zoom;
+        g_pan_x = g_fit_pan_x;
+        g_pan_y = g_fit_pan_y;
     }
-    g_fit_zoom = g_zoom;
-    g_fit_pan_x = g_pan_x;
-    g_fit_pan_y = g_pan_y;
-    g_total_polygons = total_polygons;
-    g_total_labels = total_labels;
+
+    g_total_polygons = g_slot_polygons[0] + g_slot_polygons[1];
+    g_total_labels = g_slot_labels[0] + g_slot_labels[1];
     g_text_dirty = true;
 
     // #renderStats is a placeholder draw_frame overwrites every redraw (see
     // update_render_stats) with the live visible-polygon-count / rendering-
     // mode readout -- kept as a separate span so draw_frame's per-frame
     // update doesn't have to re-set the static title/count text above it.
-    set_inner_html_trusted("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(total_polygons) +
-                              "<br>Labels: " + std::to_string(total_labels) +
+    set_inner_html_trusted("ui", "<b>GDSII Core Engine Active</b><br>Polygons: " + std::to_string(g_total_polygons) +
+                              "<br>Labels: " + std::to_string(g_total_labels) +
                               "<br><span id=\"renderStats\"></span>");
     update_scale_bar();
     request_redraw();
@@ -4466,7 +5116,10 @@ val getLayers() {
         if (has_a && has_b && ita->second.order != itb->second.order)
             return ita->second.order < itb->second.order;
         if (a->layer != b->layer) return a->layer < b->layer;
-        return a->datatype < b->datatype;
+        if (a->datatype != b->datatype) return a->datatype < b->datatype;
+        // Same (layer, datatype) from two slots: A before B, so the viewer can
+        // fold the run into one row without having to sort it again.
+        return a->source < b->source;
     });
 
     val result = val::array();
@@ -4475,6 +5128,11 @@ val getLayers() {
         val obj = val::object();
         obj.set("layer", l->layer);
         obj.set("datatype", l->datatype);
+        // Which loaded layout this entry came from. With one layout loaded
+        // every entry says 0 and callers can ignore it; with two, it is what
+        // tells "this layer is in both files" from "this layer was added or
+        // removed", which is the first thing a comparison wants to know.
+        obj.set("source", l->source);
         auto it = g_lyp_info.find(l->tag());
         obj.set("name", it != g_lyp_info.end() ? it->second.name : std::string());
         obj.set("group", it != g_lyp_info.end() ? it->second.group : std::string());
@@ -4499,11 +5157,14 @@ val getLayers() {
 // visibility sticks across a GDS reload (apply_layer_colors reads it back).
 void setLayerVisible(uint32_t layer_number, uint32_t datatype, bool visible) {
     uint64_t tag = make_tag(layer_number, datatype);
+    // Every slot's copy of the layer, not the first one found: the viewer
+    // shows one row per (layer, datatype) across both loaded layouts, so
+    // hiding that row has to hide the layer in both. There is no way to ask
+    // for one slot's copy alone, deliberately -- a layer visible in one
+    // layout and hidden in the other would make the two look different for a
+    // reason that has nothing to do with the designs.
     for (LayerBuffer& l : g_layers) {
-        if (l.tag() == tag) {
-            l.visible = visible;
-            break;
-        }
+        if (l.tag() == tag) l.visible = visible;
     }
     auto it = g_lyp_info.find(tag);
     if (it != g_lyp_info.end()) it->second.visible = visible;
@@ -4569,6 +5230,10 @@ val findLabels(const std::string& query_in, unsigned limit) {
                 obj.set("y", (double)label.y);
                 obj.set("layer", l.layer);
                 obj.set("datatype", l.datatype);
+                // Which loaded layout this label is in. With two of them the
+                // same search runs over both, and a hit that does not say
+                // which design it came from is worse than no hit.
+                obj.set("source", l.source);
                 auto it = g_lyp_info.find(l.tag());
                 obj.set("name", it != g_lyp_info.end() ? it->second.name : std::string());
                 obj.set("visible", l.visible);
@@ -4601,6 +5266,48 @@ void setShowText(bool show) {
 // The dat.gui "Merge Overlaps" checkbox -- see g_merge_mode/draw_layer_merged.
 void setMergeMode(bool on) {
     g_merge_mode = on;
+    request_redraw();
+}
+
+// ---- Comparison slots -------------------------------------------------------
+
+// How opaquely a slot draws. The panel's blend slider drives the pair as
+// alpha[0] = 1-t, alpha[1] = t, so either end is a clean single-layout view.
+void setSlotAlpha(int slot, float alpha) {
+    if (slot < 0 || slot >= kSlotCount) return;
+    g_slot_alpha[slot] = alpha < 0.0f ? 0.0f : (alpha > 1.0f ? 1.0f : alpha);
+    request_redraw();
+}
+
+// Nudge each loaded layout toward its own hue, for telling them apart at a
+// blend where they otherwise look like one layout. Off by default: it trades
+// away the .lyp palette, which is how layers are told apart.
+void setSlotTint(bool on) {
+    g_slot_tint = on;
+    request_redraw();
+}
+
+// Unloads one slot's geometry, leaving the other's alone. The viewer calls
+// this when a comparison drops back to a single layout.
+void clearSlot(int slot) {
+    if (!g_gl_ready || slot < 0 || slot >= kSlotCount) return;
+    clear_layers_for_slot(slot);
+    // Whatever is left is the whole design again. The camera stays where the
+    // user left it -- unloading the layout they were comparing against is no
+    // reason to move the view off what they were looking at -- but it does get
+    // re-clamped, since the box it is held inside just shrank.
+    refit_to_union();
+    clamp_pan();
+    update_measure_labels();
+    update_scale_bar();
+    request_redraw();
+}
+
+// The difference highlight (see draw_diff_highlight). Meaningless with one
+// layout loaded, where every layer agrees with an empty other side and
+// nothing is drawn, so it needs no guard of its own.
+void setDiffHighlight(bool on) {
+    g_diff_highlight = on;
     request_redraw();
 }
 
@@ -4663,6 +5370,37 @@ bool escapeMeasure() {
 
 int measurementCount() {
     return (int)g_measurements.size();
+}
+
+// Every finished ruler as a flat {x0,y0,x1,y1} tuple, for a host mirroring
+// measurements onto another viewer -- there is no way to enumerate them from
+// JS otherwise, only this count. Marshaled the same way getCamera/getLayers
+// already do (plain scalar fields through val::object()/val::array()) rather
+// than a typed-array view: there is no existing typed_memory_view usage
+// anywhere in this file's JS-facing surface, and a handful of rulers is
+// nowhere near where that would matter the way per-polygon geometry does.
+val getMeasurements() {
+    val result = val::array();
+    int idx = 0;
+    for (const Measurement& m : g_measurements) {
+        val obj = val::object();
+        obj.set("x0", m.x0);
+        obj.set("y0", m.y0);
+        obj.set("x1", m.x1);
+        obj.set("y1", m.y1);
+        result.set(idx++, obj);
+    }
+    return result;
+}
+
+// Appends a finished measurement without touching measure mode or whatever
+// ruler the user here is mid-way through placing (g_measure_pending) -- a
+// ruler mirrored from another viewer is already complete, not something this
+// viewer's own user has to click through, and must not cancel their
+// in-progress one.
+void addMeasurement(float x0, float y0, float x1, float y1) {
+    g_measurements.push_back({x0, y0, x1, y1});
+    request_redraw();
 }
 
 // Ruler on/off -- i.e. measure mode vs pan mode (the Pan | Measure row / M
@@ -4863,6 +5601,85 @@ val getMarkerStats() {
     return stats;
 }
 
+// The world-space ports collected during the parse (see collect_world_ports),
+// crossing from the worker as flat arrays: `xydw` five floats per port (x, y,
+// dx, dy, width), `type` one index per port, `typeNames` the index's meaning,
+// and the names packed as UTF-8 bytes with an offsets array, as the layers'
+// labels are. Colors are settled here from the type's name: the two kinds
+// every photonics layout has get the fixed colors, anything else the theme's
+// highlight blue.
+void setPorts(val data) {
+    std::vector<float> xydw = convertJSArrayToNumberVector<float>(data["xydw"]);
+    std::vector<uint32_t> types = convertJSArrayToNumberVector<uint32_t>(data["type"]);
+    std::vector<uint8_t> chars = convertJSArrayToNumberVector<uint8_t>(data["nameChars"]);
+    g_port_name_offsets = convertJSArrayToNumberVector<uint32_t>(data["nameOffsets"]);
+    g_port_name_chars.assign(chars.begin(), chars.end());
+    g_ports_capped = data["capped"].isTrue();
+
+    g_port_types.clear();
+    val type_names = data["typeNames"];
+    unsigned n_types = type_names["length"].as<unsigned>();
+    for (unsigned i = 0; i < n_types; i++) g_port_types.push_back(type_names[i].as<std::string>());
+    if (g_port_types.empty()) g_port_types.push_back("");
+    g_port_type_colors.clear();
+    for (const std::string& t : g_port_types) {
+        if (t == "optical") g_port_type_colors.push_back({0.96f, 0.42f, 0.10f});
+        else if (t == "electrical") g_port_type_colors.push_back({0.20f, 0.72f, 0.32f});
+        else if (t == "placement") g_port_type_colors.push_back({0.55f, 0.55f, 0.58f});
+        else g_port_type_colors.push_back(g_highlight_color);
+    }
+
+    size_t count = std::min(xydw.size() / 5, types.size());
+    g_ports.clear();
+    g_ports.reserve(count);
+    for (size_t i = 0; i < count; i++) {
+        WorldPort p;
+        p.x = xydw[i * 5];
+        p.y = xydw[i * 5 + 1];
+        p.dx = xydw[i * 5 + 2];
+        p.dy = xydw[i * 5 + 3];
+        p.width = xydw[i * 5 + 4];
+        p.type = types[i] < g_port_types.size() ? types[i] : 0;
+        g_ports.push_back(p);
+    }
+    if (g_port_name_offsets.size() != count + 1) {
+        // Names that don't line up with the ports are worse than none.
+        g_port_name_offsets.clear();
+        g_port_name_chars.clear();
+    }
+    request_redraw();
+}
+
+void setShowPorts(bool show) {
+    g_show_ports = show;
+    request_redraw();
+}
+
+val getPortStats() {
+    val stats = val::object();
+    stats.set("count", (int)g_ports.size());
+    stats.set("capped", g_ports_capped);
+    stats.set("visible", g_show_ports);
+    stats.set("types", (int)g_port_types.size());
+    stats.set("drawn", (int)g_ports_drawn);
+    stats.set("namesDrawn", (int)g_port_names_drawn);
+    // The first few ports, for tests to check the expansion against.
+    val sample = val::array();
+    for (size_t i = 0; i < g_ports.size() && i < 8; i++) {
+        val p = val::object();
+        p.set("x", (double)g_ports[i].x);
+        p.set("y", (double)g_ports[i].y);
+        p.set("dx", (double)g_ports[i].dx);
+        p.set("dy", (double)g_ports[i].dy);
+        p.set("width", (double)g_ports[i].width);
+        p.set("type", g_ports[i].type < g_port_types.size() ? g_port_types[g_ports[i].type] : std::string());
+        p.set("name", port_name(i));
+        sample.call<void>("push", p);
+    }
+    stats.set("sample", sample);
+    return stats;
+}
+
 int main() {
     g_gl_ready = init_gl();
     if (!g_gl_ready) return 0;
@@ -4926,12 +5743,18 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setShowInfill", &setShowInfill);
     function("setShowText", &setShowText);
     function("setMergeMode", &setMergeMode);
+    function("setSlotAlpha", &setSlotAlpha);
+    function("setSlotTint", &setSlotTint);
+    function("clearSlot", &clearSlot);
+    function("setDiffHighlight", &setDiffHighlight);
     function("setShowGrid", &setShowGrid);
     function("setTheme", &setTheme);
     function("setMeasureMode", &setMeasureMode);
     function("clearMeasurements", &clearMeasurements);
     function("escapeMeasure", &escapeMeasure);
     function("measurementCount", &measurementCount);
+    function("getMeasurements", &getMeasurements);
+    function("addMeasurement", &addMeasurement);
     function("setMarkers", &setMarkers);
     function("clearMarkers", &clearMarkers);
     function("setMarkerCategoryVisible", &setMarkerCategoryVisible);
@@ -4943,6 +5766,9 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setCellHighlight", &setCellHighlight);
     function("clearCellHighlight", &clearCellHighlight);
     function("getMarkerStats", &getMarkerStats);
+    function("setPorts", &setPorts);
+    function("setShowPorts", &setShowPorts);
+    function("getPortStats", &getPortStats);
     function("getCoordinateTextAt", &getCoordinateTextAt);
     // For viewer.js's ResizeObserver: the element can change size without the
     // window doing anything (a flex layout reflowing, a panel opening, a card

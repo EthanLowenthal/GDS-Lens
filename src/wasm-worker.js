@@ -153,9 +153,17 @@ self.onmessage = (event) => {
                 if (ref.placements) transferList.push(ref.placements.buffer);
             }
         }
+        // The kfactory ports expanded to world space (see collect_world_ports
+        // in renderer.cpp): flat typed arrays, one per field, so a layout with
+        // many thousands of them is a handful of buffers rather than objects.
+        const ports = result.ports;
+        if (ports) {
+            transferList.push(ports.xydw.buffer, ports.type.buffer, ports.nameChars.buffer,
+                              ports.nameOffsets.buffer);
+        }
         postMessage(
             {type: "gdsResult", ok: true, layers: result.layers, instanceGroups: result.instanceGroups,
-             hierarchy: result.hierarchy, bbox: result.bbox},
+             hierarchy: result.hierarchy, bbox: result.bbox, ports},
             transferList
         );
         console.log("[GDS worker] postMessage(gdsResult) call returned");

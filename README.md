@@ -65,6 +65,14 @@ a streaming WebAssembly compile — see
   and ASCII DRC results.
 - **Navigates hierarchy**. You can search cells and labels, and measure
   distances.
+- **Shows gdsfactory / kfactory ports**. A layout written by gdsfactory 8+
+  carries its ports as KLayout metadata inside the file; the viewer reads them
+  back, draws every port as a bar across its width with an arrow the way it
+  faces (and its name, close in), and lists the top cell's ports in the panel.
+  No Python involved.
+- **Compares two layouts**. One viewer can hold two of them, drawn through one
+  camera, with a crossfade between them and a per-layer highlight of where they
+  differ. See [Two layouts in one viewer](docs/embedding.md#two-layouts-in-one-viewer).
 
 ## Installation
 
@@ -91,8 +99,6 @@ takes one attribute and exposes a handful of methods.
 
 #### Attributes
 
-The element takes one attribute:
-
 | Attribute | Description |
 |---|---|
 | `src` | URL of a layout to fetch and display. Setting it later reloads. |
@@ -104,26 +110,35 @@ The element exposes the following members:
 | Member | Returns | Description |
 |---|---|---|
 | `ready` | `Promise<ViewerSurface>` | Resolves once the engine has mounted. Every method in the following table awaits this, so you rarely need it directly. |
-| `load(source, options?)` | `Promise<void>` | `source` is a URL string, a `Uint8Array`, or an `ArrayBuffer`. `options.reload` keeps the current camera and layer visibility instead of framing the design. Resolves once the layout is on screen; rejects on a failed fetch, a file the parser refuses, or — with an error named `AbortError` — when a later load superseded this one. |
+| `load(source, options?)` | `Promise<void>` | `source` is a URL string, a `Uint8Array`, or an `ArrayBuffer`. `options.reload` keeps the current camera and layer visibility instead of framing the design. `options.slot` is `"a"` (the default) or `"b"`, which loads a second layout alongside the first to compare them — see [Two layouts in one viewer](docs/embedding.md#two-layouts-in-one-viewer). Resolves once the layout is on screen; rejects on a failed fetch, a file the parser refuses, or — with an error named `AbortError` — when a later load into the same slot superseded this one. |
 | `showLoading(label?)` | `Promise<void>` | Shows the loading overlay, for the wait before a `load()` of bytes the page is fetching itself. `load(url)` does this on its own. |
 | `goToPoint(x, y)` | `Promise<boolean>` | Centers on a coordinate in microns and flashes a crosshair. Resolves `true` if the point is inside the layout. |
 | `setLyp(name, text)` | `Promise<void>` | Applies a `.lyp` layer-properties file. Pass `""` to clear. |
 | `setMarkers(name, text)` | `Promise<void>` | Applies a marker database. The viewer detects the format from the content. |
 | `showError(message)` | `Promise<void>` | Replaces the view with an error message. |
 | `destroy()` | `Promise<void>` | Releases the viewer's WebAssembly instance and WebGL context for good. Rarely needed — see [Removal parks the viewer](#removal-parks-the-viewer). |
+| `getCamera()` | `Promise<{zoom, panX, panY}>` | The current pan/zoom. |
+| `setCamera(camera)` | `Promise<void>` | Sets the pan/zoom. Clamped to the loaded design's bounds (the union of both, with two layouts loaded). |
+| `getLayers()` | `Promise<LayerInfo[]>` | Every layer's name, group, colors, visibility and shape counts, plus the `source` slot it came from. |
+| `setLayerVisible(layer, datatype, visible)` | `Promise<void>` | Shows or hides one layer. |
+| `getMeasurements()` | `Promise<{x0,y0,x1,y1}[]>` | Every ruler on screen, in micron endpoints. |
+| `addMeasurement(x0, y0, x1, y1)` | `Promise<void>` | Places a finished ruler without disturbing measure mode. |
+| `clearMeasurements()` | `Promise<void>` | Removes every ruler. Rulers don't survive a reload either way. |
+| `unload(slot?)` | `Promise<void>` | Drops the second layout, leaving a single-layout viewer. |
+| `setBlend(t)` | `Promise<void>` | Crossfades two loaded layouts: `0` shows only A, `1` only B, between overlays them. |
+| `getBlend()` | `Promise<number>` | The current crossfade. |
 
-Every `load()` cancels the one before it, so two quick changes to `src` show
-the second layout even when the first is the slower download.
+Every `load()` cancels the one before it *for the same slot*, so two quick
+changes to `src` show the second layout even when the first is the slower
+download.
 
 #### Events
 
-The element dispatches two events on itself, whichever way a load was started
-— the `src` attribute, `load()`, or a host pushing bytes through its surface.
-Neither bubbles.
+The element dispatches events on itself. None bubbles.
 
 | Event | `detail` | When |
 |---|---|---|
-| `gds-load` | `{ layerCount, cellCount }` | A layout finished loading and is on screen. |
+| `gds-load` | `{ slot, layerCount, cellCount, portCount }` | A layout finished loading and is on screen, whichever way the load was started — the `src` attribute, `load()`, or a host pushing bytes through its surface. `slot` is which of the two layouts it is. `portCount` is how many ports its kfactory metadata declared, 0 for a plain file. |
 | `gds-error` | `{ message }` | A load failed, or `showError()` was called. `message` is the text the viewer shows. |
 
 ```js
