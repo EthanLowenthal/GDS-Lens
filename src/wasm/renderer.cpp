@@ -4613,10 +4613,18 @@ val parseGdsToLayers(const std::string& path, val options) {
 
     // Each group's jobs occupy jobs[cursor, end) -- the end index recorded
     // here, the cursor walked forward as the group loop below consumes them.
-    std::vector<std::pair<InstanceGroupPolys*, size_t>> group_job_ends;
+    // The cell comes along for its name, which is the only stable handle a
+    // split parse's shards share for the same group (see the `cell` field the
+    // group entry carries).
+    struct GroupJobs {
+        Cell* cell;
+        InstanceGroupPolys* polys;
+        size_t end;
+    };
+    std::vector<GroupJobs> group_job_ends;
     for (auto& kv : groups) {
         for (auto& entry : kv.second.by_layer_unit) queue_job(entry.first, entry.second);
-        group_job_ends.emplace_back(&kv.second, jobs.size());
+        group_job_ends.push_back({kv.first, &kv.second, jobs.size()});
     }
 
     std::vector<size_t> run_order(jobs.size());
@@ -4664,13 +4672,13 @@ val parseGdsToLayers(const std::string& path, val options) {
     val instance_groups_js = val::array();
     size_t group_job_cursor = label_only_end;
     for (auto& gr : group_job_ends) {
-        InstanceGroupPolys& group = *gr.first;
+        InstanceGroupPolys& group = *gr.polys;
         double group_min_x = HUGE_VAL, group_max_x = -HUGE_VAL;
         double group_min_y = HUGE_VAL, group_max_y = -HUGE_VAL;
         val group_layers = val::array();
         uint64_t unit_polygon_count_sum = 0;
 
-        for (size_t i = group_job_cursor; i < gr.second; i++) {
+        for (size_t i = group_job_cursor; i < gr.end; i++) {
             LayerJob& job = jobs[i];
             if (job.polygon_count > 0 && job.min_x <= job.max_x) {
                 group_min_x = std::min(group_min_x, job.min_x);
@@ -4681,7 +4689,7 @@ val parseGdsToLayers(const std::string& path, val options) {
             unit_polygon_count_sum += job.polygon_count;
             group_layers.call<void>("push", job.entry);
         }
-        group_job_cursor = gr.second;
+        group_job_cursor = gr.end;
 
         // A group with nothing to draw: the cell is placed often enough to be
         // instanced, but none of the layers this call read has geometry in it.
@@ -4738,6 +4746,15 @@ val parseGdsToLayers(const std::string& path, val options) {
         group_entry.set("instances", to_float32_array(instances_flat));
         group_entry.set("layers", group_layers);
         group_entry.set("bbox", group_bbox);
+        // Which cell this group stands for. Only a split parse uses it: the
+        // shards each see the same instanced cells but only the layers they
+        // own, so one cell yields one group per shard that holds any of its
+        // geometry -- each carrying a full copy of the per-instance
+        // transforms. Left alone that is N copies of the instance buffer on
+        // the GPU and N instanced draw calls a frame where there should be
+        // one, so the main thread folds them back together by this name (see
+        // mergeShardResults in viewer.js).
+        group_entry.set("cell", std::string(gr.cell && gr.cell->name ? gr.cell->name : ""));
         instance_groups_js.call<void>("push", group_entry);
     }
 

@@ -177,8 +177,16 @@ function shardCount(byteLength, cores = coreBudget()) {
     return Math.max(1, Math.min(cores, affordable));
 }
 
+// The least a split has to be predicted to buy before it is worth having.
+// Each shard costs a Worker, a second copy of the file, a second copy of the
+// wasm module and a full duplicate walk of every record in the layout, so a
+// split that only shaves a tenth off the triangulation is worse than no split
+// at all -- the duplicated parses alone will eat the difference.
+const MIN_PREDICTED_SPEEDUP = 2;
+
 // Assigns tags to shards, heaviest first onto whichever shard is lightest so
 // far (longest-processing-time first, the standard greedy makespan heuristic).
+// Returns null when the layout cannot usefully be split at all.
 //
 // The balance this achieves is limited by how good the cost estimate is, and
 // the estimate is not very good: measured per-point triangulation cost spans
@@ -192,16 +200,36 @@ function shardCount(byteLength, cores = coreBudget()) {
 // three heavy layers that dominate a design, a single mis-estimated layer
 // lands next to enough correctly-estimated ones to average out. It is also why
 // the balance improves markedly between four shards and eight.
+//
+// What no amount of shards can fix is a design whose work is all on one layer,
+// which is common enough to have to handle -- a routing or waveguide layer
+// carrying almost everything, with a handful of marker layers beside it. A
+// layer is the smallest thing a shard can be given (the filter gdstk's reader
+// takes is a set of tags), so the heaviest one sets a floor on the makespan no
+// matter how many Workers are started. Measured on a design dominated by one
+// layer: eight shards, and the one holding that layer took as long as the
+// whole unsplit parse, while seven others each paid a full parse to
+// contribute nothing.
+//
+// So the plan is sized against that floor rather than against the core count,
+// and abandoned when the floor leaves too little to win.
 function planShards(tagPoints, count) {
-    const shards = [];
-    for (let i = 0; i < count; i++) shards.push({ tags: [], cost: 0 });
-    if (!tagPoints) return null;
+    if (!tagPoints || tagPoints.size === 0) return null;
 
     const byCost = [...tagPoints.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
-    // Fewer tags than shards: the extra shards would each pay a full parse to
-    // produce nothing, so there is no point having them.
-    if (byCost.length < count) return null;
+    const total = byCost.reduce((sum, entry) => sum + entry[1], 0);
+    const heaviest = byCost[0][1];
+    if (!(total > 0) || !(heaviest > 0)) return null;
 
+    // No shard can finish before the heaviest layer does, so shards past the
+    // point where the even split is already lighter than that layer have
+    // nothing to do but duplicate the parse.
+    const useful = Math.min(count, Math.ceil(total / heaviest));
+    if (useful < 2) return null;
+    if (total / Math.max(heaviest, total / useful) < MIN_PREDICTED_SPEEDUP) return null;
+
+    const shards = [];
+    for (let i = 0; i < useful; i++) shards.push({ tags: [], cost: 0 });
     for (const [tag, cost] of byCost) {
         let lightest = shards[0];
         for (const shard of shards) {
@@ -213,4 +241,74 @@ function planShards(tagPoints, count) {
     return shards.map((shard) => shard.tags);
 }
 
-export { scanGdsTags, planShards, shardCount, packTag, looksLikeGds, MIN_SPLIT_BYTES };
+// Grows one bounding box by another, skipping the shards renderer.cpp
+// flagged as holding no geometry (see the `hasGeometry` note there).
+function unionBbox(into, next, hasGeometry) {
+    if (!next || hasGeometry === false) return into;
+    if (!into) return { minX: next.minX, maxX: next.maxX, minY: next.minY, maxY: next.maxY };
+    return {
+        minX: Math.min(into.minX, next.minX),
+        maxX: Math.max(into.maxX, next.maxX),
+        minY: Math.min(into.minY, next.minY),
+        maxY: Math.max(into.maxY, next.maxY)
+    };
+}
+
+// Puts the shards back together into the single result the upload path
+// expects. The per-layer geometry simply concatenates -- every shard owns
+// a disjoint set of layers, so no entry can collide -- and the hierarchy,
+// ports and labels come from the one shard that was asked for them.
+//
+// Sorted by layer and datatype rather than left in the order the shards
+// happened to come back in, because that order is what decides how
+// overlapping translucent fills stack. Left alone it would depend on how
+// many shards the parse was split into, which depends on the file's size
+// and the machine's core count -- so the same layout would draw
+// differently on two engineers' laptops. Sorting costs nothing here (one
+// entry per layer, not per polygon) and makes the stack the same
+// everywhere, split or not.
+function mergeShardResults(results) {
+    const merged = { layers: [], instanceGroups: [], hierarchy: null, ports: null, bbox: null };
+    // Instanced cells are decided from the hierarchy, which no shard
+    // filters, so every shard holding any of a cell's geometry reports
+    // that cell as a group of its own -- same placements, a slice of the
+    // layers. Folding them back by cell name gives the one group an
+    // unsplit parse produces, instead of N groups each re-uploading the
+    // same per-instance transforms and each costing an instanced draw call
+    // of its own every frame.
+    const byCell = new Map();
+    for (const result of results) {
+        for (const layer of result.layers) merged.layers.push(layer);
+        for (const group of result.instanceGroups) {
+            // No name to fold on (an unsplit parse, or a nameless cell):
+            // keep the group as it stands rather than merging blind.
+            const existing = group.cell ? byCell.get(group.cell) : null;
+            if (!existing) {
+                merged.instanceGroups.push(group);
+                if (group.cell) byCell.set(group.cell, group);
+                continue;
+            }
+            for (const layer of group.layers) existing.layers.push(layer);
+            // Each shard saw only its own layers of the unit shape, so the
+            // group's world footprint is the union of what they each
+            // worked out from their slice of it.
+            existing.bbox = {
+                minX: Math.min(existing.bbox.minX, group.bbox.minX),
+                maxX: Math.max(existing.bbox.maxX, group.bbox.maxX),
+                minY: Math.min(existing.bbox.minY, group.bbox.minY),
+                maxY: Math.max(existing.bbox.maxY, group.bbox.maxY)
+            };
+        }
+        if (result.hierarchy) merged.hierarchy = result.hierarchy;
+        if (result.ports) merged.ports = result.ports;
+        merged.bbox = unionBbox(merged.bbox, result.bbox, result.hasGeometry);
+    }
+    merged.layers.sort((a, b) => a.layer - b.layer || a.datatype - b.datatype);
+    for (const group of merged.instanceGroups) {
+        group.layers.sort((a, b) => a.layer - b.layer || a.datatype - b.datatype);
+    }
+    if (!merged.bbox) merged.bbox = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+    return merged;
+}
+
+export { scanGdsTags, planShards, shardCount, mergeShardResults, packTag, looksLikeGds, MIN_SPLIT_BYTES };

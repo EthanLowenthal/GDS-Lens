@@ -16,7 +16,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "node:url";
 
-import { scanGdsTags, planShards, shardCount, packTag, MIN_SPLIT_BYTES } from "../src/parse-split.js";
+import { scanGdsTags, planShards, shardCount, mergeShardResults, packTag, MIN_SPLIT_BYTES }
+    from "../src/parse-split.js";
 import { loadModule, skip } from "./wasm-build.js";
 import { chromium, defaultVariant, withPayload } from "./payload.js";
 
@@ -54,11 +55,25 @@ test("shards are planned heaviest-first onto the lightest shard", () => {
     assert.deepStrictEqual(planShards(tags, 3), [[10], [20], [30, 40]]);
 });
 
-test("a plan needs at least one tag per shard", () => {
-    const tags = new Map([[10, 1], [20, 1]]);
-    assert.strictEqual(planShards(tags, 3), null, "a shard with no tags would parse for nothing");
+test("a plan asks for no more shards than it can keep busy", () => {
+    // Two equal layers cannot occupy three Workers: the third would pay a full
+    // parse to triangulate nothing.
+    assert.deepStrictEqual(planShards(new Map([[10, 1], [20, 1]]), 3), [[10], [20]]);
     assert.strictEqual(planShards(null, 2), null, "nothing to plan from");
-    assert.deepStrictEqual(planShards(tags, 2), [[10], [20]]);
+    assert.strictEqual(planShards(new Map(), 2), null, "no tags to plan from");
+});
+
+test("a design whose work is all on one layer is not split at all", () => {
+    // The heaviest layer is the floor on how fast any split can finish, because
+    // a layer is the smallest thing a shard can be handed. Nearly all on one
+    // layer -- an ordinary shape for a design with one routing or waveguide --
+    // eight Workers would finish no sooner than one, having paid eight parses.
+    assert.strictEqual(planShards(new Map([[1, 925], [2, 40], [3, 35]]), 8), null);
+    // Two layers of equal weight split cleanly in two, and no further.
+    assert.deepStrictEqual(planShards(new Map([[1, 500], [2, 500]]), 8), [[1], [2]]);
+    // A merely lopsided design still splits, just not as many ways as asked.
+    const spread = new Map([[1, 300], [2, 200], [3, 200], [4, 150], [5, 150]]);
+    assert.strictEqual(planShards(spread, 8).length, 4);
 });
 
 test("shard count is bounded by memory, not just by cores", () => {
@@ -191,6 +206,46 @@ test("the tag filter applies to OASIS too, which has no reader-level filter", { 
     assert.strictEqual(inner.ok, true, inner.error);
     assert.deepStrictEqual([...inner.layers], []);
     assert.deepStrictEqual([...inner.instanceGroups].map((g) => [...g.layers].map((l) => l.layer)), [[2]]);
+});
+
+// fixtures/instanced_two_layers.gds exists for this one case: a cell placed
+// nine times (over the instancing threshold) carrying geometry on two layers,
+// plus a third layer on the top cell. Split three ways, the instanced cell's
+// two layers land in two different shards -- so each reports the same cell as
+// a group of its own, with the same nine placements and half the layers. Every
+// other fixture has its instanced geometry on a single layer, where the
+// question never comes up.
+test("one cell's geometry split across shards merges back into one group", { skip }, async () => {
+    const bytes = fixture("instanced_two_layers.gds");
+    const shards = planShards(scanGdsTags(bytes), 3);
+    assert.strictEqual(shards.length, 3, "three equal layers should split three ways");
+
+    const whole = parseShard(await loadModule(), bytes, null);
+    const parts = [];
+    for (const [index, tags] of shards.entries()) {
+        parts.push(parseShard(await loadModule(), bytes,
+                              { tags, labels: index === 0, hierarchy: index === 0, releaseFile: true }));
+    }
+
+    // Unmerged, the instanced cell is reported by two of the three shards.
+    assert.strictEqual(parts.reduce((n, part) => n + part.instanceGroups.length, 0), 2);
+
+    const merged = mergeShardResults(parts);
+    assert.deepStrictEqual(
+        summarize(merged.layers, merged.instanceGroups),
+        summarize(whole.layers, whole.instanceGroups),
+        "the merge did not reproduce the unsplit parse");
+
+    // Specifically: one group, its placements carried once rather than once
+    // per shard, and both of the cell's layers on it.
+    assert.strictEqual(merged.instanceGroups.length, 1);
+    const group = merged.instanceGroups[0];
+    assert.strictEqual(group.cell, "CHILD");
+    assert.strictEqual(group.instances.length / 6, 9);
+    assert.deepStrictEqual([...group.layers].map((l) => `${l.layer}/${l.datatype}`), ["1/0", "2/0"]);
+    assert.deepStrictEqual(group.bbox, whole.instanceGroups[0].bbox,
+                           "the group's world footprint is the union of what each shard saw");
+    assert.deepStrictEqual(merged.bbox, whole.bbox);
 });
 
 test("a shard releases the staged file when asked", { skip }, async () => {

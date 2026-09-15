@@ -2,7 +2,7 @@ import { rankCellMatches, cellPathToTarget } from "./cell-search.js";
 import { parseMarkerFile, flattenMarkerModel } from "./marker-parsers.js";
 import { describeLoadFailure, describeDecodeFailure } from "./load-errors.js";
 import { decodeLayoutBytes, looksGzipped } from "./layout-bytes.js";
-import { scanGdsTags, planShards, shardCount } from "./parse-split.js";
+import { scanGdsTags, planShards, shardCount, mergeShardResults } from "./parse-split.js";
 // Resolved by the build to engine-source.js (the served payloads) or
 // engine-source.esm.js (the bundled module). A bare specifier because
 // esbuild's alias only rewrites those, not relative paths.
@@ -3621,46 +3621,6 @@ export function createViewer(mountTarget) {
             total += counts.total;
         }
         updateProgress(phase, current, total);
-    }
-
-    // Grows one bounding box by another, skipping the shards renderer.cpp
-    // flagged as holding no geometry (see the `hasGeometry` note there).
-    function unionBbox(into, next, hasGeometry) {
-        if (!next || hasGeometry === false) return into;
-        if (!into) return { minX: next.minX, maxX: next.maxX, minY: next.minY, maxY: next.maxY };
-        return {
-            minX: Math.min(into.minX, next.minX),
-            maxX: Math.max(into.maxX, next.maxX),
-            minY: Math.min(into.minY, next.minY),
-            maxY: Math.max(into.maxY, next.maxY)
-        };
-    }
-
-    // Puts the shards back together into the single result the upload path
-    // expects. The per-layer geometry simply concatenates -- every shard owns
-    // a disjoint set of layers, so no entry can collide -- and the hierarchy,
-    // ports and labels come from the one shard that was asked for them.
-    //
-    // Sorted by layer and datatype rather than left in the order the shards
-    // happened to come back in, because that order is what decides how
-    // overlapping translucent fills stack. Left alone it would depend on how
-    // many shards the parse was split into, which depends on the file's size
-    // and the machine's core count -- so the same layout would draw
-    // differently on two engineers' laptops. Sorting costs nothing here (one
-    // entry per layer, not per polygon) and makes the stack the same
-    // everywhere, split or not.
-    function mergeShardResults(results) {
-        const merged = { layers: [], instanceGroups: [], hierarchy: null, ports: null, bbox: null };
-        for (const result of results) {
-            for (const layer of result.layers) merged.layers.push(layer);
-            for (const group of result.instanceGroups) merged.instanceGroups.push(group);
-            if (result.hierarchy) merged.hierarchy = result.hierarchy;
-            if (result.ports) merged.ports = result.ports;
-            merged.bbox = unionBbox(merged.bbox, result.bbox, result.hasGeometry);
-        }
-        merged.layers.sort((a, b) => a.layer - b.layer || a.datatype - b.datatype);
-        if (!merged.bbox) merged.bbox = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
-        return merged;
     }
 
     // One shard's own copy of the file. There is no sharing it between Workers

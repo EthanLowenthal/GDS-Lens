@@ -23,16 +23,26 @@ version. Before that, `0.x` releases changed it freely.
   1.87 s in one Worker, 0.49 s across eight. A smaller one goes from 0.72 s
   to 0.25 s. Layouts that already loaded quickly are unchanged.
 
-  How many Workers a layout gets is decided from its size. Every shard holds
-  its own copy of the file and its own parse's working set, so the count comes
-  *down* as the file grows, and past a few hundred megabytes a layout parses
-  in one Worker as it always has -- both because the memory is not there to
-  spend and because the speedup has flattened out by then anyway.
+  How many Workers a layout gets is decided from its size and its shape. Every
+  shard holds its own copy of the file and its own parse's working set, so the
+  count comes *down* as the file grows, and past a few hundred megabytes a
+  layout parses in one Worker as it always has -- both because the memory is
+  not there to spend and because the speedup has flattened out by then anyway.
+
+  A layer is also the smallest thing a shard can be given, so a design whose
+  work sits almost entirely on one layer -- one routing or waveguide layer
+  with a few marker layers beside it, which is a common enough shape -- cannot
+  be split at all, and is not: extra Workers there would each pay a full parse
+  to finish no sooner. A design dominated by one layer now loads in one
+  Worker, as it did before.
 
   Nothing about this is visible in the API. The same frame is drawn either
   way, down to the pixel, and overlapping layers now stack in layer order
   rather than in whatever order the parse happened to emit them, so the same
-  file draws the same on every machine.
+  file draws the same on every machine. An instanced cell whose geometry
+  spans several shards is folded back into one instance group, so it keeps
+  one copy of its placements and one draw call a frame rather than one per
+  shard.
 
   A `shards` attribute (or `?gdsShards=N`) overrides the count, `shards="1"`
   turning the split off -- the setting to reach for if a layout ever loads
