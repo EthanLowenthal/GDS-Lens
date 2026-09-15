@@ -56,8 +56,9 @@ function packTag(layer, datatype) {
     return datatype * 2 ** 32 + layer;
 }
 
-// Walks the record headers of a GDSII file and totals up how many polygon
-// points sit on each layer/datatype pair. Returns null for anything that is
+// Walks the record headers of a GDSII file and totals up, for each
+// layer/datatype pair, how many polygon points sit on it and how many polygons
+// those points belong to. Returns null for anything that is
 // not GDSII (OASIS, above all -- its records are not laid out this way), and
 // for a file whose records do not tile it exactly, which means the walk
 // desynchronized and the totals cannot be trusted.
@@ -78,7 +79,10 @@ function scanGdsTags(bytes) {
     if (!looksLikeGds(bytes)) return null;
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     const end = bytes.byteLength;
-    const points = new Map();
+    // tag -> {points, polygons}. The point total stands in for how much work
+    // the layer is; the polygon count is how finely that work can be divided,
+    // since a polygon is the smallest thing a shard can be given.
+    const perTag = new Map();
 
     let pos = 0;
     let layer = -1;
@@ -117,7 +121,13 @@ function scanGdsTags(bytes) {
             case REC_ENDEL:
                 if (inElement && layer >= 0 && datatype >= 0) {
                     const tag = packTag(layer, datatype);
-                    points.set(tag, (points.get(tag) || 0) + elementPoints);
+                    const seen = perTag.get(tag);
+                    if (seen) {
+                        seen.points += elementPoints;
+                        seen.polygons++;
+                    } else {
+                        perTag.set(tag, { points: elementPoints, polygons: 1 });
+                    }
                 }
                 inElement = false;
                 break;
@@ -129,7 +139,7 @@ function scanGdsTags(bytes) {
     // it means some record's declared length was wrong and the walk has been
     // reading arbitrary bytes as record headers ever since.
     if (pos !== end) return null;
-    return points;
+    return perTag;
 }
 
 // Peak memory, not core count, is what bounds how many shards a layout can be
@@ -177,68 +187,152 @@ function shardCount(byteLength, cores = coreBudget()) {
     return Math.max(1, Math.min(cores, affordable));
 }
 
-// The least a split has to be predicted to buy before it is worth having.
-// Each shard costs a Worker, a second copy of the file, a second copy of the
-// wasm module and a full duplicate walk of every record in the layout, so a
-// split that only shaves a tenth off the triangulation is worse than no split
-// at all -- the duplicated parses alone will eat the difference.
-const MIN_PREDICTED_SPEEDUP = 2;
+// A layer too heavy for one shard is divided by handing each shard every Nth
+// polygon of it. Below this many polygons there is nothing to divide -- and a
+// layer of three polygons spread over three shards is three parses to save
+// nothing -- so such a layer is always given to one shard whole.
+const MIN_POLYGONS_PER_STRIPE = 32;
 
-// Assigns tags to shards, heaviest first onto whichever shard is lightest so
-// far (longest-processing-time first, the standard greedy makespan heuristic).
-// Returns null when the layout cannot usefully be split at all.
+// Striping is aimed at pieces this many times smaller than one shard's share,
+// rather than at exactly one share. Cutting the work finer than the number of
+// shards is what lets a greedy assignment absorb a bad estimate: a layer that
+// costs twice what its point count suggested is then two or three pieces
+// spread over different shards instead of one shard's whole allocation.
 //
-// The balance this achieves is limited by how good the cost estimate is, and
-// the estimate is not very good: measured per-point triangulation cost spans
-// more than a tenfold range between layers, because a convex polygon is
-// triangulated by a fan in one linear pass while a concave one goes through
-// ear clipping, and nothing in the file says which a polygon will be without
-// reading its points. A layer of 4-point rectangles and a layer of 500-point
-// curves with the same point total are not the same amount of work.
-//
-// Over-decomposing is the answer to that: with more shards than the two or
-// three heavy layers that dominate a design, a single mis-estimated layer
-// lands next to enough correctly-estimated ones to average out. It is also why
-// the balance improves markedly between four shards and eight.
-//
-// What no amount of shards can fix is a design whose work is all on one layer,
-// which is common enough to have to handle -- a routing or waveguide layer
-// carrying almost everything, with a handful of marker layers beside it. A
-// layer is the smallest thing a shard can be given (the filter gdstk's reader
-// takes is a set of tags), so the heaviest one sets a floor on the makespan no
-// matter how many Workers are started. Measured on a design dominated by one
-// layer: eight shards, and the one holding that layer took as long as the
-// whole unsplit parse, while seven others each paid a full parse to
-// contribute nothing.
-//
-// So the plan is sized against that floor rather than against the core count,
-// and abandoned when the floor leaves too little to win.
-function planShards(tagPoints, count) {
-    if (!tagPoints || tagPoints.size === 0) return null;
+// Measured on a mid-size layout across eight shards, where the per-shard
+// triangulation spread was 159-340 ms with whole layers: at 2 the spread
+// closes to roughly 1.2x and the load drops from 510 ms to 441 ms, for 6% more
+// peak memory (every shard sharing a layer reads all of it). At 4 the load
+// drops a further 10 ms for 23% more memory, which is not a trade worth
+// making.
+const STRIPE_OVERSUBSCRIBE = 2;
 
-    const byCost = [...tagPoints.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
-    const total = byCost.reduce((sum, entry) => sum + entry[1], 0);
-    const heaviest = byCost[0][1];
-    if (!(total > 0) || !(heaviest > 0)) return null;
+// Triangulation cost is not proportional to point count, and the gap is wide
+// enough to decide whether splitting is worth doing at all. A convex polygon
+// is filled by a fan over its points in one linear pass; a concave one goes
+// through ear clipping, which measured ten times dearer per point (20 ms per
+// million points on a layer of rectangles against 250 on a layer of curves).
+//
+// Nothing in the file says which a polygon is without reading its points, but
+// the average points per polygon on a layer is a fair stand-in: a layer
+// averaging four or five points is rectangles, and rectangles are convex.
+// Weighting each layer's points by that guess gives an estimate of the work a
+// split would divide -- used both to balance the shards and, below, to decide
+// whether there is enough of it to bother.
+const SIMPLE_POLYGON_POINTS = 8;
+const COMPLEX_POLYGON_WEIGHT = 10;
 
-    // No shard can finish before the heaviest layer does, so shards past the
-    // point where the even split is already lighter than that layer have
-    // nothing to do but duplicate the parse.
-    const useful = Math.min(count, Math.ceil(total / heaviest));
+// Splitting doubles the parse -- more than doubles it, since shards contend
+// for memory bandwidth -- and only divides the triangulation, so a design with
+// little triangulation in it comes out slower. Measured on a layout of small
+// rectangles: 205 ms in one Worker against 221 ms across eight, the
+// per-shard parse going from 61 ms to 131 ms to divide 72 ms of triangulation.
+//
+// This is where that design falls below and the designs that gain fall above,
+// with the nearest on either side at 6.0M and 8.5M weighted points.
+const MIN_SPLIT_WORK = 8e6;
+
+// Same idea for the design as a whole: a layout with only a handful of
+// polygons in it parses faster than a second Worker takes to start. This is a
+// backstop rather than the real gate -- MIN_SPLIT_BYTES already turns away
+// anything small -- so it is set low enough not to refuse a design that is a
+// few large polygons per shard.
+const MIN_POLYGONS_PER_SHARD = 64;
+
+// Assigns work to shards, heaviest piece first onto whichever shard is
+// lightest so far (longest-processing-time first, the standard greedy makespan
+// heuristic). Returns null when the layout should not be split at all.
+//
+// The piece is usually a whole layer, because that is the unit gdstk's reader
+// can filter on: a shard reads only its own tags, which keeps each shard's
+// parse to the geometry it will actually use.
+//
+// But a layer is a lumpy unit. Per-point triangulation cost spans more than a
+// tenfold range between layers -- a convex polygon is triangulated by a fan in
+// one linear pass while a concave one goes through ear clipping, and nothing
+// in the file says which a polygon will be without reading its points -- so a
+// plan that looks balanced by point count often is not. Worse, plenty of real
+// designs put almost everything on one layer (one routing or waveguide layer
+// with a few marker layers beside it), and no assignment of whole layers can
+// split that at all: measured on a design dominated by one layer, eight shards
+// left the one holding it doing as much work as an unsplit parse.
+//
+// So a layer whose share is more than one shard's worth is striped: each of
+// several shards reads it and triangulates every Nth polygon of it, skipping
+// the rest. Striping cuts through the cost-model problem as well as the
+// dominant-layer one, since every Nth polygon of a layer is a fair sample of
+// that layer whatever the polygons look like.
+//
+// What striping costs is that its shards each read the whole layer rather than
+// a slice. That is less expensive than it sounds, because gdstk's reader
+// builds every polygon before discarding the ones outside the filter anyway
+// (see the note on read_layout), so a shard's peak is set by the design's size
+// rather than by its own share of it either way.
+function planShards(perTag, count) {
+    if (!perTag || perTag.size === 0) return null;
+
+    // Estimated triangulation work per layer, and the totals over all of them.
+    const cost = new Map();
+    let total = 0;
+    let polygons = 0;
+    for (const [tag, seen] of perTag) {
+        const perPolygon = seen.points / Math.max(1, seen.polygons);
+        const weighted = seen.points * (perPolygon <= SIMPLE_POLYGON_POINTS ? 1 : COMPLEX_POLYGON_WEIGHT);
+        cost.set(tag, weighted);
+        total += weighted;
+        polygons += seen.polygons;
+    }
+    if (!(total > 0)) return null;
+    if (total < MIN_SPLIT_WORK) return null;
+
+    // No more shards than there is work to keep them busy.
+    const useful = Math.min(count, Math.max(1, Math.floor(polygons / MIN_POLYGONS_PER_SHARD)));
     if (useful < 2) return null;
-    if (total / Math.max(heaviest, total / useful) < MIN_PREDICTED_SPEEDUP) return null;
+
+    // One shard's fair share of the total. A layer over that gets striped, by
+    // as many ways as it is over -- bounded by the shard count, and by having
+    // enough polygons that the stripes are worth having.
+    const share = total / (useful * STRIPE_OVERSUBSCRIBE);
+    const pieces = [];
+    for (const [tag, seen] of perTag) {
+        const weighted = cost.get(tag);
+        let stripes = weighted > share ? Math.ceil(weighted / share) : 1;
+        stripes = Math.min(stripes, useful, Math.max(1, Math.floor(seen.polygons / MIN_POLYGONS_PER_STRIPE)));
+        if (stripes <= 1) {
+            pieces.push({ tag, index: 0, stripes: 1, cost: weighted });
+            continue;
+        }
+        for (let index = 0; index < stripes; index++) {
+            pieces.push({ tag, index, stripes, cost: weighted / stripes });
+        }
+    }
+
+    // Ties broken on tag then stripe so the same file always plans the same way.
+    pieces.sort((a, b) => b.cost - a.cost || a.tag - b.tag || a.index - b.index);
 
     const shards = [];
-    for (let i = 0; i < useful; i++) shards.push({ tags: [], cost: 0 });
-    for (const [tag, cost] of byCost) {
-        let lightest = shards[0];
+    for (let i = 0; i < useful; i++) shards.push({ tags: [], stripes: [], cost: 0, holds: new Set() });
+    for (const piece of pieces) {
+        // Two stripes of one layer on one shard would be a shard reading that
+        // layer once and triangulating two disjoint samples of it, which the
+        // per-shard options have no way to say. There is always a shard free:
+        // a layer is never striped more ways than there are shards.
+        let lightest = null;
         for (const shard of shards) {
-            if (shard.cost < lightest.cost) lightest = shard;
+            if (shard.holds.has(piece.tag)) continue;
+            if (!lightest || shard.cost < lightest.cost) lightest = shard;
         }
-        lightest.tags.push(tag);
-        lightest.cost += cost;
+        if (!lightest) continue;
+        lightest.tags.push(piece.tag);
+        lightest.holds.add(piece.tag);
+        lightest.cost += piece.cost;
+        if (piece.stripes > 1) lightest.stripes.push(piece.tag, piece.index, piece.stripes);
     }
-    return shards.map((shard) => shard.tags);
+
+    // A shard with nothing on it would pay a full parse to produce nothing.
+    const used = shards.filter((shard) => shard.tags.length > 0);
+    if (used.length < 2) return null;
+    return used.map((shard) => ({ tags: shard.tags, stripes: shard.stripes }));
 }
 
 // Grows one bounding box by another, skipping the shards renderer.cpp

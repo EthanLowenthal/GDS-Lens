@@ -4149,15 +4149,31 @@ bool on_resize(int /*eventType*/, const EmscriptenUiEvent* /*e*/, void* /*userDa
 // parseGdsToLayers). Frees every Polygon* in polys before returning.
 
 val build_layer_entry(uint64_t tag, std::vector<Polygon*>& polys, uint64_t& out_polygon_count,
-                      double& out_min_x, double& out_max_x, double& out_min_y, double& out_max_y) {
-    out_polygon_count = polys.size();
+                      double& out_min_x, double& out_max_x, double& out_min_y, double& out_max_y,
+                      uint64_t stripe_index = 0, uint64_t stripe_count = 1) {
     out_min_x = HUGE_VAL;
     out_max_x = -HUGE_VAL;
     out_min_y = HUGE_VAL;
     out_max_y = -HUGE_VAL;
 
+    // A striped layer is one too heavy for a single shard, so several shards
+    // read it and each takes every stripe_count'th polygon of it (see
+    // planShards). The polygons this call skips still belong to it and are
+    // still freed below -- it is only their geometry that another shard is
+    // producing. Order is what makes the stripes line up: every shard walks
+    // the same hierarchy in the same order, and gdstk's tag filter removes a
+    // shape as soon as it is read, so what survives keeps the order it had.
+    auto in_stripe = [stripe_index, stripe_count](size_t i) {
+        return stripe_count <= 1 || i % stripe_count == stripe_index;
+    };
+
+    out_polygon_count = 0;
     uint64_t point_total = 0;
-    for (Polygon* poly : polys) point_total += poly->point_array.count;
+    for (size_t i = 0; i < polys.size(); i++) {
+        if (!in_stripe(i)) continue;
+        out_polygon_count++;
+        point_total += polys[i]->point_array.count;
+    }
 
     std::vector<float> outline_vertices;
     outline_vertices.reserve(point_total * 2);
@@ -4179,7 +4195,9 @@ val build_layer_entry(uint64_t tag, std::vector<Polygon*>& polys, uint64_t& out_
         }
     };
 
-    for (Polygon* poly : polys) {
+    for (size_t poly_index = 0; poly_index < polys.size(); poly_index++) {
+        if (!in_stripe(poly_index)) continue;
+        Polygon* poly = polys[poly_index];
         uint32_t first = (uint32_t)(outline_vertices.size() / 2);
         for (uint64_t i = 0; i < poly->point_array.count; i++) {
             const Vec2& pt = poly->point_array[i];
@@ -4290,6 +4308,10 @@ void attach_labels(val& layer_entry, const std::vector<CollectedLabel>& labels, 
 // build_layer_entry frees the polygons out of it.
 struct LayerJob {
     uint64_t tag = 0;
+    // Which slice of this layer's polygons is this call's to build, when the
+    // layer is shared with other shards (see build_layer_entry).
+    uint64_t stripe_index = 0;
+    uint64_t stripe_count = 1;
     std::vector<Polygon*>* polys = nullptr;
     val entry = val::undefined();
     uint64_t polygon_count = 0;
@@ -4461,6 +4483,10 @@ val parseGdsToLayers(const std::string& path, val options) {
     // design rather than a slice of it -- every shard reads the same records
     // and would otherwise produce N identical copies of each.
     Set<Tag> shard_tags = {};
+    // tag -> (stripe index, stripe count) for the layers this shard shares
+    // with others. A tag absent from here is this shard's alone and is built
+    // whole. Empty on an unsplit parse.
+    std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> shard_stripes;
     bool sharded = false;
     bool want_labels = true;
     bool want_hierarchy = true;
@@ -4478,6 +4504,19 @@ val parseGdsToLayers(const std::string& path, val options) {
         if (!hierarchy_opt.isUndefined()) want_hierarchy = hierarchy_opt.as<bool>();
         val release_opt = options["releaseFile"];
         if (!release_opt.isUndefined()) release_file = release_opt.as<bool>();
+        // Flat triples -- tag, stripe index, stripe count -- rather than an
+        // array of objects, so this crosses as one typed sequence however many
+        // layers are shared.
+        val stripes = options["stripes"];
+        if (!stripes.isUndefined() && !stripes.isNull()) {
+            std::vector<double> flat = vecFromJSArray<double>(stripes);
+            for (size_t i = 0; i + 2 < flat.size(); i += 3) {
+                uint64_t stripe_count = (uint64_t)flat[i + 2];
+                if (stripe_count > 1) {
+                    shard_stripes[(uint64_t)flat[i]] = {(uint64_t)flat[i + 1], stripe_count};
+                }
+            }
+        }
     }
 
     report_progress("parsing", 0, 1);
@@ -4594,10 +4633,15 @@ val parseGdsToLayers(const std::string& path, val options) {
     // shuffle permutes a separate index list rather than the jobs themselves.
     std::vector<LayerJob> jobs;
     std::vector<Polygon*> no_polygons;  // label-only layers: text, no geometry
-    auto queue_job = [&jobs](uint64_t tag, std::vector<Polygon*>& polys) {
+    auto queue_job = [&jobs, &shard_stripes](uint64_t tag, std::vector<Polygon*>& polys) {
         LayerJob job;
         job.tag = tag;
         job.polys = &polys;
+        auto stripe = shard_stripes.find(tag);
+        if (stripe != shard_stripes.end()) {
+            job.stripe_index = stripe->second.first;
+            job.stripe_count = stripe->second.second;
+        }
         jobs.push_back(job);
     };
 
@@ -4635,7 +4679,7 @@ val parseGdsToLayers(const std::string& path, val options) {
     for (size_t i : run_order) {
         LayerJob& job = jobs[i];
         job.entry = build_layer_entry(job.tag, *job.polys, job.polygon_count, job.min_x, job.max_x, job.min_y,
-                                      job.max_y);
+                                      job.max_y, job.stripe_index, job.stripe_count);
         layer_index++;
         report_progress("triangulating", layer_index, jobs.size());
     }

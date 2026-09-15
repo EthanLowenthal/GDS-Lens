@@ -944,11 +944,16 @@ export function createViewer(mountTarget) {
                 byTag.set(tag, { ...layer, sources: [slotId] });
                 continue;
             }
+            // A layer heavy enough to be striped across parse shards comes
+            // back as several entries from the same slot (see planShards),
+            // which is a row whose counts add up -- not a second slot. Only
+            // the slot list has to stay unique; the chip reads it to say
+            // whether a layer is in one layout or both.
+            if (!existing.sources.includes(slotId)) existing.sources.push(slotId);
             // Counts are summed so the row's shape count describes the row.
             // Colors, name and group come from the first entry, which
             // getLayers() sorts to be slot A's: both come from the same .lyp,
             // so they agree anyway.
-            existing.sources.push(slotId);
             existing.polygonCount = (existing.polygonCount || 0) + (layer.polygonCount || 0);
             existing.labelCount = (existing.labelCount || 0) + (layer.labelCount || 0);
         }
@@ -3675,7 +3680,7 @@ export function createViewer(mountTarget) {
             slot.workers.push(worker);
             const shard = shards[index] === null
                 ? null
-                : { index, count: shards.length, tags: shards[index] };
+                : { index, count: shards.length, ...shards[index] };
             startWorker(worker, fileCopyFor(bytes, index, shards.length), slot, index, shard);
         }
     }

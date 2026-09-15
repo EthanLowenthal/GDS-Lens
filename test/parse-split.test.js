@@ -24,12 +24,14 @@ import { chromium, defaultVariant, withPayload } from "./payload.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fixture = (name) => new Uint8Array(fs.readFileSync(path.join(__dirname, "fixtures", name)));
 
-test("the header scan totals polygon points per layer without parsing", () => {
+test("the header scan totals points and polygons per layer without parsing", () => {
     const tags = scanGdsTags(fixture("sample_layout.gds"));
     // Both boxes are 4-point rectangles, closed in GDSII (first point repeated).
+    // Points say how much work a layer is; polygons say how finely it divides.
     assert.deepStrictEqual(
         [...tags].sort((a, b) => a[0] - b[0]),
-        [[packTag(1, 0), 5], [packTag(2, 0), 5]]);
+        [[packTag(1, 0), { points: 5, polygons: 1 }],
+         [packTag(2, 0), { points: 5, polygons: 1 }]]);
 });
 
 test("the header scan declines anything it cannot walk", () => {
@@ -47,33 +49,81 @@ test("the header scan declines anything it cannot walk", () => {
     assert.strictEqual(scanGdsTags(truncated), null);
 });
 
+// Shaped like the scan's output, at a scale the planner takes seriously: the
+// weights are millions of points, spread over polygons big enough to count as
+// the expensive kind to triangulate, unless a case says otherwise.
+const scanned = (...pairs) =>
+    new Map(pairs.map(([tag, millions, polygons = null]) => {
+        const points = millions * 1e6;
+        return [tag, { points, polygons: polygons === null ? Math.round(points / 50) : polygons }];
+    }));
+
 test("shards are planned heaviest-first onto the lightest shard", () => {
-    const tags = new Map([[10, 100], [20, 60], [30, 50], [40, 40]]);
-    // The three heaviest seed a shard each, then 40 joins the lightest of
-    // them: 100 | 60 | 50+40. Walking the tags in their own order would have
-    // put 40 with 100 instead, for a makespan of 140 rather than 100.
-    assert.deepStrictEqual(planShards(tags, 3), [[10], [20], [30, 40]]);
+    // Six layers even enough that none needs striping, so every piece is a
+    // whole layer and this is a test of the assignment alone.
+    const plan = planShards(scanned([1, 10], [2, 9], [3, 8], [4, 7], [5, 6], [6, 5]), 2);
+    assert.deepStrictEqual(plan.map((shard) => shard.stripes), [[], []], "nothing should be striped");
+    assert.deepStrictEqual(plan.map((shard) => shard.tags), [[1, 4, 5], [2, 3, 6]]);
+    // 23 and 22 against a total of 45: the best a two-way split can do.
+    // Walking the layers in their own order would have given 27 and 18.
+    assert.deepStrictEqual(plan.map((shard) => shard.tags.reduce((n, t) => n + (11 - t), 0)), [23, 22]);
 });
 
-test("a plan asks for no more shards than it can keep busy", () => {
-    // Two equal layers cannot occupy three Workers: the third would pay a full
-    // parse to triangulate nothing.
-    assert.deepStrictEqual(planShards(new Map([[10, 1], [20, 1]]), 3), [[10], [20]]);
-    assert.strictEqual(planShards(null, 2), null, "nothing to plan from");
-    assert.strictEqual(planShards(new Map(), 2), null, "no tags to plan from");
+test("there is nothing to plan from", () => {
+    assert.strictEqual(planShards(null, 2), null);
+    assert.strictEqual(planShards(new Map(), 2), null);
+    // A design of a dozen polygons is not worth a second Worker whatever its
+    // layers look like.
+    assert.strictEqual(planShards(scanned([10, 100, 6], [20, 100, 6]), 4), null);
 });
 
-test("a design whose work is all on one layer is not split at all", () => {
-    // The heaviest layer is the floor on how fast any split can finish, because
-    // a layer is the smallest thing a shard can be handed. Nearly all on one
-    // layer -- an ordinary shape for a design with one routing or waveguide --
-    // eight Workers would finish no sooner than one, having paid eight parses.
-    assert.strictEqual(planShards(new Map([[1, 925], [2, 40], [3, 35]]), 8), null);
-    // Two layers of equal weight split cleanly in two, and no further.
-    assert.deepStrictEqual(planShards(new Map([[1, 500], [2, 500]]), 8), [[1], [2]]);
-    // A merely lopsided design still splits, just not as many ways as asked.
-    const spread = new Map([[1, 300], [2, 200], [3, 200], [4, 150], [5, 150]]);
-    assert.strictEqual(planShards(spread, 8).length, 4);
+test("a design of rectangles is not split, however large", () => {
+    // Splitting divides the triangulation but duplicates the parse, so it only
+    // pays where there is triangulation to divide. Rectangles are convex and
+    // filled by a fan in one linear pass, which is an order of magnitude
+    // cheaper per point than the ear clipping a concave polygon needs -- so a
+    // design of nothing but rectangles spends its time in the parse, and
+    // splitting it makes the load slower rather than faster.
+    //
+    // Five point averages per polygon is what a layer of rectangles looks like
+    // to the scan (four corners, closed).
+    const rectangles = new Map([[1, { points: 3e6, polygons: 600000 }],
+                                [2, { points: 2e6, polygons: 400000 }]]);
+    assert.strictEqual(planShards(rectangles, 8), null);
+
+    // The same point count on polygons of a hundred points each is real work,
+    // and is split.
+    const curves = new Map([[1, { points: 3e6, polygons: 30000 }],
+                            [2, { points: 2e6, polygons: 20000 }]]);
+    assert.ok(planShards(curves, 8));
+});
+
+test("a layer too heavy for one shard is striped across several", () => {
+    // Nearly all on one layer, an ordinary shape for a design with one routing
+    // or waveguide layer. Assigning whole layers cannot split this at all --
+    // the heaviest one is a floor on the makespan -- so the heavy layer is
+    // shared, each shard taking every Nth polygon of it.
+    const plan = planShards(scanned([1, 925], [2, 40], [3, 35]), 4);
+    assert.strictEqual(plan.length, 4);
+    for (const shard of plan) assert.ok(shard.tags.includes(1), "every shard should share layer 1");
+    // Flat [tag, index, count] triples, one per shared layer, and the indices
+    // are a complete cover of the stripe count -- no polygon read twice, none
+    // dropped.
+    const indices = plan.map((shard) => {
+        assert.deepStrictEqual(shard.stripes.length, 3);
+        assert.deepStrictEqual([shard.stripes[0], shard.stripes[2]], [1, 4]);
+        return shard.stripes[1];
+    });
+    assert.deepStrictEqual([...indices].sort(), [0, 1, 2, 3]);
+});
+
+test("a layer is not striped more finely than it has polygons to divide", () => {
+    // Same lopsided shape, but the heavy layer is 40 polygons: dividing that
+    // eight ways gives shards five polygons each, which is not worth a parse.
+    const plan = planShards(scanned([1, 925, 40], [2, 40], [3, 35]), 8);
+    const shared = plan.filter((shard) => shard.stripes.length > 0);
+    for (const shard of shared) assert.ok(shard.stripes[2] <= 1 || shard.stripes[2] <= 40 / 32 + 1);
+    assert.ok(plan.length <= 8);
 });
 
 test("shard count is bounded by memory, not just by cores", () => {
@@ -124,10 +174,15 @@ function summarize(layers, groups) {
     };
 }
 
+// Shard assignments written out rather than planned, so these stay tests of
+// what the reader does with them. planShards has its own tests above, and
+// would refuse these fixtures anyway -- they hold a handful of polygons, far
+// below what it considers worth a second Worker.
+const shardOf = (tags, stripes = []) => ({ tags, stripes });
+
 test("a two-shard parse rebuilds exactly what one shard produces", { skip }, async () => {
     const bytes = fixture("sample_layout.gds");
-    const shards = planShards(scanGdsTags(bytes), 2);
-    assert.strictEqual(shards.length, 2);
+    const shards = [shardOf([packTag(1, 0)]), shardOf([packTag(2, 0)])];
 
     const whole = parseShard(await loadModule(), bytes, null);
     assert.strictEqual(whole.ok, true, whole.error);
@@ -135,9 +190,9 @@ test("a two-shard parse rebuilds exactly what one shard produces", { skip }, asy
     // A fresh module per shard, which is what a Worker each really means: no
     // state carries between them.
     const results = [];
-    for (const [index, tags] of shards.entries()) {
+    for (const [index, shard] of shards.entries()) {
         const result = parseShard(await loadModule(), bytes,
-                                  { tags, labels: index === 0, hierarchy: index === 0, releaseFile: true });
+                                  { ...shard, labels: index === 0, hierarchy: index === 0, releaseFile: true });
         assert.strictEqual(result.ok, true, result.error);
         results.push(result);
     }
@@ -161,12 +216,12 @@ test("a two-shard parse rebuilds exactly what one shard produces", { skip }, asy
 
 test("only the first shard describes the whole design", { skip }, async () => {
     const bytes = fixture("sample_layout.gds");
-    const shards = planShards(scanGdsTags(bytes), 2);
+    const shards = [shardOf([packTag(1, 0)]), shardOf([packTag(2, 0)])];
 
     const first = parseShard(await loadModule(), bytes,
-                             { tags: shards[0], labels: true, hierarchy: true, releaseFile: true });
+                             { ...shards[0], labels: true, hierarchy: true, releaseFile: true });
     const second = parseShard(await loadModule(), bytes,
-                              { tags: shards[1], labels: false, hierarchy: false, releaseFile: true });
+                              { ...shards[1], labels: false, hierarchy: false, releaseFile: true });
 
     // The cell tree, the ports and the labels are properties of the file, not
     // of a set of layers: every shard reads the same records and would report
@@ -217,14 +272,13 @@ test("the tag filter applies to OASIS too, which has no reader-level filter", { 
 // question never comes up.
 test("one cell's geometry split across shards merges back into one group", { skip }, async () => {
     const bytes = fixture("instanced_two_layers.gds");
-    const shards = planShards(scanGdsTags(bytes), 3);
-    assert.strictEqual(shards.length, 3, "three equal layers should split three ways");
+    const shards = [shardOf([packTag(1, 0)]), shardOf([packTag(2, 0)]), shardOf([packTag(3, 0)])];
 
     const whole = parseShard(await loadModule(), bytes, null);
     const parts = [];
-    for (const [index, tags] of shards.entries()) {
+    for (const [index, shard] of shards.entries()) {
         parts.push(parseShard(await loadModule(), bytes,
-                              { tags, labels: index === 0, hierarchy: index === 0, releaseFile: true }));
+                              { ...shard, labels: index === 0, hierarchy: index === 0, releaseFile: true }));
     }
 
     // Unmerged, the instanced cell is reported by two of the three shards.
@@ -248,6 +302,82 @@ test("one cell's geometry split across shards merges back into one group", { ski
     assert.deepStrictEqual(merged.bbox, whole.bbox);
 });
 
+// Every polygon in the design, keyed by layer and reduced to its vertices, so
+// a striped parse can be checked against an unsplit one: the polygons are the
+// same set even though they arrive spread across several entries per layer
+// instead of one. Sorted, since which shard produced which polygon is exactly
+// what changes.
+function polygonsByTag(layers, groups) {
+    const byLayer = new Map();
+    const take = (entries) => {
+        for (const entry of entries) {
+            const key = `${entry.layer}/${entry.datatype}`;
+            if (!byLayer.has(key)) byLayer.set(key, []);
+            const into = byLayer.get(key);
+            const vertices = entry.outlineVertices;
+            const ranges = entry.outlineRanges;
+            for (let i = 0; i < ranges.length; i += 2) {
+                const first = ranges[i];
+                const count = ranges[i + 1];
+                into.push([...vertices.subarray(first * 2, (first + count) * 2)].join(","));
+            }
+        }
+    };
+    take(layers);
+    for (const group of groups) take(group.layers);
+    for (const list of byLayer.values()) list.sort();
+    return byLayer;
+}
+
+// fixtures/striped_layer.gds puts 401 polygons on 1/0 against one each on 2/0
+// and 3/0, which is the shape no assignment of whole layers can split: the one
+// heavy layer would be a floor on the makespan however many Workers ran. So
+// the layer itself is shared, each shard taking every Nth polygon of it.
+//
+// What has to hold is that the stripes are a partition -- every polygon built
+// exactly once across the shards. An off-by-one in the stride would silently
+// drop or double a slice of the design, which is the kind of thing that shows
+// up as a subtly wrong picture rather than as an error.
+test("striping a layer across shards partitions it exactly", { skip }, async () => {
+    const bytes = fixture("striped_layer.gds");
+    // What a plan for this design looks like: the heavy layer shared four ways,
+    // the two small ones riding along on the first shard.
+    const heavyTag = packTag(1, 0);
+    const shards = [0, 1, 2, 3].map((index) => shardOf(
+        index === 0 ? [heavyTag, packTag(2, 0), packTag(3, 0)] : [heavyTag],
+        [heavyTag, index, 4]));
+
+    const whole = parseShard(await loadModule(), bytes, null);
+    assert.strictEqual(whole.ok, true, whole.error);
+
+    const parts = [];
+    for (const [index, shard] of shards.entries()) {
+        const part = parseShard(await loadModule(), bytes,
+                                { ...shard, labels: index === 0, hierarchy: index === 0, releaseFile: true });
+        assert.strictEqual(part.ok, true, part.error);
+        parts.push(part);
+    }
+
+    const merged = mergeShardResults(parts);
+    const got = polygonsByTag(merged.layers, merged.instanceGroups);
+    const want = polygonsByTag(whole.layers, whole.instanceGroups);
+    assert.deepStrictEqual([...got.keys()].sort(), [...want.keys()].sort());
+    for (const [tag, polygons] of want) {
+        assert.deepStrictEqual(got.get(tag), polygons, `layer ${tag} did not come back whole`);
+    }
+
+    // The heavy layer arrives as several entries rather than one -- which is
+    // what the sidebar's per-tag folding is for -- holding between them every
+    // polygon an unsplit parse put in the single entry.
+    const entriesOn = (result) => result.layers.concat(...result.instanceGroups.map((g) => g.layers))
+        .filter((entry) => entry.layer === 1 && entry.datatype === 0);
+    const polygonsOn = (result) =>
+        entriesOn(result).reduce((n, entry) => n + entry.outlineRanges.length / 2, 0);
+    assert.ok(entriesOn(merged).length > entriesOn(whole).length, "the layer should arrive striped");
+    assert.strictEqual(polygonsOn(merged), polygonsOn(whole));
+    assert.deepStrictEqual(merged.bbox, whole.bbox);
+});
+
 test("a shard releases the staged file when asked", { skip }, async () => {
     const Module = await loadModule();
     Module.FS.writeFile("/input.layout", fixture("sample_layout.gds"));
@@ -266,12 +396,12 @@ test("a shard releases the staged file when asked", { skip }, async () => {
 // Reading the frame back needs the dance compare-slots.test.js documents: no
 // preserveDrawingBuffer, so nudge the camera to queue the renderer's own
 // redraw and read inside a requestAnimationFrame registered after it.
-async function loadAndRead(query) {
+async function loadAndRead(query, src = "sample_layout.gds") {
     let result = null;
     await withPayload(defaultVariant, async (page, port) => {
         const pageErrors = [];
         page.on("pageerror", (err) => pageErrors.push(String(err).split("\n")[0]));
-        await page.goto(`http://127.0.0.1:${port}/gds-lens.html?src=sample_layout.gds${query}`);
+        await page.goto(`http://127.0.0.1:${port}/gds-lens.html?src=${src}${query}`);
         await page.waitForFunction(() => typeof window.gdsLens?.load === "function", { timeout: 30_000 });
         await page.waitForFunction(
             () => document.querySelector("gds-lens")?.shadowRoot
@@ -294,7 +424,11 @@ async function loadAndRead(query) {
                 }
                 resolve(hash);
             }));
-            return { frame, layers, bbox: element.getBounds ? element.getBounds() : null };
+            // One row per (layer, datatype) in the sidebar, whatever the parse
+            // produced -- a striped layer arrives as several entries.
+            const rows = [...element.shadowRoot.querySelectorAll(".lil-controller.layer-row")]
+                .map((row) => row.textContent.trim());
+            return { frame, layers, rows };
         });
         result.pageErrors = pageErrors;
     });
@@ -312,4 +446,22 @@ test("a split parse draws the same frame as an unsplit one",
     assert.deepStrictEqual(split.layers, whole.layers, "the split load found different layers");
     // Pixel for pixel: the split is only worth having if it is invisible.
     assert.strictEqual(split.frame, whole.frame, "the split load drew a different frame");
+});
+
+// The same check for the harder case: a layer shared between shards, so the
+// wasm side is handed the same tag four times over and the sidebar has four
+// entries to fold into one row. Everything downstream of the parse -- the
+// upload, the layer panel, the drawing -- meets a shape it never sees from an
+// unsplit load.
+test("a striped layer draws and lists the same as an unstriped one",
+     { skip: !defaultVariant || !chromium ? "no built payload, or playwright's chromium is missing" : false },
+     async () => {
+    const whole = await loadAndRead("&gdsShards=1", "striped_layer.gds");
+    const striped = await loadAndRead("&gdsShards=4", "striped_layer.gds");
+
+    assert.deepEqual(whole.pageErrors, [], "the unsplit load threw");
+    assert.deepEqual(striped.pageErrors, [], "the striped load threw");
+    assert.strictEqual(striped.frame, whole.frame, "the striped load drew a different frame");
+    // Four parse entries for layer 1/0, one row for it.
+    assert.deepStrictEqual(striped.rows, whole.rows, "the striped load listed different layers");
 });

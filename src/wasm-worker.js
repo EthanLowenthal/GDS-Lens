@@ -143,11 +143,14 @@ self.onmessage = (event) => {
         // options and gets the lot, as before.
         const shard = message.shard || null;
         const options = shard
-            ? {tags: shard.tags, labels: shard.index === 0, hierarchy: shard.index === 0,
-               releaseFile: true}
+            ? {tags: shard.tags, stripes: shard.stripes, labels: shard.index === 0,
+               hierarchy: shard.index === 0, releaseFile: true}
             : null;
         console.log("[GDS worker] calling Module.parseGdsToLayers('/input.layout')",
-                    shard ? `shard ${shard.index} of ${shard.count}, ${shard.tags.length} tags` : "unsplit");
+                    shard
+                        ? `shard ${shard.index} of ${shard.count}, ${shard.tags.length} tags` +
+                          ` (${(shard.stripes || []).length / 3} shared)`
+                        : "unsplit");
         const result = Module.parseGdsToLayers("/input.layout", options);
         console.log("[GDS worker] parseGdsToLayers returned, ok:", result.ok, "format:", result.format, "error:", result.error);
         // releaseFile already dropped it; unlinking twice would throw.

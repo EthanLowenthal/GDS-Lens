@@ -18,10 +18,11 @@ version. Before that, `0.x` releases changed it freely.
   `SharedArrayBuffer`, and so without asking the embedding page to be
   cross-origin isolated.
 
-  Triangulation is most of a load's wall clock and is per-polygon work with no
-  dependencies, so this is where the time goes. Measured on one layout:
-  1.87 s in one Worker, 0.49 s across eight. A smaller one goes from 0.72 s
-  to 0.25 s. Layouts that already loaded quickly are unchanged.
+  Triangulation is most of a load's wall clock -- 94% of the per-layer work on
+  a large layout -- and is per-polygon work with no dependencies, so this is
+  where the time goes. Measured across eight shards, three layouts of varying
+  size went from 1.89 s to 0.46 s, from 0.72 s to 0.22 s, and from 0.62 s to
+  0.21 s. Layouts that already loaded quickly are unchanged.
 
   How many Workers a layout gets is decided from its size and its shape. Every
   shard holds its own copy of the file and its own parse's working set, so the
@@ -29,12 +30,21 @@ version. Before that, `0.x` releases changed it freely.
   layout parses in one Worker as it always has -- both because the memory is
   not there to spend and because the speedup has flattened out by then anyway.
 
-  A layer is also the smallest thing a shard can be given, so a design whose
-  work sits almost entirely on one layer -- one routing or waveguide layer
-  with a few marker layers beside it, which is a common enough shape -- cannot
-  be split at all, and is not: extra Workers there would each pay a full parse
-  to finish no sooner. A design dominated by one layer now loads in one
-  Worker, as it did before.
+  A layer whose share is more than one shard's worth is shared rather than
+  assigned, each of several shards reading it and triangulating every Nth
+  polygon. Without that, a design whose work sits almost entirely on one layer
+  -- one routing or waveguide layer with a few marker layers beside it, which
+  is a common shape -- could not be split at all, since a layer is the
+  smallest thing gdstk's reader can filter on. One dominated by a single layer
+  goes from 423 ms to 289 ms.
+
+  What is not split is a design with little triangulation in it to divide.
+  Splitting duplicates the parse and only divides the triangulation, and
+  rectangles -- convex, filled by a fan in one linear pass -- are an order of
+  magnitude cheaper per point than the ear clipping a concave polygon needs.
+  A layout of nothing but small rectangles measured 205 ms in one Worker
+  against 221 ms across eight, so layouts shaped like that load in one Worker.
+  The same estimate decides how the shards are balanced.
 
   Nothing about this is visible in the API. The same frame is drawn either
   way, down to the pixel, and overlapping layers now stack in layer order
