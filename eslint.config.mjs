@@ -88,7 +88,7 @@ export default [
         // even though it lives under scripts/.
         files: ["test/browser-smoke.test.js", "test/custom-element.test.js",
             "test/host-contract.test.js", "test/viewer-ui.test.js",
-            "test/compare-slots.test.js",
+            "test/compare-slots.test.js", "test/parse-split.test.js",
             "test/esm-bundle.test.js", "test/react.test.js",
             "scripts/check-site.mjs", "scripts/make-og-image.mjs"],
         languageOptions: {

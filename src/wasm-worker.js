@@ -49,6 +49,10 @@ import { describeLoadFailure } from "./load-errors.js";
 // see debugRequested in viewer.js). Errors always go through: a failed load is
 // worth a console line whoever is looking.
 let debugToConsole = false;
+// One-shot guard on the progress tagging below: a worker only ever handles one
+// parse, but wrapping self.postMessage twice would still be a bug worth not
+// having.
+let taggingProgress = false;
 function safeStringify(arg) {
     if (typeof arg === "string") return arg;
     if (arg instanceof Error) return arg.stack || arg.message;
@@ -103,6 +107,23 @@ self.onmessage = (event) => {
     console.log("[GDS worker] received message, type:", message.type);
     if (message.type !== "parse") return;
     debugToConsole = !!message.debug;
+    // report_progress() in renderer.cpp posts 'gdsProgress' straight from
+    // inside the parse, with no idea it is one shard of several; the main
+    // thread needs to know which worker each one came from to add them up.
+    // Tagging them on the way out keeps that knowledge out of the C++.
+    if (message.shard && !taggingProgress) {
+        taggingProgress = true;
+        // Bound and replaced on `self` rather than as a bare global: this file
+        // is an ES module in the bundled build (so a bare `postMessage(...)`
+        // call would have no `this`), and EM_ASM's own unqualified call
+        // resolves through the global object either way.
+        const realPostMessage = self.postMessage.bind(self);
+        const shardIndex = message.shard.index;
+        self.postMessage = (data, transfer) => {
+            if (data && data.type === "gdsProgress") data = {...data, shard: shardIndex};
+            return transfer === undefined ? realPostMessage(data) : realPostMessage(data, transfer);
+        };
+    }
 
     console.log("[GDS worker] fileData byteLength:", message.fileData && message.fileData.byteLength);
     console.log("[GDS worker] calling createGdstkModule()...");
@@ -113,17 +134,32 @@ self.onmessage = (event) => {
         // nothing here has to know or plumb through which one this is.
         console.log("[GDS worker] writing /input.layout to MEMFS...");
         Module.FS.writeFile("/input.layout", new Uint8Array(message.fileData));
-        console.log("[GDS worker] calling Module.parseGdsToLayers('/input.layout')...");
-        const result = Module.parseGdsToLayers("/input.layout");
+        // On a split parse (see parse-split.js) this worker is one shard of
+        // several: `tags` are the layers it alone is responsible for, and only
+        // the first shard collects the parts of the result that describe the
+        // whole design rather than a slice of it -- the cell hierarchy, the
+        // ports, and the labels, none of which are filtered by layer and would
+        // otherwise come back once per shard. An unsplit load passes no
+        // options and gets the lot, as before.
+        const shard = message.shard || null;
+        const options = shard
+            ? {tags: shard.tags, labels: shard.index === 0, hierarchy: shard.index === 0,
+               releaseFile: true}
+            : null;
+        console.log("[GDS worker] calling Module.parseGdsToLayers('/input.layout')",
+                    shard ? `shard ${shard.index} of ${shard.count}, ${shard.tags.length} tags` : "unsplit");
+        const result = Module.parseGdsToLayers("/input.layout", options);
         console.log("[GDS worker] parseGdsToLayers returned, ok:", result.ok, "format:", result.format, "error:", result.error);
-        Module.FS.unlink("/input.layout");
+        // releaseFile already dropped it; unlinking twice would throw.
+        if (!options || !options.releaseFile) Module.FS.unlink("/input.layout");
 
         if (!result.ok) {
             postMessage({type: "gdsResult", ok: false, error: result.error});
             return;
         }
 
-        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length, "cells:", result.hierarchy.cellCount, "-- posting gdsResult back to main thread");
+        console.log("[GDS worker] layers:", result.layers.length, "instance groups:", result.instanceGroups.length,
+                    "cells:", result.hierarchy ? result.hierarchy.cellCount : 0, "-- posting gdsResult back to main thread");
         const transferList = [];
         for (const layer of result.layers) {
             transferList.push(layer.outlineVertices.buffer, layer.outlineRanges.buffer,
@@ -148,7 +184,7 @@ self.onmessage = (event) => {
         // transferring rather than cloning. They're capped library-wide
         // (kMaxHierarchyPlacements), so this walk is bounded and most rows
         // (single placements) carry none at all.
-        for (const cell of result.hierarchy.cells) {
+        for (const cell of (result.hierarchy && result.hierarchy.cells) || []) {
             for (const ref of cell.refs) {
                 if (ref.placements) transferList.push(ref.placements.buffer);
             }
@@ -156,14 +192,16 @@ self.onmessage = (event) => {
         // The kfactory ports expanded to world space (see collect_world_ports
         // in renderer.cpp): flat typed arrays, one per field, so a layout with
         // many thousands of them is a handful of buffers rather than objects.
-        const ports = result.ports;
+        const ports = result.ports && result.ports.xydw ? result.ports : null;
         if (ports) {
             transferList.push(ports.xydw.buffer, ports.type.buffer, ports.nameChars.buffer,
                               ports.nameOffsets.buffer);
         }
         postMessage(
-            {type: "gdsResult", ok: true, layers: result.layers, instanceGroups: result.instanceGroups,
-             hierarchy: result.hierarchy, bbox: result.bbox, ports},
+            {type: "gdsResult", ok: true, shard: shard ? shard.index : 0,
+             layers: result.layers, instanceGroups: result.instanceGroups,
+             hierarchy: result.hierarchy && result.hierarchy.cells ? result.hierarchy : null,
+             bbox: result.bbox, hasGeometry: result.hasGeometry, ports},
             transferList
         );
         console.log("[GDS worker] postMessage(gdsResult) call returned");

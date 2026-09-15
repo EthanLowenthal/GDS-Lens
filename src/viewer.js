@@ -2,6 +2,7 @@ import { rankCellMatches, cellPathToTarget } from "./cell-search.js";
 import { parseMarkerFile, flattenMarkerModel } from "./marker-parsers.js";
 import { describeLoadFailure, describeDecodeFailure } from "./load-errors.js";
 import { decodeLayoutBytes, looksGzipped } from "./layout-bytes.js";
+import { scanGdsTags, planShards, shardCount } from "./parse-split.js";
 // Resolved by the build to engine-source.js (the served payloads) or
 // engine-source.esm.js (the bundled module). A bare specifier because
 // esbuild's alias only rewrites those, not relative paths.
@@ -196,6 +197,28 @@ export function createViewer(mountTarget) {
     };
     const traceToConsole = debugRequested();
 
+    // Overrides how many Workers a parse is split across (see parse-split.js),
+    // which is otherwise decided from the file's size and the machine's core
+    // count. `shards` on the element for an embedder, ?gdsShards=N for a plain
+    // page. 1 turns splitting off, which is the setting worth reaching for if
+    // a layout loads wrongly and the split parse is the suspect; the tests use
+    // it in the other direction, to split a fixture far too small to trigger
+    // it on its own. Anything unparseable or out of range is ignored.
+    const shardsRequested = () => {
+        let raw = null;
+        if (rootEl && rootEl.getAttribute) raw = rootEl.getAttribute("shards");
+        if (raw === null) {
+            try {
+                raw = new URLSearchParams(location.search).get("gdsShards");
+            } catch {
+                raw = null;
+            }
+        }
+        const count = Number(raw);
+        return Number.isInteger(count) && count >= 1 && count <= 16 ? count : null;
+    };
+    const shardOverride = shardsRequested();
+
     // Breadcrumbs: the panel always, the host's console only when asked.
     function trace(...args) {
         appendDebugLine(args.map(safeStringify).join(" "), false);
@@ -289,11 +312,20 @@ export function createViewer(mountTarget) {
     const slots = SLOT_IDS.map((id, index) => ({
         id,
         index,
-        // The load in flight for this slot, so a reload can cancel it. Per slot
-        // rather than shared: a comparison loads both layouts at once, and a
-        // single "active worker" would have the second load terminate the
-        // first one's parse.
-        worker: null,
+        // The load in flight for this slot, so a reload can cancel it: the
+        // Workers parsing it, and the results they have posted back so far.
+        // Per slot rather than shared: a comparison loads both layouts at
+        // once, and a single "active worker" would have the second load
+        // terminate the first one's parse.
+        //
+        // More than one Worker because a large layout's parse is split across
+        // several, each reading a slice of the layers (see parse-split.js);
+        // an unsplit load is just the one-element case of the same thing.
+        workers: [],
+        // Per-shard parse results and progress, held until every shard has
+        // reported so they can be merged into one upload and one progress bar.
+        shardResults: null,
+        shardProgress: null,
         generation: 0,
         pending: null,
         // View state captured for this slot's in-flight reload, re-applied
@@ -322,7 +354,7 @@ export function createViewer(mountTarget) {
         }
     }
 
-    const anyLoadInFlight = () => slots.some((slot) => slot.worker !== null);
+    const anyLoadInFlight = () => slots.some((slot) => slot.workers.length > 0);
 
     // Set once it is known that nothing will ever be drawn: no WebGL2 context
     // could be made, or the one there was has been lost. A load after that
@@ -360,10 +392,7 @@ export function createViewer(mountTarget) {
         canvasResizeObserver?.disconnect();
         disposeController.abort();
         if (activeViewer === hostElement) activeViewer = null;
-        for (const slot of slots) {
-            if (slot.worker) slot.worker.terminate();
-            slot.worker = null;
-        }
+        for (const slot of slots) stopWorkers(slot);
         settleLoad("reject", abortError("the viewer was destroyed"));
         // Through the promise rather than resolvedModule: a viewer destroyed
         // while its module is still instantiating must still let go of the
@@ -3307,10 +3336,9 @@ export function createViewer(mountTarget) {
         // worker rather than letting two of them race to upload geometry. The
         // other slot's load is untouched, which is what lets a comparison
         // start both layouts at once.
-        if (slot.worker) {
+        if (slot.workers.length > 0) {
             trace("[GDS] superseding an in-flight load for slot", slot.id);
-            slot.worker.terminate();
-            slot.worker = null;
+            stopWorkers(slot);
         }
         // ...and tell whoever was awaiting it. The generation is for the load
         // that has not reached its worker yet: one parked on the gzip await
@@ -3373,16 +3401,7 @@ export function createViewer(mountTarget) {
             parseBytes = decoded.bytes;
         }
 
-        let worker;
-        try {
-            worker = createParseWorker();
-            trace("[GDS] new Worker() constructor returned OK");
-        } catch (err) {
-            fail("[GDS] failed to build/start worker:", err);
-            showFatalError(`Failed to create worker: ${err.message || err}`);
-            return outcome;
-        }
-        startWorker(worker, parseBytes, slot);
+        startParse(parseBytes, slot);
         return outcome;
     }
 
@@ -3392,10 +3411,7 @@ export function createViewer(mountTarget) {
     // reading.
     function unloadSlot(slotId = "b") {
         const slot = slotOf(slotId);
-        if (slot.worker) {
-            slot.worker.terminate();
-            slot.worker = null;
-        }
+        stopWorkers(slot);
         settleLoad("reject", abortError("the slot was unloaded"), slot);
         slot.loaded = false;
         slot.name = null;
@@ -3565,8 +3581,146 @@ export function createViewer(mountTarget) {
 
     hostCall("connect", viewer);
 
-    function startWorker(worker, fileData, slot) {
-        slot.worker = worker;
+    // Tears down whatever Workers a slot still has parsing for it, and forgets
+    // the partial results they had posted. Safe to call on a slot with none.
+    function stopWorkers(slot) {
+        for (const worker of slot.workers) worker.terminate();
+        slot.workers = [];
+        slot.shardResults = null;
+        slot.shardProgress = null;
+    }
+
+    // The phases renderer.cpp reports, in the order it reports them. Used to
+    // fold several shards' progress into one bar: they run the same phases at
+    // the same time but not at the same rate.
+    const PARSE_PHASES = ["parsing", "hierarchy", "flattening", "triangulating"];
+
+    // One bar out of N shards, driven by whichever shard is furthest behind --
+    // the load is not done until the slowest one is, so reporting anything
+    // more optimistic would mean a bar that sits at 100% while the viewer is
+    // still working. Within that phase the shards' counts are summed, which is
+    // what makes the triangulation readout ("Layer 340/2350") mean the whole
+    // design again rather than one shard's share of it.
+    function reportShardProgress(slot) {
+        const seen = slot.shardProgress;
+        if (!seen) return;
+        let slowest = PARSE_PHASES.length;
+        for (const shard of seen) {
+            const rank = shard ? PARSE_PHASES.indexOf(shard.phase) : -1;
+            if (rank < slowest) slowest = rank;
+        }
+        if (slowest < 0 || slowest >= PARSE_PHASES.length) return;
+        const phase = PARSE_PHASES[slowest];
+        let current = 0;
+        let total = 0;
+        for (const shard of seen) {
+            const counts = shard && shard.byPhase[phase];
+            if (!counts) continue;
+            // A shard already past this phase finished all of it.
+            current += shard.phase === phase ? counts.current : counts.total;
+            total += counts.total;
+        }
+        updateProgress(phase, current, total);
+    }
+
+    // Grows one bounding box by another, skipping the shards renderer.cpp
+    // flagged as holding no geometry (see the `hasGeometry` note there).
+    function unionBbox(into, next, hasGeometry) {
+        if (!next || hasGeometry === false) return into;
+        if (!into) return { minX: next.minX, maxX: next.maxX, minY: next.minY, maxY: next.maxY };
+        return {
+            minX: Math.min(into.minX, next.minX),
+            maxX: Math.max(into.maxX, next.maxX),
+            minY: Math.min(into.minY, next.minY),
+            maxY: Math.max(into.maxY, next.maxY)
+        };
+    }
+
+    // Puts the shards back together into the single result the upload path
+    // expects. The per-layer geometry simply concatenates -- every shard owns
+    // a disjoint set of layers, so no entry can collide -- and the hierarchy,
+    // ports and labels come from the one shard that was asked for them.
+    //
+    // Sorted by layer and datatype rather than left in the order the shards
+    // happened to come back in, because that order is what decides how
+    // overlapping translucent fills stack. Left alone it would depend on how
+    // many shards the parse was split into, which depends on the file's size
+    // and the machine's core count -- so the same layout would draw
+    // differently on two engineers' laptops. Sorting costs nothing here (one
+    // entry per layer, not per polygon) and makes the stack the same
+    // everywhere, split or not.
+    function mergeShardResults(results) {
+        const merged = { layers: [], instanceGroups: [], hierarchy: null, ports: null, bbox: null };
+        for (const result of results) {
+            for (const layer of result.layers) merged.layers.push(layer);
+            for (const group of result.instanceGroups) merged.instanceGroups.push(group);
+            if (result.hierarchy) merged.hierarchy = result.hierarchy;
+            if (result.ports) merged.ports = result.ports;
+            merged.bbox = unionBbox(merged.bbox, result.bbox, result.hasGeometry);
+        }
+        merged.layers.sort((a, b) => a.layer - b.layer || a.datatype - b.datatype);
+        if (!merged.bbox) merged.bbox = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+        return merged;
+    }
+
+    // One shard's own copy of the file. There is no sharing it between Workers
+    // -- that is what SharedArrayBuffer would have been for, and the whole
+    // reason this is several Workers rather than several threads -- so each
+    // gets a copy, and the last one to be handed out takes the original
+    // instead of copying it one more time.
+    //
+    // Copies are made one at a time and transferred immediately, so the main
+    // thread holds the file plus at most one copy rather than N of them.
+    function fileCopyFor(bytes, index, count) {
+        const own = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
+        if (index === count - 1 && own) return bytes.buffer;
+        return bytes.slice().buffer;
+    }
+
+    // Works out how to split this layout's parse, starts a Worker per shard,
+    // and hands each the slice of layers it is responsible for.
+    function startParse(fileData, slot) {
+        const bytes = asBytes(fileData);
+        let shards = null;
+        const wanted = shardOverride || shardCount(bytes.byteLength);
+        if (wanted > 1) {
+            // Cheap enough to do on the main thread with the progress overlay
+            // already up: a header walk over even a very large layout is under
+            // a fifth of a second, against the seconds the parse itself takes.
+            // Null back means the file is not GDSII (OASIS's records are not
+            // laid out this way) or its records did not tile cleanly, and
+            // either way there is nothing to partition on -- so the load falls
+            // back to the single Worker it has always used.
+            const scanStart = performance.now();
+            shards = planShards(scanGdsTags(bytes), wanted);
+            trace("[GDS] tag scan took", Math.round(performance.now() - scanStart), "ms;",
+                  shards ? `splitting the parse ${shards.length} ways` : "parsing in one worker");
+        }
+        if (!shards) shards = [null];
+
+        slot.shardResults = new Array(shards.length).fill(null);
+        slot.shardProgress = new Array(shards.length).fill(null);
+
+        for (let index = 0; index < shards.length; index++) {
+            let worker;
+            try {
+                worker = createParseWorker();
+                trace("[GDS] new Worker() constructor returned OK");
+            } catch (err) {
+                fail("[GDS] failed to build/start worker:", err);
+                showFatalError(`Failed to create worker: ${err.message || err}`);
+                stopWorkers(slot);
+                return;
+            }
+            slot.workers.push(worker);
+            const shard = shards[index] === null
+                ? null
+                : { index, count: shards.length, tags: shards[index] };
+            startWorker(worker, fileCopyFor(bytes, index, shards.length), slot, index, shard);
+        }
+    }
+
+    function startWorker(worker, transfer, slot, index, shard) {
         // Only fires for the Worker failing to start at all (e.g. its script
         // URL rejected by CSP) -- failures inside the worker's own async code
         // are reported via a 'gdsResult' message instead (see wasm-worker.js),
@@ -3596,106 +3750,119 @@ export function createViewer(mountTarget) {
             // of moving parsing into a Worker at all, swamping whatever the
             // off-main-thread parse saved.
             trace("[GDS] main thread received worker message:", workerMessage.type);
+            // A message from a Worker this slot has already let go of: a
+            // superseded load, or a sibling shard's failure that tore the rest
+            // down. Its geometry is not wanted and its progress is not ours.
+            if (!slot.workers.includes(worker)) return;
             if (workerMessage.type === "gdsProgress") {
-                updateProgress(workerMessage.phase, workerMessage.current, workerMessage.total);
+                const seen = slot.shardProgress[index] || { phase: null, byPhase: {} };
+                seen.phase = workerMessage.phase;
+                seen.byPhase[workerMessage.phase] =
+                    { current: workerMessage.current, total: workerMessage.total };
+                slot.shardProgress[index] = seen;
+                reportShardProgress(slot);
             } else if (workerMessage.type === "gdsResult") {
-                // Free the worker's copy of the geometry before uploading ours:
-                // on a big design both threads holding it at once is what tips a
-                // borderline load over the edge.
+                // Free this Worker's copy of the geometry before uploading
+                // ours: on a big design both sides holding it at once is what
+                // tips a borderline load over the edge. The shard's result is
+                // kept -- the structured clone made it ours when it arrived.
                 worker.terminate();
-                if (slot.worker === worker) slot.worker = null;
+                slot.workers = slot.workers.filter((candidate) => candidate !== worker);
                 if (!workerMessage.ok) {
+                    // One shard failing means the design would be uploaded
+                    // with layers missing, so the load fails whole.
+                    stopWorkers(slot);
                     showFatalError(workerMessage.error);
                     return;
                 }
-                trace("[GDS] load succeeded, layer count:", workerMessage.layers.length);
-                modulePromise.then((Module) => {
-                    // A load started before the module came up and found out it
-                    // has no context: uploadLayers would no-op and the load
-                    // would report success with nothing on screen.
-                    if (glUnavailable) {
-                        showFatalError(GL_UNAVAILABLE);
-                        return;
-                    }
-                    // uploadLayers is the other place a big layout can run out of
-                    // memory -- the parse fit in the worker, but this thread's
-                    // module now has to hold the same geometry plus its VBOs. An
-                    // unhandled throw here would leave the progress bar spinning
-                    // forever, so surface it like any other load failure.
-                    try {
-                        Module.uploadLayers(workerMessage.layers, workerMessage.instanceGroups,
-                                            workerMessage.bbox, slot.index);
-                    } catch (err) {
-                        showFatalError(describeLoadFailure(err));
-                        return;
-                    }
-                    clearFatalError();
-                    // Put the camera and per-layer visibility back before the
-                    // panel is rebuilt, so renderLayerList reflects the restored
-                    // checkboxes rather than the fresh load's defaults.
-                    if (slot.viewState) {
-                        try {
-                            restoreViewState(Module, slot.viewState);
-                        } catch (err) {
-                            fail("[GDS] could not restore view state:", err);
-                        }
-                        slot.viewState = null;
-                    }
-                    slot.loaded = true;
-                    slot.hierarchy = workerMessage.hierarchy || null;
-                    renderCompareFolder();
-                    renderLayerList(Module.getLayers());
-                    renderHierarchy();
-                    applyPorts(Module, workerMessage.ports, workerMessage.hierarchy);
-                    // There's a view to save from now on (see viewsFolder.hide()).
-                    viewsFolder.show();
-                    // uploadLayers drops the rulers -- they were anchored to the
-                    // geometry this load just replaced.
-                    refreshRulerRow(Module);
-                    // The other slot may still be parsing: a comparison starts
-                    // both layouts at once, and taking the progress overlay
-                    // down on the first one to land would report a load that
-                    // is only half done.
-                    if (!anyLoadInFlight()) endProgress();
-                    trace("[GDS] done, progress hidden");
-                    hostElement.dispatchEvent(new CustomEvent("gds-load", {
-                        detail: {
-                            slot: slot.id,
-                            layerCount: workerMessage.layers.length,
-                            cellCount: workerMessage.hierarchy ? workerMessage.hierarchy.cellCount : 0,
-                            portCount: workerMessage.hierarchy ? workerMessage.hierarchy.portCount || 0 : 0
-                        }
-                    }));
-                    settleLoad("resolve", undefined, slot);
-                }, (err) => {
-                    showFatalError(`WebAssembly module failed to load: ${err && err.message ? err.message : err}`);
-                });
+                slot.shardResults[index] = workerMessage;
+                if (slot.shardResults.some((result) => result === null)) {
+                    trace("[GDS] shard", index, "done;",
+                          slot.shardResults.filter((r) => r === null).length, "still parsing");
+                    return;
+                }
+                const merged = mergeShardResults(slot.shardResults);
+                slot.shardResults = null;
+                slot.shardProgress = null;
+                uploadParse(merged, slot);
             }
         };
         trace("[GDS] posting 'parse' message to worker...");
-        // A host may hand in either an ArrayBuffer or a typed-array view over
-        // one, and the transfer list accepts only the buffer itself. Normalize
-        // here rather than making every host care, but do not transfer a buffer
-        // we only partially own: a view with an offset, or shorter than its
-        // buffer, would hand the worker neighbouring bytes as though they were
-        // part of the layout, so that case is copied out first.
-        let transfer;
-        if (fileData instanceof ArrayBuffer) {
-            transfer = fileData;
-        } else if (fileData.byteOffset === 0 && fileData.byteLength === fileData.buffer.byteLength) {
-            transfer = fileData.buffer;
-        } else {
-            transfer = fileData.slice().buffer;
-        }
         // `debug` is whether the worker may write to the real console as well
         // as relaying to the panel; see the console patch in wasm-worker.js.
         worker.postMessage(
-            { type: "parse", fileData: transfer, debug: traceToConsole },
+            { type: "parse", fileData: transfer, debug: traceToConsole, shard },
             [transfer]
         );
         trace("[GDS] worker.postMessage('parse') call returned");
     }
 
+    // Everything after the parse: the geometry goes to the GL side and the
+    // panels are rebuilt around it.
+    function uploadParse(workerMessage, slot) {
+        trace("[GDS] load succeeded, layer count:", workerMessage.layers.length);
+        modulePromise.then((Module) => {
+            // A load started before the module came up and found out it
+            // has no context: uploadLayers would no-op and the load
+            // would report success with nothing on screen.
+            if (glUnavailable) {
+                showFatalError(GL_UNAVAILABLE);
+                return;
+            }
+            // uploadLayers is the other place a big layout can run out of
+            // memory -- the parse fit in the worker, but this thread's
+            // module now has to hold the same geometry plus its VBOs. An
+            // unhandled throw here would leave the progress bar spinning
+            // forever, so surface it like any other load failure.
+            try {
+                Module.uploadLayers(workerMessage.layers, workerMessage.instanceGroups,
+                                    workerMessage.bbox, slot.index);
+            } catch (err) {
+                showFatalError(describeLoadFailure(err));
+                return;
+            }
+            clearFatalError();
+            // Put the camera and per-layer visibility back before the
+            // panel is rebuilt, so renderLayerList reflects the restored
+            // checkboxes rather than the fresh load's defaults.
+            if (slot.viewState) {
+                try {
+                    restoreViewState(Module, slot.viewState);
+                } catch (err) {
+                    fail("[GDS] could not restore view state:", err);
+                }
+                slot.viewState = null;
+            }
+            slot.loaded = true;
+            slot.hierarchy = workerMessage.hierarchy || null;
+            renderCompareFolder();
+            renderLayerList(Module.getLayers());
+            renderHierarchy();
+            applyPorts(Module, workerMessage.ports, workerMessage.hierarchy);
+            // There's a view to save from now on (see viewsFolder.hide()).
+            viewsFolder.show();
+            // uploadLayers drops the rulers -- they were anchored to the
+            // geometry this load just replaced.
+            refreshRulerRow(Module);
+            // The other slot may still be parsing: a comparison starts
+            // both layouts at once, and taking the progress overlay
+            // down on the first one to land would report a load that
+            // is only half done.
+            if (!anyLoadInFlight()) endProgress();
+            trace("[GDS] done, progress hidden");
+            hostElement.dispatchEvent(new CustomEvent("gds-load", {
+                detail: {
+                    slot: slot.id,
+                    layerCount: workerMessage.layers.length,
+                    cellCount: workerMessage.hierarchy ? workerMessage.hierarchy.cellCount : 0,
+                    portCount: workerMessage.hierarchy ? workerMessage.hierarchy.portCount || 0 : 0
+                }
+            }));
+            settleLoad("resolve", undefined, slot);
+        }, (err) => {
+            showFatalError(`WebAssembly module failed to load: ${err && err.message ? err.message : err}`);
+        });
+    }
 
     // Handed back to <gds-lens>: `viewer` is the surface (also given to the
     // host through connect), `adopt` moves this viewer into a different

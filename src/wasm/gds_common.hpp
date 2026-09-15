@@ -67,17 +67,61 @@ inline FileFormat detect_format(const char* path) {
     return FileFormat::Gds;
 }
 
+// Drops every polygon whose tag isn't in shape_tags, for the OASIS path --
+// read_oas has no filter argument of its own, unlike read_gds. Labels are left
+// alone either way: the filter selects *geometry*, and which worker keeps the
+// labels is decided above this (see parseGdsToLayers).
+inline void filter_shape_tags(gdstk::Library& lib, const gdstk::Set<gdstk::Tag>& shape_tags) {
+    for (uint64_t c = 0; c < lib.cell_array.count; c++) {
+        gdstk::Cell* cell = lib.cell_array[c];
+        gdstk::Array<gdstk::Polygon*>& polys = cell->polygon_array;
+        uint64_t kept = 0;
+        for (uint64_t i = 0; i < polys.count; i++) {
+            gdstk::Polygon* poly = polys[i];
+            if (shape_tags.has_value(poly->tag)) {
+                polys[kept++] = poly;
+            } else {
+                poly->clear();
+                gdstk::free_allocation(poly);
+            }
+        }
+        polys.count = kept;
+
+        gdstk::Array<gdstk::FlexPath*>& paths = cell->flexpath_array;
+        kept = 0;
+        for (uint64_t i = 0; i < paths.count; i++) {
+            gdstk::FlexPath* path = paths[i];
+            if (path->num_elements > 0 && shape_tags.has_value(path->elements[0].tag)) {
+                paths[kept++] = path;
+            } else {
+                path->clear();
+                gdstk::free_allocation(path);
+            }
+        }
+        paths.count = kept;
+    }
+}
+
 // Reads a GDSII or OASIS file into a Library, picking the reader by content.
 // unit/tolerance mean the same thing for both readers; the detected format is
 // reported through format_out so callers can word errors accordingly.
+//
+// shape_tags, when non-NULL, keeps only geometry on those layer/datatype pairs
+// -- the split one parse worker reads for (see parseGdsToLayers). read_gds
+// takes it directly; read_oas has no equivalent, so OASIS is filtered after
+// the fact. Either way the *records* are all still read, so this saves
+// retained memory rather than parse time.
 inline gdstk::Library read_layout(const char* path, double unit, double tolerance,
-                                  FileFormat* format_out, gdstk::ErrorCode* error_code) {
+                                  FileFormat* format_out, gdstk::ErrorCode* error_code,
+                                  const gdstk::Set<gdstk::Tag>* shape_tags = NULL) {
     FileFormat format = detect_format(path);
     if (format_out) *format_out = format;
     if (format == FileFormat::Oasis) {
-        return gdstk::read_oas(path, unit, tolerance, error_code);
+        gdstk::Library lib = gdstk::read_oas(path, unit, tolerance, error_code);
+        if (shape_tags) filter_shape_tags(lib, *shape_tags);
+        return lib;
     }
-    return gdstk::read_gds(path, unit, tolerance, NULL, error_code);
+    return gdstk::read_gds(path, unit, tolerance, shape_tags, error_code);
 }
 
 // Errors strictly below ChecksumError are warnings: gdstk still produced a

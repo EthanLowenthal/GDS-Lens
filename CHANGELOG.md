@@ -7,6 +7,37 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [Unreleased]
+
+### Added
+
+- **Split parse.** Loading a layout now spreads the work across several
+  Workers instead of one. Each runs its own copy of the wasm module over its
+  own copy of the file and reads only the layers it was assigned, so nothing
+  is shared and nothing is locked -- which is what lets this work without
+  `SharedArrayBuffer`, and so without asking the embedding page to be
+  cross-origin isolated.
+
+  Triangulation is most of a load's wall clock and is per-polygon work with no
+  dependencies, so this is where the time goes. Measured on one layout:
+  1.87 s in one Worker, 0.49 s across eight. A smaller one goes from 0.72 s
+  to 0.25 s. Layouts that already loaded quickly are unchanged.
+
+  How many Workers a layout gets is decided from its size. Every shard holds
+  its own copy of the file and its own parse's working set, so the count comes
+  *down* as the file grows, and past a few hundred megabytes a layout parses
+  in one Worker as it always has -- both because the memory is not there to
+  spend and because the speedup has flattened out by then anyway.
+
+  Nothing about this is visible in the API. The same frame is drawn either
+  way, down to the pixel, and overlapping layers now stack in layer order
+  rather than in whatever order the parse happened to emit them, so the same
+  file draws the same on every machine.
+
+  A `shards` attribute (or `?gdsShards=N`) overrides the count, `shards="1"`
+  turning the split off -- the setting to reach for if a layout ever loads
+  wrongly and the split parse is the suspect.
+
 ## [1.3.0] - 2026-09-14
 
 ### Added

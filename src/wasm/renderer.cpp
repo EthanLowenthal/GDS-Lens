@@ -29,6 +29,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -3172,8 +3173,13 @@ struct LabelSink {
     std::unordered_map<uint64_t, std::vector<CollectedLabel>> by_tag;
     uint64_t count = 0;
     bool capped = false;
+    // False on every parse shard but the one that owns labels: text isn't
+    // filtered by layer at read time, so each shard sees the whole design's
+    // labels and only one of them may keep them (see parseGdsToLayers).
+    bool enabled = true;
 
     void add(uint64_t tag, double x, double y, uint8_t anchor, const char* text) {
+        if (!enabled) return;
         // Empty text draws nothing -- dropping it here keeps it from creating
         // a layer entry (and a sidebar row) of its own.
         if (text == nullptr || text[0] == '\0') return;
@@ -4445,13 +4451,48 @@ UploadedGeometry upload_geometry(val entry) {
 // Reports progress via report_progress() as it goes; the caller (JS) is
 // expected to relay 'gdsProgress' postMessages to whatever's driving a
 // progress bar.
-val parseGdsToLayers(const std::string& path) {
+val parseGdsToLayers(const std::string& path, val options) {
     val result = val::object();
+
+    // Sharding options, all absent in the single-worker case: `tags` limits
+    // the geometry this call reads to those layer/datatype pairs (see the
+    // split-parse note on read_layout), and labels/hierarchy let the shards
+    // that aren't shard 0 skip the parts of the result that describe the whole
+    // design rather than a slice of it -- every shard reads the same records
+    // and would otherwise produce N identical copies of each.
+    Set<Tag> shard_tags = {};
+    bool sharded = false;
+    bool want_labels = true;
+    bool want_hierarchy = true;
+    bool release_file = false;
+    if (!options.isUndefined() && !options.isNull()) {
+        val tags = options["tags"];
+        if (!tags.isUndefined() && !tags.isNull()) {
+            sharded = true;
+            std::vector<double> packed = vecFromJSArray<double>(tags);
+            for (double value : packed) shard_tags.add((Tag)(uint64_t)value);
+        }
+        val labels_opt = options["labels"];
+        if (!labels_opt.isUndefined()) want_labels = labels_opt.as<bool>();
+        val hierarchy_opt = options["hierarchy"];
+        if (!hierarchy_opt.isUndefined()) want_hierarchy = hierarchy_opt.as<bool>();
+        val release_opt = options["releaseFile"];
+        if (!release_opt.isUndefined()) release_file = release_opt.as<bool>();
+    }
 
     report_progress("parsing", 0, 1);
     ErrorCode error_code = ErrorCode::NoError;
     gds_common::FileFormat format = gds_common::FileFormat::Gds;
-    Library lib = gds_common::read_layout(path.c_str(), 1e-6, 1e-2, &format, &error_code);
+    Library lib = gds_common::read_layout(path.c_str(), 1e-6, 1e-2, &format, &error_code,
+                                          sharded ? &shard_tags : NULL);
+    shard_tags.clear();
+    // The staged bytes are dead the moment the reader is done with them, and
+    // on a split parse every shard holds its own copy of the whole file (there
+    // is no shared memory between workers), so dropping it here is worth a
+    // sizeable fraction of peak footprint on a large layout. Off by default:
+    // the single-worker path leaves the caller's staging file where it found
+    // it, which is what every existing caller expects.
+    if (release_file) std::remove(path.c_str());
     report_progress("parsing", 1, 1);
 
     if (gds_common::is_fatal(error_code)) {
@@ -4488,10 +4529,14 @@ val parseGdsToLayers(const std::string& path) {
     // Ports gdsfactory/kfactory wrote into the file, if any: listed per cell in
     // the hierarchy and expanded to world space for the overlay. Positions in
     // the metadata are in database units; the geometry is in the library unit.
-    kfactory_ports::CellPorts cell_ports =
-        kfactory_ports::read(lib, lib.unit > 0.0 ? lib.precision / lib.unit : 1.0);
-    val hierarchy = build_hierarchy(lib, roots, cell_ports);
-    val ports_js = collect_world_ports(roots, cell_ports);
+    val hierarchy = val::array();
+    val ports_js = val::array();
+    if (want_hierarchy) {
+        kfactory_ports::CellPorts cell_ports =
+            kfactory_ports::read(lib, lib.unit > 0.0 ? lib.precision / lib.unit : 1.0);
+        hierarchy = build_hierarchy(lib, roots, cell_ports);
+        ports_js = collect_world_ports(roots, cell_ports);
+    }
 
     // Decide which cells are reused enough to GPU-instance, then split the
     // design into static geometry + one instance group per instanced cell.
@@ -4500,6 +4545,7 @@ val parseGdsToLayers(const std::string& path) {
     std::unordered_map<uint64_t, std::vector<Polygon*>> by_layer_static;
     std::unordered_map<Cell*, InstanceGroupPolys> groups;
     LabelSink labels;
+    labels.enabled = want_labels;
     uint64_t root_index = 0;
     for (Cell* root : roots) {
         collect_instanced(root, Affine2D{}, instanced, by_layer_static, groups, labels);
@@ -4637,6 +4683,15 @@ val parseGdsToLayers(const std::string& path) {
         }
         group_job_cursor = gr.second;
 
+        // A group with nothing to draw: the cell is placed often enough to be
+        // instanced, but none of the layers this call read has geometry in it.
+        // On an unsplit parse that means a cell with no geometry at all; on a
+        // shard it means the cell's geometry belongs to a different shard, and
+        // every shard would otherwise emit the same group with the same
+        // per-instance transforms and no layers to use them -- one full copy
+        // of the instance data per shard, uploaded to draw nothing.
+        if (group_layers["length"].as<unsigned>() == 0) continue;
+
         uint64_t instance_count = group.instances.size();
         total_polygons += unit_polygon_count_sum * instance_count;
 
@@ -4706,6 +4761,14 @@ val parseGdsToLayers(const std::string& path) {
     result.set("hierarchy", hierarchy);
     result.set("ports", ports_js);
     result.set("bbox", bbox);
+    // Whether the box above is a real one. Reported alongside rather than
+    // folded into it, so the box keeps the plain four-number shape every
+    // caller (and every cell's box in the hierarchy) already has. A shard of a
+    // split parse whose layers turned out to hold nothing reports the zero box
+    // like any empty layout, and merging that into the other shards' boxes
+    // would drag the design's framing out to include a point no geometry
+    // occupies -- see unionBbox in viewer.js.
+    result.set("hasGeometry", have_bbox);
     result.set("totalPolygons", total_polygons);
     result.set("totalLabels", labels.count);
     result.set("labelsCapped", labels.capped);
