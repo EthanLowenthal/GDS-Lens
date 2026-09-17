@@ -7,7 +7,7 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
-## [Unreleased]
+## [1.4.0] - 2026-09-17
 
 ### Added
 
@@ -641,7 +641,9 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.0.2...v1.0.3
