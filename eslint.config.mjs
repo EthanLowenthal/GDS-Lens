@@ -90,7 +90,8 @@ export default [
             "test/host-contract.test.js", "test/viewer-ui.test.js",
             "test/compare-slots.test.js", "test/parse-split.test.js",
             "test/esm-bundle.test.js", "test/react.test.js",
-            "scripts/check-site.mjs", "scripts/make-og-image.mjs"],
+            "scripts/check-site.mjs", "scripts/make-og-image.mjs",
+            "scripts/bench-render.mjs"],
         languageOptions: {
             globals: { ...globals.node, ...globals.browser },
             ecmaVersion: 2022,
