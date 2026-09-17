@@ -58,6 +58,81 @@ version. Before that, `0.x` releases changed it freely.
   turning the split off -- the setting to reach for if a layout ever loads
   wrongly and the split parse is the suspect.
 
+### Changed
+
+- **Which cells are GPU-instanced is now decided on what instancing saves,
+  not on how often a cell is placed.** A cell used to be instanced once it
+  appeared eight times anywhere in the design. That is the wrong question: the
+  memory instancing saves is the geometry of the copies it avoids flattening,
+  and it is paid for with a draw call per (cell, layer) in every frame for as
+  long as the layout is open. A cell of twenty rectangles placed a dozen times
+  saves a few kilobytes and costs that draw call forever.
+
+  Generated layouts are made of thousands of such cells, so the old rule put
+  tens of thousands of draw calls in every frame. A synthetic test chip of
+  8,000 distinct cells over six layers, 2.5 million polygons in 33 MB, drew at
+  108 ms a frame -- and drew at the same 108 ms zoomed in on a corner of it,
+  because nothing about the cost depended on what was on screen.
+
+  A cell is now instanced when the geometry its extra copies would add comes
+  to at least ~10 MB, subject to a ~600 MB ceiling on how much flattening the
+  design as a whole may add, spent first on the cells that save the most. Both
+  are counted in polygon points rather than polygons, because that is what the
+  memory is proportional to and a via and a waveguide curve differ by two
+  orders of magnitude. A cell placed a hundred thousand times still instances;
+  a thousand cells placed twelve times each now flatten. The same test chip
+  draws in under 1 ms and loads in 1.27 s rather than 4.35 s, and a cell placed
+  5,000 times still instances and still loads a 500-million-polygon hierarchy
+  from a 6 MB file.
+
+- **Per-layer and per-batch attribute setup is baked into vertex array objects
+  at upload time** instead of being re-issued on every draw of every frame.
+  The same test chip went from 960,186 WebGL calls a frame to 144,000, of
+  which 48,000 were the draws themselves. On its own this was worth about 6%,
+  since the driver's cost is in the draw call rather than the setup around it,
+  but it is what makes the remaining draw calls cheap.
+
+  Fills and outlines are now drawn in two passes per layer rather than
+  interleaved per batch, which is what lets the uniforms that differ between
+  them be set twice per layer instead of twice per batch. One consequence is
+  visible: a reused cell's outline is no longer drawn under the next cell's
+  fill.
+
+- **The debug readout counts the frame's draw calls** where it used to say
+  `no culling`. It is the number to read first on a slow frame, because it
+  separates the two reasons a frame is slow: tens of thousands of draw calls
+  means the frame time is the calls, and a few hundred means it is the
+  geometry, which is a different problem.
+
+- **Panning and zooming a very large layout reprojects the last render instead
+  of redrawing the geometry.** The layer pass costs what the geometry costs
+  whatever moved, so a camera that moves every frame used to pay it every
+  frame: a test chip of 127 million polygons measured 606 ms a frame, and a
+  drag is sixty of those a second. The geometry is not what changed, though,
+  only the camera. The layers are now rendered once into an offscreen texture
+  covering half a viewport more than the canvas in each direction, and while
+  the gesture lasts each frame maps that texture through the new camera. The
+  same drag runs at the display's refresh rate, 8.4 ms a frame, with one real
+  render once the camera stops.
+
+  What this does not do is make the layout render any faster. It makes the
+  wait land once, at the end of a gesture, instead of on every frame of it.
+
+  Only the layers go through it. The grid under them and the labels, ports,
+  markers, rulers and highlights over them are redrawn every frame at full
+  sharpness: they cost almost nothing, and they are the parts a stale pixel
+  would actually mislead about. The frame the view settles on is bit-identical
+  to the one drawn without any of this -- verified pixel for pixel across a
+  1200x800 canvas -- so nothing is approximated once you stop moving. During a
+  fast drag the area beyond what was rendered is empty until the redraw
+  catches up, rather than being smeared out of the texture's edge.
+
+  It engages only above five million polygons in the layer pass, so layouts
+  that were never slow are drawn exactly as before, with no texture copy and
+  no staleness. Merge mode and the difference highlight are excluded: both
+  rasterize per layer into the coverage mask at the canvas resolution, which
+  does not survive being rendered at a larger extent and reprojected.
+
 ## [1.3.0] - 2026-09-14
 
 ### Added

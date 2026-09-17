@@ -146,6 +146,15 @@ test("shard count is bounded by memory, not just by cores", () => {
 // Mirrors what wasm-worker.js does for one shard: stage the bytes, parse with
 // the shard's options, and hand back what it would have posted.
 function parseShard(Module, bytes, options) {
+    // Instancing is decided on how many polygons a cell's copies would add if
+    // flattened, and these fixtures are a few rectangles -- far under the
+    // threshold, so nothing in them would be instanced at the real setting.
+    // These tests are about sharding rather than about that decision, and a
+    // fixture large enough to cross the threshold on its own merits would be
+    // hundreds of kilobytes of repository, so the threshold is pinned to 0
+    // instead: every cell placed often enough is instanced, which is what the
+    // fixtures were built for.
+    Module.setInstanceThreshold(0);
     Module.FS.writeFile("/input.layout", bytes);
     const result = Module.parseGdsToLayers("/input.layout", options);
     if (!options || !options.releaseFile) Module.FS.unlink("/input.layout");

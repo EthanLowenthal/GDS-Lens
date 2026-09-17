@@ -116,6 +116,45 @@ inline const char* const kCompositeVertexShaderSrc =
     "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
     "}";
 
+// Reprojects the cached layer render (see draw_frame's cache path) under the
+// camera the current frame is being drawn with. The cache holds the layers as
+// they looked at some earlier camera, rendered over a region larger than the
+// viewport; this maps each canvas pixel back through the current camera into
+// world space and forward through the cache's camera into the texture, so a
+// pan slides the image and a zoom scales it, exactly as re-rendering would --
+// only without the geometry.
+//
+// Anything the cache does not cover comes out transparent rather than clamped,
+// because the clamp would smear the texture's edge row across the uncovered
+// band, which reads as real geometry. Transparent leaves the background there
+// until the full redraw that follows the gesture fills it in.
+inline const char* const kCacheFragmentShaderSrc =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "uniform sampler2D u_cache;\n"
+    "uniform vec2 u_resolution;\n"
+    "uniform vec2 u_offset;\n"
+    "uniform float u_zoom;\n"
+    "uniform vec2 u_cacheResolution;\n"
+    "uniform vec2 u_cacheOffset;\n"
+    "uniform float u_cacheZoom;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    // Canvas pixel -> world, through the camera this frame is drawing with.
+    // The halves are the same centering kVertexShaderSrc's clipSpace does.
+    "    vec2 centered = gl_FragCoord.xy - u_resolution * 0.5;\n"
+    "    vec2 world = u_offset + centered / u_zoom;\n"
+    // World -> the cache texture's own pixels, through the camera it was
+    // rendered with.
+    "    vec2 cachePx = (world - u_cacheOffset) * u_cacheZoom + u_cacheResolution * 0.5;\n"
+    "    vec2 uv = cachePx / u_cacheResolution;\n"
+    "    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {\n"
+    "        fragColor = vec4(0.0);\n"
+    "        return;\n"
+    "    }\n"
+    "    fragColor = texture(u_cache, uv);\n"
+    "}";
+
 // Merge mode's composite pass: reads the layer's coverage mask and paints the
 // union boundary in the layer's frame color and the interior with the same
 // screen-space hatch patterns the normal fill path uses (duplicated from

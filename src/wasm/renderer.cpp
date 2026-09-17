@@ -114,6 +114,14 @@ struct PolygonRange {
 // (col0.xy, col1.xy, translate.xy) per instance, bound with
 // glVertexAttribDivisor so it advances once per instance.
 struct InstancedBatch {
+    // The attribute setup for the two draws below, baked once at upload time
+    // (see make_vao): the unit shape's position attribute plus the three
+    // per-instance affine attributes and their divisors, which are the same
+    // every frame and used to be re-issued every frame. Binding one of these
+    // is ~20 WebGL calls that are no longer made per batch per frame, and a
+    // real chip has tens of thousands of batches.
+    GLuint fill_vao = 0;
+    GLuint outline_vao = 0;
     GLuint fill_vbo = 0;
     GLsizei fill_vertex_count = 0;
     GLuint outline_vbo = 0;
@@ -171,6 +179,10 @@ struct LayerBuffer {
     // gdstk's 64-bit Tag, the key used by g_lyp_info and every by-tag bucket.
     uint32_t datatype = 0;
     uint64_t tag() const { return make_tag(layer, datatype); }
+    // As InstancedBatch's, minus the per-instance attributes: this geometry
+    // is drawn once, not per placement.
+    GLuint fill_vao = 0;
+    GLuint outline_vao = 0;
     GLuint outline_vbo = 0;
     GLuint fill_vbo = 0;
     // Index buffer over outline_vbo, holding every polygon's boundary as
@@ -319,6 +331,89 @@ GLuint g_mask_tex = 0;
 // GL_MAX_TEXTURE_SIZE (AA off, but never blank).
 int g_mask_scale = 2;
 
+// ---- Cached layer render (see draw_frame) ----------------------------------
+// A full chip's layer pass costs what its geometry costs no matter what moved,
+// so a camera that moves every frame pays it every frame: 128 million polygons
+// measured over 600ms a frame on a fast GPU, and a drag is 60 of those a
+// second. The geometry is not what changed, though -- only the camera is -- so
+// the layer pass is rendered once into this texture and reprojected under the
+// new camera while the gesture lasts (see kCacheFragmentShaderSrc), with one
+// real render once it stops.
+//
+// Only the layers go in here. The grid under them and the labels, ports,
+// markers, rulers and highlights over them are redrawn every frame at full
+// sharpness: they cost almost nothing, they are the parts a stale pixel would
+// actually mislead about, and the ruler especially has to track the cursor
+// exactly.
+GLuint g_cache_fbo = 0;
+GLuint g_cache_tex = 0;
+GLuint g_cache_program = 0;
+GLint g_cache_loc_resolution = -1;
+GLint g_cache_loc_offset = -1;
+GLint g_cache_loc_zoom = -1;
+GLint g_cache_loc_cache_resolution = -1;
+GLint g_cache_loc_cache_offset = -1;
+GLint g_cache_loc_cache_zoom = -1;
+// Rendered larger than the canvas in each dimension, so a drag has somewhere
+// to go before it reaches the edge of what was rendered. 1.5 is half a
+// viewport of free travel in every direction for 2.25x the texels.
+constexpr float kCacheMargin = 1.5f;
+int g_cache_width = 0;
+int g_cache_height = 0;
+uint64_t g_cache_tex_bytes = 0;
+// The camera the cache was rendered with, which is what the reprojection maps
+// out of.
+bool g_cache_filled = false;
+float g_cache_zoom = 1.0f;
+float g_cache_pan_x = 0.0f;
+float g_cache_pan_y = 0.0f;
+// Appearance the cache was rendered under. Compared per frame rather than
+// hooked into every setter, so a toggle that changes what a layer looks like
+// cannot leave a stale image behind by being forgotten here.
+bool g_cache_infill = false;
+// Bumped where geometry, visibility or colour changes -- the things there is
+// no single value to compare.
+uint64_t g_layer_epoch = 0;
+uint64_t g_cache_epoch = 0;
+// Set while the on-screen image is a reprojection rather than a real render,
+// so draw_frame knows to keep asking for frames until the camera settles.
+bool g_cache_stale = false;
+double g_cache_stale_since_ms = 0.0;
+// How long the camera must hold still before the cache is re-rendered. Long
+// enough not to fire mid-gesture between two mouse moves, short enough that
+// letting go feels like it sharpened immediately.
+constexpr double kCacheSettleMs = 90.0;
+// Below this many polygons in the layer pass the cache is not used at all: it
+// would add a texture copy and a frame of staleness to a layout that was never
+// slow.
+//
+// Deliberately not gated on frame time, which is the obvious choice and is
+// wrong: the cache makes frames fast, a frame-time gate then switches it off,
+// the frames go slow again, and the gate oscillates at whatever period the
+// averaging gives it. The polygon count of the last real render measures the
+// work the layer pass would have to do, and reprojecting does not change it.
+// It is a rough stand-in for cost -- a polygon can be a rectangle or a
+// thousand-point curve -- but it only has to be right about the order of
+// magnitude, and it never feeds back on itself.
+constexpr uint64_t kCacheMinPolygons = 5'000'000;
+
+// The live value, so a test can force the cache off (or on) and compare the
+// frame against the one the geometry draws directly -- see setCacheMinPolygons.
+uint64_t g_cache_min_polygons = kCacheMinPolygons;
+
+// The camera the previous frame drew with, which is how a frame tells a moving
+// gesture from one that has stopped.
+float g_prev_frame_zoom = -1.0f;
+float g_prev_frame_pan_x = 0.0f;
+float g_prev_frame_pan_y = 0.0f;
+// What the last real render drew, so the debug readout keeps reporting the
+// layers rather than going to zero for every reprojected frame.
+uint64_t g_cache_stat_polygons = 0;
+int g_cache_stat_layers = 0;
+uint64_t g_cache_stat_draws = 0;
+
+void invalidate_frame_cache() { g_layer_epoch++; }
+
 // ---- Pick pass (see pick_snap_at) ------------------------------------------
 // Nothing about the geometry survives on the CPU after uploadLayers -- only
 // VBOs -- so the ruler's "what is near this point" question is answered by
@@ -419,6 +514,10 @@ constexpr int kSlotCount = 2;
 // the slider is a clean single-layout view and the middle is the overlay. A
 // slot at 0 is skipped before any GL call rather than drawn transparent.
 float g_slot_alpha[kSlotCount] = {1.0f, 1.0f};
+// The crossfade the layer cache was rendered at (see g_cache_infill) -- here
+// rather than with the other g_cache_* fields because kSlotCount is declared
+// with the slots.
+float g_cache_slot_alpha[kSlotCount] = {1.0f, 1.0f};
 
 // Optional per-slot hue, off by default. Two revisions of one design are the
 // same colors in the same places, so at a 50/50 blend they look like one
@@ -897,6 +996,32 @@ bool init_gl() {
     glUseProgram(g_comp_program);
     glUniform1i(glGetUniformLocation(g_comp_program, "u_mask"), 0);
 
+    // Reprojects the cached layer render under a moved camera (see the
+    // g_cache_* declarations). Its storage is allocated in resize_canvas,
+    // since it is sized from the canvas.
+    g_cache_program = link_program(shaders::kCompositeVertexShaderSrc, shaders::kCacheFragmentShaderSrc);
+    g_cache_loc_resolution = glGetUniformLocation(g_cache_program, "u_resolution");
+    g_cache_loc_offset = glGetUniformLocation(g_cache_program, "u_offset");
+    g_cache_loc_zoom = glGetUniformLocation(g_cache_program, "u_zoom");
+    g_cache_loc_cache_resolution = glGetUniformLocation(g_cache_program, "u_cacheResolution");
+    g_cache_loc_cache_offset = glGetUniformLocation(g_cache_program, "u_cacheOffset");
+    g_cache_loc_cache_zoom = glGetUniformLocation(g_cache_program, "u_cacheZoom");
+    glUseProgram(g_cache_program);
+    glUniform1i(glGetUniformLocation(g_cache_program, "u_cache"), 0);
+
+    glGenTextures(1, &g_cache_tex);
+    glBindTexture(GL_TEXTURE_2D, g_cache_tex);
+    // LINEAR: a reprojection almost never lands on texel centres, and the
+    // alternative is the image crawling as it is dragged.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &g_cache_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_cache_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_cache_tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
     g_diff_program = link_program(shaders::kCompositeVertexShaderSrc, shaders::kDiffFragmentShaderSrc);
     g_diff_loc_mask_scale = glGetUniformLocation(g_diff_program, "u_maskScale");
     g_diff_loc_color_a = glGetUniformLocation(g_diff_program, "u_colorA");
@@ -1073,6 +1198,7 @@ void apply_layer_colors(LayerBuffer& layer) {
 }
 
 void apply_lyp_to_layers() {
+    invalidate_frame_cache();
     for (LayerBuffer& layer : g_layers) apply_layer_colors(layer);
     // A .lyp can hide layers, and the label buffer only holds visible ones.
     g_text_dirty = true;
@@ -1742,11 +1868,16 @@ struct ViewRect {
 // hatch spacing so screen-space fill patterns (computed from gl_FragCoord,
 // not world position) don't visibly pop at the edge of the view as a
 // polygon crosses the cull boundary.
-ViewRect current_view_rect() {
-    float half_w = (float)g_canvas_width * 0.5f / g_zoom + kHatchSpacingPx;
-    float half_h = (float)g_canvas_height * 0.5f / g_zoom + kHatchSpacingPx;
+// The world rectangle a `width` x `height` pixel render at the current camera
+// covers. The canvas is the usual one; the layer cache is rendered over a
+// larger extent than the canvas and has to cull against that instead.
+ViewRect view_rect_for(int width, int height) {
+    float half_w = (float)width * 0.5f / g_zoom + kHatchSpacingPx;
+    float half_h = (float)height * 0.5f / g_zoom + kHatchSpacingPx;
     return {g_pan_x - half_w, g_pan_x + half_w, g_pan_y - half_h, g_pan_y + half_h};
 }
+
+ViewRect current_view_rect() { return view_rect_for(g_canvas_width, g_canvas_height); }
 
 bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, const ViewRect& view) {
     return min_x <= view.max_x && max_x >= view.min_x && min_y <= view.max_y && max_y >= view.min_y;
@@ -1756,10 +1887,19 @@ bool bbox_intersects_view(float min_x, float max_x, float min_y, float max_y, co
 // inside #ui, see uploadLayers). layers_drawn/layers_total count only the
 // layer-level visibility/bbox skip in draw_frame -- there's no per-polygon
 // culling anymore, so every drawn layer's polygons are all visible.
-void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers_total) {
-    char buf[448];
-    int len = snprintf(buf, sizeof(buf), "Visible: %llu / %llu polygons<br>Render: no culling (%d / %d layers on screen)",
-             (unsigned long long)visible_polygons, (unsigned long long)g_total_polygons, layers_drawn, layers_total);
+void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers_total,
+                         uint64_t draw_calls) {
+    char buf[512];
+    // Draw calls are the number to read first on a slow frame. Geometry costs
+    // what it costs, but the calls are a choice: a layer draws in two, and
+    // every GPU-instanced cell adds one per layer it touches (see
+    // kInstanceThreshold). Tens of thousands here and the frame time is the
+    // calls; a few hundred here and a slow frame is the geometry itself, which
+    // is a different problem with a different fix.
+    int len = snprintf(buf, sizeof(buf),
+             "Visible: %llu / %llu polygons<br>Render: %llu draw calls (%d / %d layers on screen)",
+             (unsigned long long)visible_polygons, (unsigned long long)g_total_polygons,
+             (unsigned long long)draw_calls, layers_drawn, layers_total);
     if (g_total_labels > 0 && len > 0 && (size_t)len < sizeof(buf)) {
         len += snprintf(buf + len, sizeof(buf) - (size_t)len, "<br>Labels: %llu / %llu drawn",
                         (unsigned long long)(g_show_text ? g_labels_drawn : 0),
@@ -1773,9 +1913,10 @@ void update_render_stats(uint64_t visible_polygons, int layers_drawn, int layers
     if (len > 0 && (size_t)len < sizeof(buf)) {
         const double mb = 1024.0 * 1024.0;
         len += snprintf(buf + len, sizeof(buf) - (size_t)len,
-                        "<br>GPU: %.1f MB (geom %.1f + mask %.1f)",
-                        (double)(g_gpu_buffer_bytes + g_mask_tex_bytes) / mb, (double)g_gpu_buffer_bytes / mb,
-                        (double)g_mask_tex_bytes / mb);
+                        "<br>GPU: %.1f MB (geom %.1f + mask %.1f + cache %.1f)",
+                        (double)(g_gpu_buffer_bytes + g_mask_tex_bytes + g_cache_tex_bytes) / mb,
+                        (double)g_gpu_buffer_bytes / mb, (double)g_mask_tex_bytes / mb,
+                        (double)g_cache_tex_bytes / mb);
     }
     // Frame time is only measured across back-to-back frames (see
     // draw_frame); before any interaction there's nothing meaningful to show.
@@ -2055,10 +2196,8 @@ void clamp_pan() {
 }
 
 // Points the three per-instance affine attributes at an InstancedBatch's
-// instance VBO with a per-instance divisor / reverts them to the disabled
-// (generic identity) state -- shared by draw_frame's normal path and
-// draw_layer_merged's mask pass, which draw the same batches under different
-// programs (the attribute indices are fixed at link time, see link_program).
+// instance VBO with a per-instance divisor. Called once per batch at upload
+// time, from make_vao, which is what records it -- never per frame.
 void enable_instance_attribs(GLuint instance_vbo) {
     const GLsizei stride = kInstanceStrideFloats * (GLsizei)sizeof(float);
     glBindBuffer(GL_ARRAY_BUFFER, instance_vbo);
@@ -2073,10 +2212,32 @@ void enable_instance_attribs(GLuint instance_vbo) {
     glVertexAttribDivisor(g_loc_i_translate, 1);
 }
 
-void disable_instance_attribs() {
-    glDisableVertexAttribArray(g_loc_i_col0);
-    glDisableVertexAttribArray(g_loc_i_col1);
-    glDisableVertexAttribArray(g_loc_i_translate);
+
+// Bakes one draw's whole attribute setup into a vertex array object, once, at
+// upload time -- position from position_vbo, the per-instance affine from
+// instance_vbo when there is one, and the element buffer, since the
+// ELEMENT_ARRAY binding is VAO state (the ARRAY binding is not; it is captured
+// by glVertexAttribPointer instead).
+//
+// This is the difference between ~20 WebGL calls per batch per frame and two.
+// Every program here binds the same attribute indices explicitly at link time
+// (see link_program), so one VAO is valid under all of them -- the normal
+// layer program, merge mode's mask program and the pick program alike.
+GLuint make_vao(GLuint position_vbo, GLuint ebo, GLuint instance_vbo) {
+    if (!position_vbo) return 0;
+    GLuint vao = 0;
+    glGenVertexArrays(1, &vao);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, position_vbo);
+    glEnableVertexAttribArray(g_loc_position);
+    glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    if (instance_vbo) enable_instance_attribs(instance_vbo);
+    if (ebo) glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    // Back to the shared one, which every draw that isn't a layer still uses
+    // and which leaves the instance attributes disabled at their generic
+    // identity values (see init_gl).
+    glBindVertexArray(g_vao);
+    return vao;
 }
 
 // ---- Pick pass --------------------------------------------------------------
@@ -2155,19 +2316,17 @@ constexpr float kSnapRadiusPx = 12.0f;
 // program is bound -- as GL_LINES through the edge index buffer, or as
 // GL_POINTS over the raw vertices.
 void draw_layer_outline(const LayerBuffer& layer, GLenum primitive) {
-    auto draw = [&](GLuint vbo, GLuint ebo, GLsizei index_count, GLsizei vertex_count,
-                    GLsizei instances) {
-        if (!vbo) return;
-        if (primitive == GL_POINTS ? vertex_count == 0 : ebo == 0) return;
-        glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glEnableVertexAttribArray(g_loc_position);
-        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    // The outline VAO serves both primitives: the element buffer it carries is
+    // simply unused by the GL_POINTS draw, which walks the vertices instead.
+    auto draw = [&](GLuint vao, GLsizei index_count, GLsizei vertex_count, GLsizei instances) {
+        if (!vao) return;
+        if (primitive == GL_POINTS ? vertex_count == 0 : index_count == 0) return;
+        glBindVertexArray(vao);
         if (primitive == GL_POINTS) {
             if (instances > 0) glDrawArraysInstanced(GL_POINTS, 0, vertex_count, instances);
             else glDrawArrays(GL_POINTS, 0, vertex_count);
             return;
         }
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
         if (instances > 0) {
             glDrawElementsInstanced(GL_LINES, index_count, GL_UNSIGNED_INT, 0, instances);
         } else {
@@ -2175,13 +2334,12 @@ void draw_layer_outline(const LayerBuffer& layer, GLenum primitive) {
         }
     };
 
-    draw(layer.outline_vbo, layer.outline_ebo, layer.outline_index_count, layer.outline_vertex_count, 0);
+    draw(layer.outline_vao, layer.outline_index_count, layer.outline_vertex_count, 0);
     for (const InstancedBatch& batch : layer.instanced_batches) {
-        enable_instance_attribs(batch.instance_vbo);
-        draw(batch.outline_vbo, batch.outline_ebo, batch.outline_index_count,
-             batch.outline_vertex_count, batch.instance_count);
-        disable_instance_attribs();
+        draw(batch.outline_vao, batch.outline_index_count, batch.outline_vertex_count,
+             batch.instance_count);
     }
+    glBindVertexArray(g_vao);
 }
 
 // Nearest snappable point to a screen position, in world coordinates. False
@@ -2392,37 +2550,27 @@ bool layer_has_geometry(const LayerBuffer& layer) {
 // nothing, and the outer edge gains at most half a mask texel (a quarter of a
 // canvas pixel at the default scale). It also picks up the polygons too large
 // to triangulate, which used to be missing from merged layers altogether.
+// Leaves a layer VAO bound: both callers finish with a fullscreen pass that
+// needs the shared one, and rebind it themselves.
 void draw_layer_coverage(const LayerBuffer& layer) {
-    if (layer.fill_vbo) {
-        glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
-        glEnableVertexAttribArray(g_loc_position);
-        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    if (layer.fill_vao) {
+        glBindVertexArray(layer.fill_vao);
         glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
     }
-    if (layer.outline_ebo) {
-        glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
-        glEnableVertexAttribArray(g_loc_position);
-        glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
+    if (layer.outline_vao && layer.outline_index_count) {
+        glBindVertexArray(layer.outline_vao);
         glDrawElements(GL_LINES, layer.outline_index_count, GL_UNSIGNED_INT, 0);
     }
     for (const InstancedBatch& batch : layer.instanced_batches) {
-        if (!batch.fill_vbo && !batch.outline_ebo) continue;
-        enable_instance_attribs(batch.instance_vbo);
-        glEnableVertexAttribArray(g_loc_position);
-        if (batch.fill_vbo) {
-            glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
-            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        if (batch.fill_vao) {
+            glBindVertexArray(batch.fill_vao);
             glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
         }
-        if (batch.outline_ebo) {
-            glBindBuffer(GL_ARRAY_BUFFER, batch.outline_vbo);
-            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
+        if (batch.outline_vao && batch.outline_index_count) {
+            glBindVertexArray(batch.outline_vao);
             glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
                                     batch.instance_count);
         }
-        disable_instance_attribs();
     }
 }
 
@@ -2464,7 +2612,9 @@ void draw_layer_merged(const LayerBuffer& layer) {
     glBindTexture(GL_TEXTURE_2D, g_mask_tex);
     // The fullscreen triangle comes from gl_VertexID; a_position must not be
     // an enabled array here or GL would read (and bounds-check) whatever
-    // buffer the mask pass left bound.
+    // buffer the mask pass left bound. Back on the shared VAO first, so the
+    // disable lands there rather than in a layer's baked setup.
+    glBindVertexArray(g_vao);
     glDisableVertexAttribArray(g_loc_position);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glUseProgram(g_program);
@@ -2550,7 +2700,9 @@ void draw_diff_highlight() {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_mask_tex);
         // Same reason as the merge composite: the fullscreen triangle comes
-        // from gl_VertexID, so a_position must not be an enabled array here.
+        // from gl_VertexID, so a_position must not be an enabled array here,
+        // and the shared VAO is the one it may be disabled in.
+        glBindVertexArray(g_vao);
         glDisableVertexAttribArray(g_loc_position);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         drew = true;
@@ -2729,6 +2881,164 @@ void draw_goto_flash(double now_ms) {
     glDrawArrays(GL_LINES, 0, (GLsizei)(verts.size() / 2));
 }
 
+// The layer pass: every visible layer's geometry, and nothing else. Split out
+// of draw_frame because it has two possible targets -- the canvas, and the
+// offscreen cache the reprojection path reads (see the g_cache_* declarations)
+// -- which differ only in the resolution uniform and the bound framebuffer,
+// both of which the caller sets.
+void draw_layers(const ViewRect& view, uint64_t* out_polygons, int* out_layers_drawn,
+                 uint64_t* out_draw_calls) {
+    // No per-polygon or per-tile culling: every on-screen layer draws in
+    // exactly one glDrawArrays (fill) + one glDrawElements (outline) call,
+    // full stop. An earlier version tried to fall back to a per-polygon
+    // culled draw loop when a layer was only partially on screen (i.e. most
+    // zoom levels between "fit to window" and "zoomed in on a small area"),
+    // but that fallback issued one draw call per remaining visible polygon
+    // and was the actual bottleneck -- worse than just drawing everything
+    // unconditionally. The only skip left is the layer-level bbox check
+    // below, which is O(number of layers), not O(number of polygons).
+    for (const LayerBuffer& layer : g_layers) {
+        if (!layer.visible) continue;
+        // A slot crossfaded fully out draws nothing at all, rather than
+        // drawing everything at zero alpha: at either end of the blend slider
+        // this is exactly the cost of viewing that layout on its own.
+        if (g_slot_alpha[layer.source] <= 0.0f) continue;
+        if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
+
+        const std::array<float, 4> fill_color = slot_color(layer, layer.fill_color);
+        const std::array<float, 4> frame_color = slot_color(layer, layer.frame_color);
+
+        (*out_layers_drawn)++;
+        (*out_polygons) += layer.polygon_count;
+
+        if (g_merge_mode) {
+            draw_layer_merged(layer);
+            // The mask pass draws the same geometry draw_layer_coverage would,
+            // plus one fullscreen composite.
+            (*out_draw_calls) += 1 + (layer.fill_vao ? 1 : 0) +
+                                (layer.outline_vao && layer.outline_index_count ? 1 : 0);
+            for (const InstancedBatch& batch : layer.instanced_batches) {
+                (*out_draw_calls) += (batch.fill_vao ? 1 : 0) +
+                                    (batch.outline_vao && batch.outline_index_count ? 1 : 0);
+            }
+            continue;
+        }
+
+        // Every fill on the layer, then every outline -- rather than fill and
+        // outline together per batch, which is how this used to run. The
+        // uniforms below differ only between the two kinds of draw, so this
+        // orders them into two settings per layer instead of two per batch,
+        // and a chip's worth of batches made that the bulk of the frame. It
+        // also stops one batch's outline being buried under the next batch's
+        // fill.
+        //
+        // Reused cells draw from the same loop as the layer's own geometry:
+        // one unique unit shape drawn instance_count times, each placed by a
+        // per-instance 2x3 affine (see a_iCol0/a_iCol1/a_iTranslate in
+        // kVertexShaderSrc). Pointing the attributes at that affine buffer is
+        // part of the batch's VAO, so binding it is the whole setup.
+        if (g_show_infill) {
+            glUniform4fv(g_loc_color, 1, fill_color.data());
+            glUniform1f(g_loc_use_hatch, 1.0f);
+            glUniform1f(g_loc_pattern_type, layer.pattern_type);
+            glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
+            glUniform1f(g_loc_hatch_spacing, kHatchSpacingPx);
+            glUniform1f(g_loc_hatch_width, kHatchHalfWidthPx);
+            if (layer.fill_vao) {
+                // Fill vertices are triangles laid back-to-back with no
+                // loop-closing constraint, so the whole layer draws correctly
+                // in one shot -- no indices needed.
+                glBindVertexArray(layer.fill_vao);
+                glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
+                (*out_draw_calls)++;
+            }
+            for (const InstancedBatch& batch : layer.instanced_batches) {
+                if (!batch.fill_vao) continue;
+                glBindVertexArray(batch.fill_vao);
+                glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
+                (*out_draw_calls)++;
+            }
+        }
+
+        glUniform4fv(g_loc_color, 1, frame_color.data());
+        glUniform1f(g_loc_use_hatch, 0.0f);
+        if (layer.outline_vao && layer.outline_index_count) {
+            // outline_ebo holds every polygon's boundary as explicit edge
+            // pairs (see upload_geometry), so this one glDrawElements call
+            // draws every outline polygon on the layer. Each edge is its own
+            // independent primitive, so unrelated polygons can't get
+            // connected and no restart markers are needed.
+            glBindVertexArray(layer.outline_vao);
+            glDrawElements(GL_LINES, layer.outline_index_count, GL_UNSIGNED_INT, 0);
+            (*out_draw_calls)++;
+        }
+        for (const InstancedBatch& batch : layer.instanced_batches) {
+            if (!batch.outline_vao || !batch.outline_index_count) continue;
+            glBindVertexArray(batch.outline_vao);
+            glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
+                                    batch.instance_count);
+            (*out_draw_calls)++;
+        }
+    }
+}
+
+
+// Renders the layer pass into the cache texture at the current camera, over a
+// region kCacheMargin times the canvas in each dimension so a drag has
+// somewhere to go before it runs off the edge of what was rendered.
+void render_layer_cache(uint64_t* polys, int* layers, uint64_t* draws) {
+    glBindFramebuffer(GL_FRAMEBUFFER, g_cache_fbo);
+    glViewport(0, 0, g_cache_width, g_cache_height);
+    // Transparent, not the background colour: the grid is drawn under this on
+    // the canvas and has to show through wherever no layer covers.
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glUseProgram(g_program);
+    glUniform2f(g_loc_resolution, (float)g_cache_width, (float)g_cache_height);
+    glUniform2f(g_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_loc_zoom, g_zoom);
+    draw_layers(view_rect_for(g_cache_width, g_cache_height), polys, layers, draws);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g_canvas_width, g_canvas_height);
+
+    g_cache_filled = true;
+    g_cache_zoom = g_zoom;
+    g_cache_pan_x = g_pan_x;
+    g_cache_pan_y = g_pan_y;
+    g_cache_epoch = g_layer_epoch;
+    g_cache_infill = g_show_infill;
+    for (int i = 0; i < kSlotCount; i++) g_cache_slot_alpha[i] = g_slot_alpha[i];
+    g_cache_stat_polygons = *polys;
+    g_cache_stat_layers = *layers;
+    g_cache_stat_draws = *draws;
+}
+
+// Paints the cached layers onto the canvas under the current camera.
+void composite_layer_cache() {
+    glUseProgram(g_cache_program);
+    glUniform2f(g_cache_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform2f(g_cache_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_cache_loc_zoom, g_zoom);
+    glUniform2f(g_cache_loc_cache_resolution, (float)g_cache_width, (float)g_cache_height);
+    glUniform2f(g_cache_loc_cache_offset, g_cache_pan_x, g_cache_pan_y);
+    glUniform1f(g_cache_loc_cache_zoom, g_cache_zoom);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_cache_tex);
+    // The cache holds premultiplied colour: it was blended over a transparent
+    // clear with the normal source-over function, which leaves colour already
+    // scaled by coverage. Compositing it needs GL_ONE for the source factor,
+    // or the alpha is applied a second time and everything drawn at less than
+    // full opacity comes back darker than it was rendered.
+    glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    // Same as the other fullscreen passes: the triangle comes from
+    // gl_VertexID, so a_position must not be an enabled array.
+    glBindVertexArray(g_vao);
+    glDisableVertexAttribArray(g_loc_position);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_program);
+}
+
 bool draw_frame(double time, void* /*userData*/) {
     g_frame_requested = false;
     g_frame_handle = 0;
@@ -2757,113 +3067,79 @@ bool draw_frame(double time, void* /*userData*/) {
     // composite pass), and it leaves the program switched, which the layer
     // uniforms below immediately correct.
     draw_grid();
-    glUseProgram(g_program);
-
-    glUniform2f(g_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
-    glUniform2f(g_loc_offset, g_pan_x, g_pan_y);
-    glUniform1f(g_loc_zoom, g_zoom);
-
-    const ViewRect view = current_view_rect();
-
-    // No per-polygon or per-tile culling: every on-screen layer draws in
-    // exactly one glDrawArrays (fill) + one glDrawElements (outline) call,
-    // full stop. An earlier version tried to fall back to a per-polygon
-    // culled draw loop when a layer was only partially on screen (i.e. most
-    // zoom levels between "fit to window" and "zoomed in on a small area"),
-    // but that fallback issued one draw call per remaining visible polygon
-    // and was the actual bottleneck -- worse than just drawing everything
-    // unconditionally. The only skip left is the layer-level bbox check
-    // below, which is O(number of layers), not O(number of polygons).
     uint64_t frame_visible_polygons = 0;
     int frame_layers_drawn = 0;
+    uint64_t frame_draw_calls = 0;
 
-    for (const LayerBuffer& layer : g_layers) {
-        if (!layer.visible) continue;
-        // A slot crossfaded fully out draws nothing at all, rather than
-        // drawing everything at zero alpha: at either end of the blend slider
-        // this is exactly the cost of viewing that layout on its own.
-        if (g_slot_alpha[layer.source] <= 0.0f) continue;
-        if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
+    // Whether this frame's layers can come from the cache instead of from the
+    // geometry (see the g_cache_* declarations). Merge mode and the difference
+    // highlight are excluded: both rasterize per layer into the coverage mask
+    // at the canvas resolution and composite out of it, so neither survives
+    // being rendered at the cache's larger extent and reprojected. And below
+    // kCacheMinFrameMs there is nothing to win -- the layout already draws
+    // faster than the copy would cost.
+    const bool cache_available = g_cache_fbo != 0 && g_cache_width > 0 && g_cache_height > 0 &&
+                                 !g_merge_mode && !g_diff_highlight &&
+                                 g_cache_stat_polygons > g_cache_min_polygons;
 
-        const std::array<float, 4> fill_color = slot_color(layer, layer.fill_color);
-        const std::array<float, 4> frame_color = slot_color(layer, layer.frame_color);
-
-        frame_layers_drawn++;
-        frame_visible_polygons += layer.polygon_count;
-
-        if (g_merge_mode) {
-            draw_layer_merged(layer);
-            continue;
-        }
-
-        if (layer.fill_vbo && g_show_infill) {
-            glBindBuffer(GL_ARRAY_BUFFER, layer.fill_vbo);
-            glEnableVertexAttribArray(g_loc_position);
-            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            glUniform4fv(g_loc_color, 1, fill_color.data());
-            glUniform1f(g_loc_use_hatch, 1.0f);
-            glUniform1f(g_loc_pattern_type, layer.pattern_type);
-            glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
-            glUniform1f(g_loc_hatch_spacing, kHatchSpacingPx);
-            glUniform1f(g_loc_hatch_width, kHatchHalfWidthPx);
-            // Fill vertices are triangles laid back-to-back with no
-            // loop-closing constraint, so the whole layer draws correctly
-            // in one shot -- no indices needed.
-            glDrawArrays(GL_TRIANGLES, 0, layer.fill_vertex_count);
-        }
-
-        if (layer.outline_ebo) {
-            glBindBuffer(GL_ARRAY_BUFFER, layer.outline_vbo);
-            glEnableVertexAttribArray(g_loc_position);
-            glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            glUniform4fv(g_loc_color, 1, frame_color.data());
-            glUniform1f(g_loc_use_hatch, 0.0f);
-            // outline_ebo holds every polygon's boundary as explicit edge
-            // pairs (see upload_geometry), so this one glDrawElements call
-            // draws every outline polygon on the layer. Each edge is its own
-            // independent primitive, so unrelated polygons can't get
-            // connected and no restart markers are needed.
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, layer.outline_ebo);
-            glDrawElements(GL_LINES, layer.outline_index_count, GL_UNSIGNED_INT, 0);
-        }
-
-        // Reused cells: one unique unit shape drawn instance_count times,
-        // each placed by a per-instance 2x3 affine read from instance_vbo
-        // (see a_iCol0/a_iCol1/a_iTranslate in kVertexShaderSrc). The divisor
-        // makes those attributes advance once per instance instead of once
-        // per vertex; the arrays are disabled again after each batch so the
-        // affine reverts to the identity generic value (set in init_gl) for
-        // the non-instanced draws above/below.
-        for (const InstancedBatch& batch : layer.instanced_batches) {
-            enable_instance_attribs(batch.instance_vbo);
-
-            if (batch.fill_vbo && g_show_infill) {
-                glBindBuffer(GL_ARRAY_BUFFER, batch.fill_vbo);
-                glEnableVertexAttribArray(g_loc_position);
-                glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-                glUniform4fv(g_loc_color, 1, fill_color.data());
-                glUniform1f(g_loc_use_hatch, 1.0f);
-                glUniform1f(g_loc_pattern_type, layer.pattern_type);
-                glUniform1f(g_loc_hatch_angle, layer.hatch_angle);
-                glUniform1f(g_loc_hatch_spacing, kHatchSpacingPx);
-                glUniform1f(g_loc_hatch_width, kHatchHalfWidthPx);
-                glDrawArraysInstanced(GL_TRIANGLES, 0, batch.fill_vertex_count, batch.instance_count);
-            }
-
-            if (batch.outline_ebo) {
-                glBindBuffer(GL_ARRAY_BUFFER, batch.outline_vbo);
-                glEnableVertexAttribArray(g_loc_position);
-                glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-                glUniform4fv(g_loc_color, 1, frame_color.data());
-                glUniform1f(g_loc_use_hatch, 0.0f);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, batch.outline_ebo);
-                glDrawElementsInstanced(GL_LINES, batch.outline_index_count, GL_UNSIGNED_INT, 0,
-                                        batch.instance_count);
-            }
-
-            disable_instance_attribs();
-        }
+    // Anything that changes what a layer looks like drops the cache. Compared
+    // here rather than hooked into each setter, so a toggle added later cannot
+    // leave a stale image on screen by forgetting to invalidate.
+    if (g_cache_filled &&
+        (g_cache_epoch != g_layer_epoch || g_cache_infill != g_show_infill ||
+         g_cache_slot_alpha[0] != g_slot_alpha[0] || g_cache_slot_alpha[1] != g_slot_alpha[1])) {
+        g_cache_filled = false;
     }
+
+    if (!cache_available) {
+        glUseProgram(g_program);
+        glUniform2f(g_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+        glUniform2f(g_loc_offset, g_pan_x, g_pan_y);
+        glUniform1f(g_loc_zoom, g_zoom);
+        draw_layers(current_view_rect(), &frame_visible_polygons, &frame_layers_drawn,
+                    &frame_draw_calls);
+        // What the layer pass just cost, which is what decides whether the
+        // next frame is allowed to use the cache.
+        g_cache_stat_polygons = frame_visible_polygons;
+        g_cache_filled = false;
+        g_cache_stale = false;
+    } else {
+        const bool moved_since_last_frame = g_zoom != g_prev_frame_zoom ||
+                                            g_pan_x != g_prev_frame_pan_x ||
+                                            g_pan_y != g_prev_frame_pan_y;
+        const bool differs = !g_cache_filled || g_zoom != g_cache_zoom ||
+                             g_pan_x != g_cache_pan_x || g_pan_y != g_cache_pan_y;
+        // Every frame the camera moves restarts the settle timer, so the real
+        // render lands once, after the gesture stops, instead of repeatedly
+        // during it.
+        if (moved_since_last_frame) g_cache_stale_since_ms = time;
+        if (!g_cache_filled || (differs && time - g_cache_stale_since_ms >= kCacheSettleMs)) {
+            render_layer_cache(&frame_visible_polygons, &frame_layers_drawn, &frame_draw_calls);
+        } else {
+            // A reprojected frame draws no geometry, so it has no counts of
+            // its own -- report what is actually on screen, which is what the
+            // last real render put there.
+            frame_visible_polygons = g_cache_stat_polygons;
+            frame_layers_drawn = g_cache_stat_layers;
+            frame_draw_calls = g_cache_stat_draws;
+        }
+        composite_layer_cache();
+        frame_draw_calls++;
+        g_cache_stale = g_zoom != g_cache_zoom || g_pan_x != g_cache_pan_x ||
+                        g_pan_y != g_cache_pan_y;
+        // Keep frames coming while what is on screen is a reprojection, so
+        // there is a frame to render the real thing in once the camera stops.
+        if (g_cache_stale) request_redraw();
+    }
+    g_prev_frame_zoom = g_zoom;
+    g_prev_frame_pan_x = g_pan_x;
+    g_prev_frame_pan_y = g_pan_y;
+
+    // Back to the shared VAO before anything else draws. Everything below
+    // points attributes at its own buffers, and those calls write into
+    // whichever VAO is bound -- leaving a batch's VAO bound would have them
+    // quietly rewrite that batch's setup for every later frame.
+    glBindVertexArray(g_vao);
     // Over the blended geometry and under everything that has to stay
     // readable on top of it.
     draw_diff_highlight();
@@ -2885,7 +3161,8 @@ bool draw_frame(double time, void* /*userData*/) {
     // end in a redraw. Pointer *moves* that leave the camera alone are the one
     // case this misses, so on_mousemove calls it directly as well.
     update_coord_readout();
-    update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size());
+    update_render_stats(frame_visible_polygons, frame_layers_drawn, (int)g_layers.size(),
+                        frame_draw_calls);
     return false;
 }
 
@@ -2974,6 +3251,44 @@ void resize_canvas() {
                    (int)status, (int)err);
         }
     }
+    // The layer cache, at the canvas size plus its margin. Reallocating drops
+    // whatever was in it, which is right: it was rendered for the old shape.
+    if (g_cache_tex && g_cache_fbo) {
+        // The margin is added as an even number of pixels per side, which is
+        // what makes a settled frame exact rather than merely close. At the
+        // cache's own camera the reprojection maps canvas pixel centres onto
+        // texel centres offset by (cacheResolution - resolution) / 2; an odd
+        // difference puts every sample half a texel out and LINEAR filtering
+        // then blurs the whole image by half a pixel, permanently, on a tool
+        // whose entire job is showing exactly where an edge is.
+        int pad_x = (int)((float)width * (kCacheMargin - 1.0f) * 0.5f);
+        int pad_y = (int)((float)height * (kCacheMargin - 1.0f) * 0.5f);
+        int cache_w = width + 2 * pad_x;
+        int cache_h = height + 2 * pad_y;
+        GLint max_tex = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+        if (max_tex > 0) {
+            if (cache_w > max_tex) cache_w = max_tex;
+            if (cache_h > max_tex) cache_h = max_tex;
+        }
+        g_cache_width = cache_w;
+        g_cache_height = cache_h;
+        glBindTexture(GL_TEXTURE_2D, g_cache_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cache_w, cache_h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+        g_cache_tex_bytes = (uint64_t)cache_w * (uint64_t)cache_h * 4u;
+        glBindFramebuffer(GL_FRAMEBUFFER, g_cache_fbo);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            // The cache is an optimisation: losing it costs frame rate on a
+            // large layout and nothing else, so drop it rather than fail.
+            EM_ASM({ console.warn('[GDS] layer cache FBO incomplete; drawing every frame in full'); });
+            glDeleteFramebuffers(1, &g_cache_fbo);
+            g_cache_fbo = 0;
+            g_cache_tex_bytes = 0;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        g_cache_filled = false;
+    }
     clamp_pan();
     update_scale_bar();
     request_redraw();
@@ -2991,16 +3306,24 @@ void resize_canvas() {
 // viewer to put back and misleading if they linger, so any slot load clears
 // them, exactly as any load did when there was only one slot.
 void clear_layers_for_slot(int slot) {
+    invalidate_frame_cache();
     for (LayerBuffer& layer : g_layers) {
         if (slot >= 0 && layer.source != slot) continue;
         if (layer.outline_vbo) delete_buffer_tracked(&layer.outline_vbo);
         if (layer.outline_ebo) delete_buffer_tracked(&layer.outline_ebo);
         if (layer.fill_vbo) delete_buffer_tracked(&layer.fill_vbo);
+        // VAOs hold no storage of their own, so they are outside the byte
+        // accounting -- but there is one per draw, so they are the most
+        // numerous GL object here and leaking them would be the largest leak.
+        if (layer.fill_vao) glDeleteVertexArrays(1, &layer.fill_vao);
+        if (layer.outline_vao) glDeleteVertexArrays(1, &layer.outline_vao);
         for (InstancedBatch& batch : layer.instanced_batches) {
             if (batch.fill_vbo) delete_buffer_tracked(&batch.fill_vbo);
             if (batch.outline_vbo) delete_buffer_tracked(&batch.outline_vbo);
             if (batch.outline_ebo) delete_buffer_tracked(&batch.outline_ebo);
             if (batch.instance_vbo) delete_buffer_tracked(&batch.instance_vbo);
+            if (batch.fill_vao) glDeleteVertexArrays(1, &batch.fill_vao);
+            if (batch.outline_vao) glDeleteVertexArrays(1, &batch.outline_vao);
         }
     }
     if (slot < 0) {
@@ -3225,10 +3548,46 @@ void build_cell_template(Cell* cell, std::unordered_map<uint64_t, std::vector<Po
 // this" signal, so saturation at the threshold is harmless.
 constexpr double kInstanceCountCap = 1e18;
 
-// A cell is GPU-instanced when it's placed at least this many times. Below
-// this, flattening the few copies into the static per-layer buffers is
-// cheaper than the extra per-batch draw calls instancing would add.
-constexpr double kInstanceThreshold = 8.0;
+// Instancing is a trade, not a win: it saves the memory of every flattened
+// copy of a cell and costs one draw call per (cell, layer) in every frame for
+// the life of the view. Which way that trade goes is not a question of how
+// often the cell is placed, which is what this used to decide on. A generated
+// layout is thousands of distinct small cells each placed a dozen times, and
+// instancing all of them saves a few megabytes while putting tens of thousands
+// of draw calls in every frame -- measured at over 100ms a frame on a test
+// chip whose geometry otherwise draws in one. The same chip flattened drew at
+// the display's refresh rate and loaded three times faster.
+//
+// So the decision is made on what a cell would actually save: the polygons its
+// extra copies would add if flattened (kInstanceThreshold), subject to a
+// ceiling on how much flattening the design as a whole is allowed to add
+// (kFlattenBudget), which is what keeps a library of individually-cheap cells
+// from adding up to a design that no longer fits. A cell placed a hundred
+// thousand times still instances on the first test; a thousand cells placed
+// twelve times each still flatten unless together they blow the budget.
+//
+// Both are in polygon *points*, not polygons. Polygons is the unit the rest of
+// this file counts in, but what flattening costs is proportional to vertices,
+// and the two differ by two orders of magnitude between a via and a waveguide
+// curve -- a budget in polygons would be a few hundred megabytes for one design
+// and several gigabytes for another, on a 4 GB address space. A point costs
+// roughly 40 bytes once uploaded: ~3 fill vertices from ear clipping at 8 bytes
+// each, plus the outline vertex and the two index entries naming it. So the
+// budget below is about 600 MB of flattened geometry, and the threshold is
+// about 10 MB -- the point past which one cell is worth a draw call a frame.
+constexpr double kInstanceThreshold = 250'000.0;
+constexpr double kFlattenBudget = 15'000'000.0;
+
+// The live value, so a test can pin the decision rather than having to carry a
+// fixture big enough to cross a threshold measured in tens of thousands of
+// polygons (see setInstanceThreshold). Set before a parse; read by
+// choose_instanced_cells during it.
+double g_instance_threshold = kInstanceThreshold;
+
+// Placements below which a cell is never instanced whatever it holds: a draw
+// call per frame is not worth saving two or three copies of anything, and the
+// per-instance affine buffer would be most of what it saved.
+constexpr double kInstanceMinPlacements = 8.0;
 
 // Fills counts[C] = expanded instance count of C, via memoized recursion over
 // the reference DAG (GDS references never form a cycle). roots are the cells
@@ -3274,10 +3633,65 @@ double compute_instance_count(Cell* cell, const std::unordered_map<Cell*, double
     return total;
 }
 
-// Picks the set of cells to GPU-instance: those placed >= kInstanceThreshold
-// times across the design. Builds the reference DAG's reverse adjacency
-// (child -> [(parent, repetition_count)]) once, then evaluates
-// compute_instance_count for every cell.
+// A robust path's spine is parametric, so how many points it tessellates to is
+// not known without tessellating it. This is the per-segment allowance used in
+// its place -- only for the size estimate the instancing decision is made on,
+// never for anything drawn.
+constexpr double kRobustPathPointsPerSegment = 16.0;
+
+// Points the cell's own geometry contributes, repetitions included. A path
+// element becomes one polygon walking up one side of the spine and back down
+// the other, so it costs two points per spine point.
+double own_point_count(const Cell* cell) {
+    double total = 0.0;
+    for (uint64_t i = 0; i < cell->polygon_array.count; i++) {
+        const Polygon* poly = cell->polygon_array[i];
+        uint64_t rep = poly->repetition.get_count();
+        total += (double)poly->point_array.count * (rep > 0 ? (double)rep : 1.0);
+    }
+    for (uint64_t i = 0; i < cell->flexpath_array.count; i++) {
+        const FlexPath* path = cell->flexpath_array[i];
+        uint64_t rep = path->repetition.get_count();
+        total += 2.0 * (double)path->spine.point_array.count * (double)path->num_elements *
+                 (rep > 0 ? (double)rep : 1.0);
+    }
+    for (uint64_t i = 0; i < cell->robustpath_array.count; i++) {
+        const RobustPath* path = cell->robustpath_array[i];
+        uint64_t rep = path->repetition.get_count();
+        total += 2.0 * (double)path->subpath_array.count * kRobustPathPointsPerSegment *
+                 (double)path->num_elements * (rep > 0 ? (double)rep : 1.0);
+    }
+    return total;
+}
+
+// Points one fully flattened copy of the cell would hold -- its own plus every
+// reference's, memoized down the reference DAG. Saturating for the same reason
+// compute_instance_count is: a deep arrayed hierarchy overflows any integer,
+// and a cell that large is one to instance whatever the exact figure.
+double compute_subtree_points(Cell* cell, std::unordered_map<Cell*, double>& memo,
+                              std::unordered_map<Cell*, int>& visiting) {
+    auto it = memo.find(cell);
+    if (it != memo.end()) return it->second;
+    if (visiting[cell]) return 0.0;  // malformed cyclic library
+    visiting[cell] = 1;
+    double total = own_point_count(cell);
+    for (uint64_t i = 0; i < cell->reference_array.count; i++) {
+        Reference* ref = cell->reference_array[i];
+        if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
+        uint64_t rep_count = ref->repetition.get_count();
+        double rep = rep_count > 0 ? (double)rep_count : 1.0;
+        total += rep * compute_subtree_points(ref->cell, memo, visiting);
+        if (total > kInstanceCountCap) { total = kInstanceCountCap; break; }
+    }
+    visiting[cell] = 0;
+    memo[cell] = total;
+    return total;
+}
+
+// Picks the set of cells to GPU-instance. Builds the reference DAG's reverse
+// adjacency (child -> [(parent, repetition_count)]) once, evaluates
+// compute_instance_count for every cell, and then spends the flatten budget on
+// the cells that save the most by instancing -- see kInstanceThreshold.
 std::unordered_map<Cell*, bool> choose_instanced_cells(Library& lib,
                                                        const std::unordered_map<Cell*, double>& base_counts) {
     std::unordered_map<Cell*, std::vector<std::pair<Cell*, double>>> preds;
@@ -3298,11 +3712,42 @@ std::unordered_map<Cell*, bool> choose_instanced_cells(Library& lib,
     std::unordered_map<Cell*, double> memo;
     std::unordered_map<Cell*, int> visiting;
     std::unordered_map<Cell*, bool> instanced;
+
+    // What each cell would save by being instanced: the points its copies
+    // beyond the first would add to the flattened geometry.
+    struct Candidate {
+        Cell* cell;
+        double saving;
+    };
+    std::vector<Candidate> candidates;
+    std::unordered_map<Cell*, double> point_memo;
+    std::unordered_map<Cell*, int> point_visiting;
+    // Extra points flattening every candidate would add, which is what the
+    // budget below is spent against.
+    double flatten_total = 0.0;
+
     for (uint64_t i = 0; i < lib.cell_array.count; i++) {
         Cell* cell = lib.cell_array[i];
+        instanced[cell] = false;
         double count = compute_instance_count(cell, base_counts, memo, visiting);
-        instanced[cell] = count >= kInstanceThreshold;
+        if (count < kInstanceMinPlacements) continue;
+        double unit = compute_subtree_points(cell, point_memo, point_visiting);
+        if (unit <= 0.0) continue;
+        double saving = unit * (count - 1.0);
+        candidates.push_back({cell, saving});
+        flatten_total += saving;
     }
+
+    // Biggest savers first, so a budget that runs out runs out on the cells it
+    // matters least for.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.saving > b.saving; });
+    for (const Candidate& c : candidates) {
+        if (c.saving < g_instance_threshold && flatten_total <= kFlattenBudget) continue;
+        instanced[c.cell] = true;
+        flatten_total -= c.saving;
+    }
+
     g_preds_for_count = nullptr;
     return instanced;
 }
@@ -4898,6 +5343,8 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data, int 
         layer_buffer.outline_vertex_count = g.outline_vertex_count;
         layer_buffer.fill_vbo = g.fill_vbo;
         layer_buffer.fill_vertex_count = g.fill_vertex_count;
+        layer_buffer.fill_vao = make_vao(g.fill_vbo, 0, 0);
+        layer_buffer.outline_vao = make_vao(g.outline_vbo, g.outline_ebo, 0);
         layer_buffer.polygon_count = g.polygon_count;
         layer_buffer.min_x = g.min_x;
         layer_buffer.max_x = g.max_x;
@@ -4972,6 +5419,8 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data, int 
             batch.outline_vertex_count = g.outline_vertex_count;
             batch.instance_vbo = instance_vbo;
             batch.instance_count = instance_count;
+            batch.fill_vao = make_vao(g.fill_vbo, 0, instance_vbo);
+            batch.outline_vao = make_vao(g.outline_vbo, g.outline_ebo, instance_vbo);
             layer_buffer->instanced_batches.push_back(batch);
 
             uint64_t logical_count = (uint64_t)g.polygon_count * (uint64_t)instance_count;
@@ -5280,6 +5729,7 @@ val getLayers() {
 // Toggle a single (layer, datatype). g_lyp_info is updated too so the
 // visibility sticks across a GDS reload (apply_layer_colors reads it back).
 void setLayerVisible(uint32_t layer_number, uint32_t datatype, bool visible) {
+    invalidate_frame_cache();
     uint64_t tag = make_tag(layer_number, datatype);
     // Every slot's copy of the layer, not the first one found: the viewer
     // shows one row per (layer, datatype) across both loaded layouts, so
@@ -5804,6 +6254,23 @@ val getPortStats() {
     return stats;
 }
 
+// Overrides the point saving a cell must show before it is GPU-instanced
+// (see kInstanceThreshold), for tests that need a known decision out of a small
+// fixture: 0 instances everything placed at least kInstanceMinPlacements times,
+// which is what this used to do unconditionally. Takes effect on the next
+// parse.
+// Overrides the polygon count above which the layer cache is used (see
+// kCacheMinPolygons). A huge value turns it off, which is how a test compares
+// a reprojected frame against the geometry it stands in for; 0 turns it on for
+// a layout small enough to check by eye.
+void setCacheMinPolygons(double polygons) {
+    g_cache_min_polygons = polygons >= 0.0 ? (uint64_t)polygons : kCacheMinPolygons;
+}
+
+void setInstanceThreshold(double polygons) {
+    g_instance_threshold = polygons >= 0.0 ? polygons : kInstanceThreshold;
+}
+
 int main() {
     g_gl_ready = init_gl();
     if (!g_gl_ready) return 0;
@@ -5847,6 +6314,15 @@ void destroyRenderer() {
         g_frame_requested = false;
     }
     g_gl_ready = false;
+    // Destroying the context releases every GL object with it, so nothing here
+    // is deleted by hand -- but the bookkeeping that outlives it is reset, so a
+    // re-init does not start out believing it still has a filled cache or the
+    // texture bytes that went with it.
+    g_cache_filled = false;
+    g_cache_stale = false;
+    g_cache_tex_bytes = 0;
+    g_cache_fbo = 0;
+    g_cache_tex = 0;
     if (g_ctx > 0) {
         emscripten_webgl_destroy_context(g_ctx);
         g_ctx = 0;
@@ -5855,6 +6331,8 @@ void destroyRenderer() {
 
 EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("parseGdsToLayers", &parseGdsToLayers);
+    function("setInstanceThreshold", &setInstanceThreshold);
+    function("setCacheMinPolygons", &setCacheMinPolygons);
     function("uploadLayers", &uploadLayers);
     function("showLoadError", &showLoadError);
     function("loadLypText", &loadLypText);
