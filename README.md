@@ -67,8 +67,9 @@ a streaming WebAssembly compile — see
   distances.
 - **Shows gdsfactory / kfactory ports**. A layout written by gdsfactory 8+
   carries its ports as KLayout metadata inside the file; the viewer reads them
-  back, draws every port as a bar across its width with an arrow the way it
-  faces (and its name, close in), and lists the top cell's ports in the panel.
+  back and lists the top cell's ports in the panel. **Display > Ports** draws
+  every port as a bar across its width with an arrow the way it faces (and its
+  name, close in). Ports inside placed cells are drawn once you zoom in.
   No Python involved.
 - **Compares two layouts**. One viewer can hold two of them, drawn through one
   camera, with a crossfade between them and a per-layer highlight of where they

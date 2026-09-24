@@ -483,10 +483,11 @@ export function createViewer(mountTarget) {
         resetView: () => modulePromise.then((Module) => Module.resetView()),
         showInfill: false,
         showText: false,
-        // On by default, unlike the text: a port is a handful of pixels a
-        // photonics layout is read by, and a file without kfactory metadata
-        // draws none, so the toggle costs nothing where it doesn't apply.
-        showPorts: true,
+        // Off by default, like the text: a photonics layout declares ports on
+        // nearly every cell, and drawn at every placement they are arrows over
+        // the geometry someone opening the file came to see. The Ports folder
+        // lists the top cell's either way. Matches g_show_ports in renderer.cpp.
+        showPorts: false,
         mergeOverlaps: false,
         // On by default -- matches g_show_grid in renderer.cpp, which is the
         // renderer's own initial state (nothing pushes this value down at startup).
@@ -530,7 +531,8 @@ export function createViewer(mountTarget) {
     const portsController = displayFolder.add(actions, "showPorts").name("Ports")
         .onChange((show) => setDisplay("showPorts", show));
     portsController.domElement.title =
-        "Show the ports a gdsfactory / kfactory layout declares: a bar across each, an arrow the way it faces, its name close in";
+        "Show the ports a gdsfactory / kfactory layout declares: a bar across each, an arrow the way it faces, " +
+        "its name close in. The top cell's are drawn at every zoom, the placed cells' once zoomed in";
     // Draw each layer as the union of its polygons (boundary + fill only, no
     // internal edges) -- a pure render-mode toggle, no re-parse involved.
     displayFolder.add(actions, "mergeOverlaps").name("Merge Overlaps")
@@ -2233,15 +2235,16 @@ export function createViewer(mountTarget) {
     // The ports gdsfactory / kfactory declared on the design's top cell(s):
     // where the chip connects to the outside, which is what someone opening a
     // photonics component wants to see first. Nested cells' ports are drawn on
-    // the canvas (every placement of them -- see collect_world_ports) but not
-    // listed: a top cell's dozen ports is a list, ten thousand straights' o1/o2
-    // is not. Rebuilt on every load like the hierarchy, and absent entirely for
-    // a file with no kfactory metadata.
+    // the canvas (every placement of them -- see collect_world_ports) once
+    // zoomed in far enough (see draw_ports), but not listed: a top cell's
+    // dozen ports is a list, ten thousand straights' o1/o2 is not. Rebuilt on
+    // every load like the hierarchy, and absent entirely for a file with no
+    // kfactory metadata.
     let portsFolder = null;
     const MAX_PORT_ROWS = 200;
     const EMPTY_PORTS = {
         xydw: new Float32Array(0), type: new Uint32Array(0), nameChars: new Uint8Array(0),
-        nameOffsets: new Uint32Array([0]), typeNames: [], capped: false, count: 0
+        nameOffsets: new Uint32Array([0]), typeNames: [], capped: false, count: 0, topCount: 0
     };
 
     function removePortsPanel() {
@@ -2269,16 +2272,28 @@ export function createViewer(mountTarget) {
             for (const port of cells[index].ports || []) topPorts.push(port);
         }
 
-        portsFolder = gui.addFolder(`Ports (${topPorts.length})`);
-        portsFolder.domElement.title = `${declared} port${declared === 1 ? "" : "s"} declared in this file's ` +
-            `kfactory metadata; the ${topPorts.length} on the top cell are listed here, every placement is drawn`;
+        // Placements of ports inside placed cells, which the canvas draws but
+        // this list leaves out.
+        const nested = ports ? Math.max(0, (ports.total || ports.count) - topPorts.length) : 0;
+        const plural = (n, word) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+
+        // The count is of what the list holds, so a file whose ports are all
+        // inside placed cells gets no "(0)" over a canvas full of them.
+        portsFolder = gui.addFolder(topPorts.length ? `Ports (${topPorts.length})` : "Ports");
+        portsFolder.domElement.title = `${plural(declared, "port")} declared in this file's kfactory ` +
+            `metadata; the ${topPorts.length} on the top cell are listed here and always drawn`;
         // Open: the list is the design's own interface, and short.
         portsFolder.open();
 
         if (topPorts.length === 0) {
+            const note = portsFolder.add({ n: () => {} }, "n").name("None on the top cell");
+            note.domElement.classList.add("marker-more-row");
+        }
+        if (nested > 0) {
+            // Inert, so the sentence has to fit the row: no tooltip to finish it.
             const note = portsFolder.add({ n: () => {} }, "n")
-                .name(`${declared} port${declared === 1 ? "" : "s"} inside placed cells, none on the top cell`);
-            note.domElement.classList.add("marker-warning-row");
+                .name(`${nested.toLocaleString()} more inside cells, not listed`);
+            note.domElement.classList.add("marker-more-row");
         }
         for (const port of topPorts.slice(0, MAX_PORT_ROWS)) {
             const label = `${port.name}  (${fmtCoord(port.x)}, ${fmtCoord(port.y)})  ${Math.round(port.angle)}°`;
@@ -2303,7 +2318,7 @@ export function createViewer(mountTarget) {
         }
         if (ports && ports.capped) {
             const capped = portsFolder.add({ c: () => {} }, "c")
-                .name(`The canvas shows the first ${ports.count} port placements; the rest are not drawn`);
+                .name(`Too many to draw: the canvas shows 1 in ${ports.stride} of the ports inside cells`);
             capped.domElement.classList.add("marker-warning-row");
         }
     }

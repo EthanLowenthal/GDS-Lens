@@ -82,6 +82,9 @@ test("kfactory ports: expanded to world space through placements", { skip }, asy
     // inside the mzi, so more instances than declarations; and not capped.
     assert.ok(ports.count > 17, `count ${ports.count}`);
     assert.strictEqual(ports.capped, false);
+    assert.strictEqual(ports.total, ports.count);
+    assert.strictEqual(ports.stride, 1);
+    assert.strictEqual(ports.topCount, 4);
     assert.strictEqual(ports.xydw.length, ports.count * 5);
     assert.strictEqual(ports.type.length, ports.count);
     assert.strictEqual(ports.nameOffsets.length, ports.count + 1);
@@ -123,20 +126,50 @@ test("kfactory ports: expanded to world space through placements", { skip }, asy
     const stats = Module.getPortStats();
     assert.strictEqual(stats.count, ports.count);
     assert.strictEqual(stats.capped, false);
-    assert.strictEqual(stats.visible, true);
+    // Off until the Display toggle turns it on.
+    assert.strictEqual(stats.visible, false);
     assert.strictEqual(stats.types, 1);
+    assert.strictEqual(stats.topCount, 4);
     assert.strictEqual(stats.sample[0].name, "mzi_o1");
     assert.strictEqual(stats.sample[0].type, "optical");
     assert.ok(close(stats.sample[0].x, -10));
 
-    Module.setShowPorts(false);
-    assert.strictEqual(Module.getPortStats().visible, false);
     Module.setShowPorts(true);
+    assert.strictEqual(Module.getPortStats().visible, true);
+    Module.setShowPorts(false);
 
     // An empty payload (a file with no metadata) clears them.
     Module.setPorts({xydw: new Float32Array(0), type: new Uint32Array(0), nameChars: new Uint8Array(0),
                      nameOffsets: new Uint32Array([0]), typeNames: [], capped: false, count: 0});
     assert.strictEqual(Module.getPortStats().count, 0);
+});
+
+test("kfactory ports: past the bound, an even sample and every top-cell port", { skip }, async () => {
+    const Module = await loadModule();
+    const full = (await parseFixture(Module, "kfactory_ports.gds")).ports;
+    const nested = full.count - full.topCount;
+    // Room for the 4 top-cell ports and a third of the rest.
+    const bound = full.topCount + Math.ceil(nested / 3);
+    Module.setMaxWorldPorts(bound);
+    let ports;
+    try {
+        ports = (await parseFixture(Module, "kfactory_ports.gds")).ports;
+    } finally {
+        Module.setMaxWorldPorts(-1);
+    }
+    assert.strictEqual(ports.capped, true);
+    assert.strictEqual(ports.total, full.count);
+    assert.strictEqual(ports.stride, 3);
+    assert.strictEqual(ports.topCount, 4);
+    assert.strictEqual(ports.count, 4 + Math.ceil(nested / 3));
+    assert.ok(ports.count <= bound);
+    // The top cell's ports are all there, then every third of the full walk's.
+    assert.deepStrictEqual(Array.from(ports.xydw.subarray(0, 20)), Array.from(full.xydw.subarray(0, 20)));
+    for (let k = 0; k < ports.count - 4; k++) {
+        const a = (4 + k) * 5, b = (4 + k * 3) * 5;
+        assert.deepStrictEqual(Array.from(ports.xydw.subarray(a, a + 5)), Array.from(full.xydw.subarray(b, b + 5)),
+                               `sampled port ${k}`);
+    }
 });
 
 test("kfactory ports: a plain layout has none", { skip }, async () => {

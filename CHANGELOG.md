@@ -9,7 +9,26 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+### Changed
+
+- The port overlay is off by default. Turn it on with **Display > Ports**. The
+  **Ports** folder lists the top cell's ports whether the overlay is on or not.
+- Ports inside placed cells are drawn only when 3,000 or fewer of them are in
+  view. At full-die zoom, a photonics layout has a port at both ends of every
+  waveguide, so the overlay covered the geometry. The top cell's ports are
+  drawn at every zoom.
+
 ### Fixed
+
+- On a layout with more than 200,000 port placements, the overlay stopped
+  collecting ports partway through the hierarchy, so whole blocks had none.
+  On the demo layout (230,228 placements) the top-left block was missing. The
+  limit is now 1,000,000. The placements are counted first, and past the limit
+  the overlay keeps every Nth one, so the sample covers the whole die. The
+  panel reports N.
+- The **Ports** folder said "Ports (0)" when every port was inside a placed
+  cell. The heading now leaves out the count when the top cell has no ports,
+  and the folder says how many placements there are inside cells.
 
 - On layouts large enough to use the layer cache (about 5 million polygons),
   the ruler, the snap marker, labels, ports, markers and the cell highlight

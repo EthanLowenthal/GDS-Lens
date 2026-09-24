@@ -864,12 +864,19 @@ std::vector<std::string> g_port_types;
 // One RGB per type, decided once in setPorts from the type's name.
 std::vector<std::array<float, 3>> g_port_type_colors;
 bool g_ports_capped = false;
-bool g_show_ports = true;
+// g_ports[0, g_port_top_count) are the top cells' own ports; the rest are the
+// placed cells', drawn only while few enough of them are on screen.
+size_t g_port_top_count = 0;
+// Off until the viewer's Display > Ports toggle turns it on (see showPorts in
+// viewer.js).
+bool g_show_ports = false;
 GLuint g_port_vbo = 0;
 GLuint g_port_text_vbo = 0;
 // Ports drawn and named in the last frame (for the stats readout and tests).
 uint32_t g_ports_drawn = 0;
 uint32_t g_port_names_drawn = 0;
+// Whether the last frame left the placed cells' ports out for being too many.
+bool g_nested_ports_hidden = false;
 
 // Screen-space sizing. The bar is at least kPortMinBarPx long so a port is a
 // mark you can see and aim at from any zoom; the arrow is kPortArrowPx long
@@ -884,6 +891,11 @@ constexpr float kPortLabelGapPx = 6.0f;
 // past this the labels are a mat over the geometry, and the bars alone say
 // where the ports are.
 constexpr uint32_t kMaxPortNamesPerFrame = 300;
+// The placed cells' ports are drawn only while at most this many are in view.
+// Zoomed out on a photonic chip that is every straight's o1/o2, a carpet of
+// arrows over the geometry, and the top cell's ports (always drawn) are the
+// ones that say anything at that scale.
+constexpr size_t kMaxNestedPortsInView = 3000;
 constexpr size_t kMaxPortVertsPerFrame = 600000;  // floats
 
 bool ports_present() { return !g_ports.empty(); }
@@ -2075,6 +2087,7 @@ void append_stroke(std::vector<float>& out, float x0, float y0, float x1, float 
 void draw_ports() {
     g_ports_drawn = 0;
     g_port_names_drawn = 0;
+    g_nested_ports_hidden = false;
     if (!g_show_ports || !ports_present()) return;
 
     const float px = 1.0f / g_zoom;
@@ -2096,10 +2109,23 @@ void draw_ports() {
     std::vector<std::vector<float>> verts(g_port_type_colors.size());
     std::vector<std::vector<float>> text(g_port_type_colors.size());
     size_t total_verts = 0;
+    auto in_view = [&](const WorldPort& p) {
+        return p.x >= view.min_x && p.x <= view.max_x && p.y >= view.min_y && p.y <= view.max_y;
+    };
 
-    for (size_t i = 0; i < g_ports.size(); i++) {
+    // Zoomed out, the first kMaxNestedPortsInView + 1 placed ports are nearly
+    // all in view, so this count stops early exactly when it would be long.
+    size_t top_count = std::min(g_port_top_count, g_ports.size());
+    size_t nested_in_view = 0;
+    for (size_t i = top_count; i < g_ports.size() && nested_in_view <= kMaxNestedPortsInView; i++) {
+        if (in_view(g_ports[i])) nested_in_view++;
+    }
+    g_nested_ports_hidden = nested_in_view > kMaxNestedPortsInView;
+    size_t end = g_nested_ports_hidden ? top_count : g_ports.size();
+
+    for (size_t i = 0; i < end; i++) {
         const WorldPort& p = g_ports[i];
-        if (p.x < view.min_x || p.x > view.max_x || p.y < view.min_y || p.y > view.max_y) continue;
+        if (!in_view(p)) continue;
         if (total_verts >= kMaxPortVertsPerFrame) break;
         uint32_t type = p.type < verts.size() ? p.type : 0;
         std::vector<float>& out = verts[type];
@@ -4321,10 +4347,17 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots, const kfactor
 // port somewhere below them -- a fill cell arrayed a million times has none,
 // and skipping it is what keeps this a fraction of the flatten's cost.
 //
-// Bounded by kMaxWorldPorts: past it the walk stops and says so (`capped`),
-// which the panel reports. A layout with that many ports has them stacked far
-// too densely to draw one by one anyway.
-constexpr uint64_t kMaxWorldPorts = 200000;
+// The top cells' own ports come first, [0, topCount): they are the design's
+// interface, drawn at every zoom, where the rest are drawn only close in (see
+// draw_ports).
+//
+// Bounded by kMaxWorldPorts. The placements are counted before any is
+// expanded, and past the bound the walk keeps every Nth one instead of
+// stopping partway (`capped`, `stride`), so a sample covers the whole die
+// rather than whichever blocks the walk reached first.
+constexpr uint64_t kMaxWorldPorts = 1000000;
+// kMaxWorldPorts unless a test lowered it (see setMaxWorldPorts).
+uint64_t g_max_world_ports = kMaxWorldPorts;
 
 struct WorldPortSink {
     std::vector<float> xydw;          // x, y, dx, dy, width per port
@@ -4334,7 +4367,10 @@ struct WorldPortSink {
     std::vector<std::string> type_names;
     std::unordered_map<std::string, uint32_t> type_index;
     uint64_t count = 0;
-    bool capped = false;
+    uint64_t top_count = 0;
+    // Nested placements walked so far, kept or not, and the keep interval.
+    uint64_t seen = 0;
+    uint64_t stride = 1;
 
     uint32_t type_for(const std::string& t) {
         auto found = type_index.find(t);
@@ -4344,61 +4380,85 @@ struct WorldPortSink {
         type_index[t] = idx;
         return idx;
     }
+
+    // Whether a run of n nested placements starting at `seen` holds a kept one.
+    bool run_has_keep(uint64_t n) const {
+        if (n == 0) return false;
+        if (stride == 1) return true;
+        return seen % stride == 0 || seen / stride != (seen + n - 1) / stride;
+    }
 };
 
-bool subtree_has_ports(Cell* cell, const kfactory_ports::CellPorts& ports, std::unordered_map<Cell*, int>& memo) {
+// Port placements in a cell and everything below it, saturating well short of
+// overflow. Memoized per cell; a reference cycle counts as zero.
+uint64_t world_port_count(Cell* cell, const kfactory_ports::CellPorts& ports,
+                          std::unordered_map<Cell*, uint64_t>& memo, int depth) {
+    constexpr uint64_t kSaturate = (uint64_t)1 << 60;
     auto found = memo.find(cell);
-    if (found != memo.end()) return found->second > 0;
-    memo[cell] = 0;  // also guards against a reference cycle
-    bool has = ports.by_cell.find(cell) != ports.by_cell.end();
-    for (uint64_t r = 0; r < cell->reference_array.count && !has; r++) {
+    if (found != memo.end()) return found->second;
+    memo[cell] = 0;
+    if (depth > 64) return 0;
+    uint64_t n = 0;
+    auto own = ports.by_cell.find(cell);
+    if (own != ports.by_cell.end()) n = own->second.size();
+    for (uint64_t r = 0; r < cell->reference_array.count && n < kSaturate; r++) {
         Reference* ref = cell->reference_array[r];
         if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
-        has = subtree_has_ports(ref->cell, ports, memo);
+        uint64_t child = world_port_count(ref->cell, ports, memo, depth + 1);
+        if (child == 0) continue;
+        uint64_t placements = ref->repetition.type != RepetitionType::None ? ref->repetition.get_count() : 1;
+        n += (placements > kSaturate / child) ? kSaturate : placements * child;
     }
-    memo[cell] = has ? 1 : 0;
-    return has;
+    n = std::min(n, kSaturate);
+    memo[cell] = n;
+    return n;
 }
 
-void collect_world_ports_from(Cell* cell, const Affine2D& current, const kfactory_ports::CellPorts& ports,
-                              std::unordered_map<Cell*, int>& memo, WorldPortSink& sink, int depth) {
-    if (sink.capped || depth > 64) return;
-    auto own = ports.by_cell.find(cell);
-    if (own != ports.by_cell.end()) {
-        for (const kfactory_ports::PortDef& p : own->second) {
-            if (sink.count >= kMaxWorldPorts) {
-                sink.capped = true;
-                return;
-            }
-            Vec2 pos = current.apply_point({p.x, p.y});
-            double a = p.angle_deg * M_PI / 180.0;
-            Vec2 dir = current.apply_linear({cos(a), sin(a)});
-            double len = sqrt(dir.x * dir.x + dir.y * dir.y);
-            if (len > 0) {
-                dir.x /= len;
-                dir.y /= len;
-            } else {
-                dir = {1, 0};
-            }
-            // The width is a length across the port; a magnified placement
-            // scales it by however much it stretches that direction.
-            Vec2 across = current.apply_linear({-sin(a), cos(a)});
-            double width = p.width * sqrt(across.x * across.x + across.y * across.y);
-            sink.xydw.push_back((float)pos.x);
-            sink.xydw.push_back((float)pos.y);
-            sink.xydw.push_back((float)dir.x);
-            sink.xydw.push_back((float)dir.y);
-            sink.xydw.push_back((float)width);
-            sink.type.push_back(sink.type_for(p.type));
-            sink.name_chars += p.name;
-            sink.name_offsets.push_back((uint32_t)sink.name_chars.size());
-            sink.count++;
+void emit_world_ports(const std::vector<kfactory_ports::PortDef>& defs, const Affine2D& current,
+                      WorldPortSink& sink, bool sampled) {
+    for (const kfactory_ports::PortDef& p : defs) {
+        if (sampled) {
+            bool keep = sink.seen % sink.stride == 0;
+            sink.seen++;
+            if (!keep) continue;
         }
+        Vec2 pos = current.apply_point({p.x, p.y});
+        double a = p.angle_deg * M_PI / 180.0;
+        Vec2 dir = current.apply_linear({cos(a), sin(a)});
+        double len = sqrt(dir.x * dir.x + dir.y * dir.y);
+        if (len > 0) {
+            dir.x /= len;
+            dir.y /= len;
+        } else {
+            dir = {1, 0};
+        }
+        // The width is a length across the port; a magnified placement
+        // scales it by however much it stretches that direction.
+        Vec2 across = current.apply_linear({-sin(a), cos(a)});
+        double width = p.width * sqrt(across.x * across.x + across.y * across.y);
+        sink.xydw.push_back((float)pos.x);
+        sink.xydw.push_back((float)pos.y);
+        sink.xydw.push_back((float)dir.x);
+        sink.xydw.push_back((float)dir.y);
+        sink.xydw.push_back((float)width);
+        sink.type.push_back(sink.type_for(p.type));
+        sink.name_chars += p.name;
+        sink.name_offsets.push_back((uint32_t)sink.name_chars.size());
+        sink.count++;
     }
+}
+
+// The ports of the cells `cell` places, through every placement (not the
+// cell's own -- the caller emits those).
+void collect_nested_ports(Cell* cell, const Affine2D& current, const kfactory_ports::CellPorts& ports,
+                          std::unordered_map<Cell*, uint64_t>& counts, WorldPortSink& sink, int depth) {
+    if (depth > 64) return;
     for (uint64_t r = 0; r < cell->reference_array.count; r++) {
         Reference* ref = cell->reference_array[r];
         if (ref->type != ReferenceType::Cell || ref->cell == nullptr) continue;
-        if (!subtree_has_ports(ref->cell, ports, memo)) continue;
+        uint64_t n = world_port_count(ref->cell, ports, counts, depth + 1);
+        if (n == 0) continue;
+        auto own = ports.by_cell.find(ref->cell);
         Vec2 zero = {0, 0};
         Array<Vec2> offsets = {};
         if (ref->repetition.type != RepetitionType::None) {
@@ -4407,24 +4467,47 @@ void collect_world_ports_from(Cell* cell, const Affine2D& current, const kfactor
             offsets.count = 1;
             offsets.items = &zero;
         }
-        for (uint64_t k = 0; k < offsets.count && !sink.capped; k++) {
+        for (uint64_t k = 0; k < offsets.count; k++) {
+            // A placement none of whose ports would be kept is skipped whole.
+            if (!sink.run_has_keep(n)) {
+                sink.seen += n;
+                continue;
+            }
             Affine2D placed = compose_affine(current, reference_placement(ref, offsets[k]));
-            collect_world_ports_from(ref->cell, placed, ports, memo, sink, depth + 1);
+            if (own != ports.by_cell.end()) emit_world_ports(own->second, placed, sink, true);
+            collect_nested_ports(ref->cell, placed, ports, counts, sink, depth + 1);
         }
         if (ref->repetition.type != RepetitionType::None) offsets.clear();
-        if (sink.capped) return;
     }
 }
 
 val collect_world_ports(const std::vector<Cell*>& roots, const kfactory_ports::CellPorts& ports) {
     WorldPortSink sink;
-    std::unordered_map<Cell*, int> memo;
+    uint64_t total = 0;
     if (ports.port_count > 0) {
-        for (Cell* root : roots) collect_world_ports_from(root, Affine2D{}, ports, memo, sink, 0);
+        std::unordered_map<Cell*, uint64_t> counts;
+        uint64_t top = 0;
+        for (Cell* root : roots) {
+            auto own = ports.by_cell.find(root);
+            if (own != ports.by_cell.end()) top += own->second.size();
+            total += world_port_count(root, ports, counts, 0);
+        }
+        uint64_t nested = total - top;
+        uint64_t budget = g_max_world_ports > top ? g_max_world_ports - top : 1;
+        sink.stride = nested > budget ? (nested + budget - 1) / budget : 1;
+        for (Cell* root : roots) {
+            auto own = ports.by_cell.find(root);
+            if (own != ports.by_cell.end()) emit_world_ports(own->second, Affine2D{}, sink, false);
+        }
+        sink.top_count = sink.count;
+        for (Cell* root : roots) collect_nested_ports(root, Affine2D{}, ports, counts, sink, 0);
     }
     val out = val::object();
     out.set("count", (double)sink.count);
-    out.set("capped", sink.capped);
+    out.set("topCount", (double)sink.top_count);
+    out.set("total", (double)total);
+    out.set("stride", (double)sink.stride);
+    out.set("capped", sink.stride > 1);
     out.set("xydw", to_float32_array(sink.xydw));
     out.set("type", to_uint32_array(sink.type));
     std::vector<uint8_t> chars(sink.name_chars.begin(), sink.name_chars.end());
@@ -5349,6 +5432,7 @@ void uploadLayers(val layers_data, val instance_groups_data, val bbox_data, int 
     g_port_name_chars.clear();
     g_port_name_offsets.clear();
     g_ports_capped = false;
+    g_port_top_count = 0;
 
     unsigned layer_count = layers_data["length"].as<unsigned>();
     unsigned group_count = instance_groups_data["length"].as<unsigned>();
@@ -6228,6 +6312,8 @@ void setPorts(val data) {
     g_port_name_offsets = convertJSArrayToNumberVector<uint32_t>(data["nameOffsets"]);
     g_port_name_chars.assign(chars.begin(), chars.end());
     g_ports_capped = data["capped"].isTrue();
+    val top_count = data["topCount"];
+    g_port_top_count = top_count.isNumber() ? (size_t)top_count.as<double>() : 0;
 
     g_port_types.clear();
     val type_names = data["typeNames"];
@@ -6276,6 +6362,8 @@ val getPortStats() {
     stats.set("types", (int)g_port_types.size());
     stats.set("drawn", (int)g_ports_drawn);
     stats.set("namesDrawn", (int)g_port_names_drawn);
+    stats.set("topCount", (int)g_port_top_count);
+    stats.set("nestedHidden", g_nested_ports_hidden);
     // The first few ports, for tests to check the expansion against.
     val sample = val::array();
     for (size_t i = 0; i < g_ports.size() && i < 8; i++) {
@@ -6308,6 +6396,13 @@ void setCacheMinPolygons(double polygons) {
 
 void setInstanceThreshold(double polygons) {
     g_instance_threshold = polygons >= 0.0 ? polygons : kInstanceThreshold;
+}
+
+// Overrides kMaxWorldPorts, so a test can reach the sampled expansion with a
+// small fixture. A negative value restores the default. Takes effect on the
+// next parse.
+void setMaxWorldPorts(double ports) {
+    g_max_world_ports = ports >= 1.0 ? (uint64_t)ports : kMaxWorldPorts;
 }
 
 int main() {
@@ -6371,6 +6466,7 @@ void destroyRenderer() {
 EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("parseGdsToLayers", &parseGdsToLayers);
     function("setInstanceThreshold", &setInstanceThreshold);
+    function("setMaxWorldPorts", &setMaxWorldPorts);
     function("setCacheMinPolygons", &setCacheMinPolygons);
     function("uploadLayers", &uploadLayers);
     function("showLoadError", &showLoadError);
