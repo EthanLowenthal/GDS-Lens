@@ -9,6 +9,8 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-23
+
 ### Changed
 
 - The port overlay is off by default. Turn it on with **Display > Ports**. The
@@ -691,7 +693,8 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.1.0...v1.2.0
