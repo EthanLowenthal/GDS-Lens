@@ -417,14 +417,17 @@ void invalidate_frame_cache() { g_layer_epoch++; }
 // ---- Pick pass (see pick_snap_at) ------------------------------------------
 // Nothing about the geometry survives on the CPU after uploadLayers -- only
 // VBOs -- so the ruler's "what is near this point" question is answered by
-// rasterizing that geometry again. A small window of the scene around a screen
-// point is drawn into an integer framebuffer carrying, per fragment, what kind
-// of thing it is and where in the world it sits, and that window is read back. The target is tiny and
-// fixed rather than canvas-sized: the pass supplies its own u_resolution and
-// u_offset, so setting them to the window size and the world point under the
-// cursor makes the texture cover exactly kPickSize x kPickSize canvas pixels
-// centred there, at the camera's current zoom.
-constexpr int kPickSize = 33;  // odd, so the window has a centre pixel
+// rasterizing that geometry again. The whole canvas is drawn into an integer
+// framebuffer carrying, per fragment, what kind of thing it is and where in the
+// world it sits, and read back once. Every mouse move after that is a search of
+// g_pick_buffer around the cursor, with no GPU work at all.
+//
+// It used to draw a 33-pixel window around the cursor on every move instead,
+// which sounds cheaper and is not: nothing culls below the layer level, so the
+// window drew every outline on every layer it touched -- on a full chip, the
+// whole layout, per mouse move. The canvas-sized pass costs about one frame,
+// and only when what it shows goes stale: the camera moves, a layer is hidden
+// or shown, the geometry changes, or the canvas resizes (see pick_cache_fresh).
 GLuint g_pick_program = 0;
 GLint g_pick_loc_resolution = -1;
 GLint g_pick_loc_offset = -1;
@@ -432,8 +435,18 @@ GLint g_pick_loc_zoom = -1;
 GLint g_pick_loc_id = -1;
 GLuint g_pick_fbo = 0;
 GLuint g_pick_tex = 0;
-// Readback destination, RGBA per texel: (id, world x bits, world y bits, 1).
+// Readback destination, RGBA per texel: (id, world x bits, world y bits, 1),
+// rows bottom-up as glReadPixels returns them. Canvas-sized while measure mode
+// has used it, and released when measure mode ends (see setMeasureMode).
 std::vector<uint32_t> g_pick_buffer;
+// Size of g_pick_tex, and what the buffer's contents were drawn under.
+int g_pick_tex_width = 0;
+int g_pick_tex_height = 0;
+bool g_pick_filled = false;
+float g_pick_zoom = 0.0f;
+float g_pick_pan_x = 0.0f;
+float g_pick_pan_y = 0.0f;
+uint64_t g_pick_epoch = 0;
 
 // Difference-highlight program state (see draw_diff_highlight). Shares the
 // mask FBO and the composite pass's attribute-free fullscreen triangle with
@@ -1076,8 +1089,9 @@ bool init_gl() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, kPickSize, kPickSize, 0, GL_RGBA_INTEGER,
-                 GL_UNSIGNED_INT, nullptr);
+    // 1x1 for the completeness check below; ensure_pick_target sizes it to
+    // the canvas the first time a snap needs it.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, 1, 1, 0, GL_RGBA_INTEGER, GL_UNSIGNED_INT, nullptr);
     glGenFramebuffers(1, &g_pick_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, g_pick_fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_pick_tex, 0);
@@ -1089,7 +1103,8 @@ bool init_gl() {
         glDeleteFramebuffers(1, &g_pick_fbo);
         g_pick_fbo = 0;
     } else {
-        g_pick_buffer.assign((size_t)kPickSize * kPickSize * 4, 0u);
+        g_pick_tex_width = 1;
+        g_pick_tex_height = 1;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -2245,62 +2260,6 @@ GLuint make_vao(GLuint position_vbo, GLuint ebo, GLuint instance_vbo) {
 // is gone from the CPU after upload, so anything that needs to know what is at
 // a point on screen asks the rasterizer.
 
-// Points the pick framebuffer at a screen point and clears it. The world point
-// under that pixel comes back through out_wx/out_wy: it is both the pass's
-// u_offset -- which is what centres the window on the cursor -- and the origin
-// every hit is measured from. False means there is nothing to pick against, and
-// nothing was bound, so end_pick_pass must not follow.
-bool begin_pick_pass(float screen_x, float screen_y, float& out_wx, float& out_wy) {
-    if (!g_gl_ready || !g_pick_fbo || g_layers.empty()) return false;
-    screen_to_world(screen_x, screen_y, out_wx, out_wy);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, g_pick_fbo);
-    glViewport(0, 0, kPickSize, kPickSize);
-    // Integer color attachments cannot be blended -- drawing to one with
-    // blending enabled is an error, not a silently ignored setting.
-    glDisable(GL_BLEND);
-    const GLuint zero[4] = {0u, 0u, 0u, 0u};
-    glClearBufferuiv(GL_COLOR, 0, zero);
-
-    glBindVertexArray(g_vao);
-    glUseProgram(g_pick_program);
-    glUniform2f(g_pick_loc_resolution, (float)kPickSize, (float)kPickSize);
-    glUniform2f(g_pick_loc_offset, out_wx, out_wy);
-    glUniform1f(g_pick_loc_zoom, g_zoom);
-    return true;
-}
-
-// Reads the window into g_pick_buffer and puts back the canvas framebuffer,
-// viewport and blending. The canvas itself is untouched by a pick -- nothing
-// was drawn to it -- so no redraw is owed afterwards.
-void end_pick_pass() {
-    glReadPixels(0, 0, kPickSize, kPickSize, GL_RGBA_INTEGER, GL_UNSIGNED_INT, g_pick_buffer.data());
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, g_canvas_width, g_canvas_height);
-    glEnable(GL_BLEND);
-}
-
-// The world rect the pick window covers, so the pass can do the same
-// layer-level bbox skip draw_frame does. At any zoom past "whole design in
-// view" this is what keeps a pick from touching most of the layout.
-ViewRect pick_view_rect(float wx, float wy) {
-    float half = (float)kPickSize * 0.5f / g_zoom;
-    return {wx - half, wx + half, wy - half, wy + half};
-}
-
-// The picked point maps to clip 0, i.e. exactly halfway across the viewport, so
-// this is where it lands in texel coordinates.
-constexpr float kPickCenter = (float)kPickSize * 0.5f;
-
-// Squared pixel distance from the picked point to texel (i, j)'s center. Purely
-// a function of the indices -- the window is centred on the cursor by
-// construction, so no world-space arithmetic is involved.
-float pick_texel_dist2(int i, int j) {
-    float dx = ((float)i + 0.5f) - kPickCenter;
-    float dy = ((float)j + 0.5f) - kPickCenter;
-    return dx * dx + dy * dy;
-}
-
 // ---- Ruler snapping ---------------------------------------------------------
 // What a snap candidate is. A vertex anywhere in range beats any edge: a corner
 // is a more specific answer than the line leading to it, and it's what people
@@ -2342,6 +2301,79 @@ void draw_layer_outline(const LayerBuffer& layer, GLenum primitive) {
     glBindVertexArray(g_vao);
 }
 
+// Whether g_pick_buffer still shows what the canvas would: drawn at this
+// size, under this camera, over this geometry and visibility (g_layer_epoch
+// moves with both, as it does for the frame cache).
+bool pick_cache_fresh() {
+    return g_pick_filled && g_pick_tex_width == g_canvas_width && g_pick_tex_height == g_canvas_height &&
+           g_pick_zoom == g_zoom && g_pick_pan_x == g_pan_x && g_pick_pan_y == g_pan_y &&
+           g_pick_epoch == g_layer_epoch;
+}
+
+// Draws every visible layer's outlines into the canvas-sized pick target under
+// the current camera and reads the result into g_pick_buffer. False when there
+// is nothing to pick against, or no target to pick with.
+bool fill_pick_cache() {
+    if (!g_gl_ready || !g_pick_fbo || g_layers.empty()) return false;
+    const size_t texels = (size_t)g_canvas_width * (size_t)g_canvas_height;
+    if (g_pick_tex_width != g_canvas_width || g_pick_tex_height != g_canvas_height) {
+        glBindTexture(GL_TEXTURE_2D, g_pick_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI, g_canvas_width, g_canvas_height, 0, GL_RGBA_INTEGER,
+                     GL_UNSIGNED_INT, nullptr);
+        g_pick_tex_width = g_canvas_width;
+        g_pick_tex_height = g_canvas_height;
+    }
+    g_pick_buffer.resize(texels * 4);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, g_pick_fbo);
+    glViewport(0, 0, g_canvas_width, g_canvas_height);
+    // Integer color attachments cannot be blended -- drawing to one with
+    // blending enabled is an error, not a silently ignored setting.
+    glDisable(GL_BLEND);
+    const GLuint zero[4] = {0u, 0u, 0u, 0u};
+    glClearBufferuiv(GL_COLOR, 0, zero);
+    glBindVertexArray(g_vao);
+    glUseProgram(g_pick_program);
+    glUniform2f(g_pick_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform2f(g_pick_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_pick_loc_zoom, g_zoom);
+
+    // Two passes over the layers rather than one interleaved pass, so a vertex
+    // on an early layer can't be overwritten by an edge on a later one landing
+    // in the same texel.
+    const ViewRect view = current_view_rect();
+    for (GLenum primitive : {GL_LINES, GL_POINTS}) {
+        glUniform1ui(g_pick_loc_id, primitive == GL_POINTS ? kPickKindVertex : kPickKindEdge);
+        for (const LayerBuffer& layer : g_layers) {
+            if (!layer.visible) continue;
+            if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
+            draw_layer_outline(layer, primitive);
+        }
+    }
+    glReadPixels(0, 0, g_canvas_width, g_canvas_height, GL_RGBA_INTEGER, GL_UNSIGNED_INT,
+                 g_pick_buffer.data());
+    // The canvas itself is untouched -- nothing was drawn to it -- so no redraw
+    // is owed afterwards.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g_canvas_width, g_canvas_height);
+    glEnable(GL_BLEND);
+    glUseProgram(g_program);
+
+    g_pick_filled = true;
+    g_pick_zoom = g_zoom;
+    g_pick_pan_x = g_pan_x;
+    g_pick_pan_y = g_pan_y;
+    g_pick_epoch = g_layer_epoch;
+    return true;
+}
+
+// Measure mode is over, so the canvas-sized readback is dead weight until it
+// starts again -- 16 bytes a canvas pixel on the wasm heap.
+void release_pick_cache() {
+    g_pick_filled = false;
+    std::vector<uint32_t>().swap(g_pick_buffer);
+}
+
 // Nearest snappable point to a screen position, in world coordinates. False
 // means nothing within kSnapRadiusPx and the caller should use the bare cursor
 // position.
@@ -2355,32 +2387,27 @@ void draw_layer_outline(const LayerBuffer& layer, GLenum primitive) {
 // snapping can work with no CPU-side geometry at all: the answer doesn't have
 // to be found in a data structure, only rendered.
 bool pick_snap_at(float screen_x, float screen_y, float& out_x, float& out_y) {
-    float wx, wy;
-    if (!begin_pick_pass(screen_x, screen_y, wx, wy)) return false;
-    const ViewRect view = pick_view_rect(wx, wy);
+    if (!pick_cache_fresh() && !fill_pick_cache()) return false;
 
-    // Two passes over the layers rather than one interleaved pass, so a vertex
-    // on an early layer can't be overwritten by an edge on a later one landing
-    // in the same texel.
-    for (GLenum primitive : {GL_LINES, GL_POINTS}) {
-        glUniform1ui(g_pick_loc_id, primitive == GL_POINTS ? kPickKindVertex : kPickKindEdge);
-        for (const LayerBuffer& layer : g_layers) {
-            if (!layer.visible) continue;
-            if (!bbox_intersects_view(layer.min_x, layer.max_x, layer.min_y, layer.max_y, view)) continue;
-            draw_layer_outline(layer, primitive);
-        }
-    }
-    end_pick_pass();
-
+    // Texel (i, j) covers canvas pixel column i and, rows being bottom-up,
+    // screen row height - 1 - j; its centre is what the distance is measured
+    // to, the same way the old per-move window measured from its centre.
+    const int width = g_pick_tex_width;
+    const int height = g_pick_tex_height;
+    const int reach = (int)std::ceil(kSnapRadiusPx);
+    const int ci = (int)std::floor(screen_x);
+    const int cj = height - 1 - (int)std::floor(screen_y);
     int best_index = -1;
     uint32_t best_kind = 0;
     float best_dist2 = HUGE_VALF;
     const float radius2 = kSnapRadiusPx * kSnapRadiusPx;
-    for (int j = 0; j < kPickSize; j++) {
-        for (int i = 0; i < kPickSize; i++) {
-            const size_t at = ((size_t)j * kPickSize + i) * 4;
+    for (int j = std::max(0, cj - reach); j <= std::min(height - 1, cj + reach); j++) {
+        const float dy = ((float)height - ((float)j + 0.5f)) - screen_y;
+        for (int i = std::max(0, ci - reach); i <= std::min(width - 1, ci + reach); i++) {
+            const size_t at = ((size_t)j * (size_t)width + (size_t)i) * 4;
             if (g_pick_buffer[at + 3] == 0u) continue;
-            const float dist2 = pick_texel_dist2(i, j);
+            const float dx = ((float)i + 0.5f) - screen_x;
+            const float dist2 = dx * dx + dy * dy;
             if (dist2 > radius2) continue;
             const uint32_t kind = g_pick_buffer[at];
             if (!(kind > best_kind || (kind == best_kind && dist2 < best_dist2))) continue;
@@ -3134,6 +3161,17 @@ bool draw_frame(double time, void* /*userData*/) {
     g_prev_frame_zoom = g_zoom;
     g_prev_frame_pan_x = g_pan_x;
     g_prev_frame_pan_y = g_pan_y;
+
+    // Everything below draws with g_program's camera uniforms, which the cache
+    // path leaves wrong: render_layer_cache sets u_resolution to the cache's
+    // larger size, and a reprojected frame never sets the camera at all. Left
+    // alone, the ruler, labels, markers and highlights draw shrunk toward the
+    // canvas centre and a gesture behind, so they stop lining up with the
+    // pointer on exactly the layouts big enough to use the cache.
+    glUseProgram(g_program);
+    glUniform2f(g_loc_resolution, (float)g_canvas_width, (float)g_canvas_height);
+    glUniform2f(g_loc_offset, g_pan_x, g_pan_y);
+    glUniform1f(g_loc_zoom, g_zoom);
 
     // Back to the shared VAO before anything else draws. Everything below
     // points attributes at its own buffers, and those calls write into
@@ -5992,6 +6030,7 @@ void setMeasureMode(bool on) {
     if (!on) {
         g_measure_pending = false;
         g_snap_active = false;
+        release_pick_cache();
         if (g_gl_ready) {
             update_measure_labels();
             request_redraw();

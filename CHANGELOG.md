@@ -7,6 +7,37 @@ follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 From 1.0.0 on, a breaking change to the element's API waits for a major
 version. Before that, `0.x` releases changed it freely.
 
+## [Unreleased]
+
+### Fixed
+
+- On layouts large enough to use the layer cache (about 5 million polygons),
+  the ruler, the snap marker, labels, ports, markers and the cell highlight
+  drew at about two thirds of their size, pulled toward the canvas centre, so
+  a ruler did not start or end under the pointer. They also lagged behind the
+  camera while panning. The cache renders at 1.5x the canvas size and left
+  that size, and a stale camera, in the uniforms these overlays draw with. The
+  overlays now get the canvas's size and the current camera every frame.
+- The ruler lagged the pointer on large layouts. In measure mode every mouse
+  move looks for a corner or edge to snap to, and did it by drawing a 33-pixel
+  window around the cursor. Nothing culls below the layer level, so that window
+  drew every outline on every layer it touched, which on a full chip is the
+  whole layout, on every mouse move. The snap now draws the whole canvas once,
+  reads it back, and answers each mouse move from that copy. It is drawn again
+  only when the camera, the visible layers, the geometry or the canvas size
+  change. On test layouts of about 10 million polygons, a mouse move in measure
+  mode went from 13 to 15 ms to about 0.1 ms, the same as in pan mode. The
+  first mouse move after a pan or zoom pays for the redraw, about one frame.
+  The copy takes 16 bytes per canvas pixel and is released when measure mode
+  ends.
+
+### Added
+
+- `?gdsCacheMinPolygons=N` overrides the polygon count at which the layer
+  cache turns on. 0 turns it on for any layout, a very large value turns it
+  off. It is there for diagnosing the cache and for the test that covers the
+  overlay fix above.
+
 ## [1.4.0] - 2026-09-17
 
 ### Added

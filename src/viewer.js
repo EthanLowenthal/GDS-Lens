@@ -219,6 +219,25 @@ export function createViewer(mountTarget) {
     };
     const shardOverride = shardsRequested();
 
+    // Overrides the polygon count above which pan and zoom reproject a cached
+    // render instead of drawing the geometry (see kCacheMinPolygons in
+    // renderer.cpp). ?gdsCacheMinPolygons=0 turns the cache on for any layout,
+    // which is how a test checks the cache path on a fixture small enough to
+    // reason about; a huge value turns it off. URL only: it is a diagnostic,
+    // not something an embedder should need to tune.
+    const cacheMinRequested = () => {
+        let raw;
+        try {
+            raw = new URLSearchParams(location.search).get("gdsCacheMinPolygons");
+        } catch {
+            return null;
+        }
+        if (raw === null || raw === "") return null;
+        const count = Number(raw);
+        return Number.isFinite(count) && count >= 0 ? count : null;
+    };
+    const cacheMinOverride = cacheMinRequested();
+
     // Breadcrumbs: the panel always, the host's console only when asked.
     function trace(...args) {
         appendDebugLine(args.map(safeStringify).join(" "), false);
@@ -3136,6 +3155,7 @@ export function createViewer(mountTarget) {
                 return;
             }
             watchCanvasSize(Module);
+            if (cacheMinOverride !== null) Module.setCacheMinPolygons(cacheMinOverride);
             // A GPU reset, or the browser reclaiming the context past its
             // per-page cap. The renderer's GL state cannot be rebuilt in place,
             // so this is terminal for the viewer: say so rather than leaving a
