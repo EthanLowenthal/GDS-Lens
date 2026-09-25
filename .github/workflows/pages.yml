@@ -67,13 +67,27 @@ jobs:
       # installing it here would resolve to the working tree and defeat the
       # point. Downloading the tarball is also the only step that would notice
       # a version missing from the registry.
+      #
+      # After a Publish from a tag, the version is the one the tag names, not
+      # `latest`. This job starts seconds after the publish, and the registry
+      # can still answer `latest` with the previous version then: 1.5.0's
+      # deploy shipped 1.4.0 that way. The same lag can make the new version
+      # itself 404 for a while, hence the retries.
       - name: Fetch the published payload
         env:
-          VERSION: ${{ inputs.version || 'latest' }}
+          VERSION: ${{ inputs.version || (github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_branch, 'v') && github.event.workflow_run.head_branch) || 'latest' }}
         run: |
           set -euo pipefail
+          VERSION="${VERSION#v}"
           mkdir -p /tmp/pkg && cd /tmp/pkg
-          tarball="$(npm pack "gds-lens@${VERSION}" --silent)"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if tarball="$(npm pack "gds-lens@${VERSION}" --silent --prefer-online)"; then
+              break
+            fi
+            [ "$attempt" = 10 ] && exit 1
+            echo "gds-lens@${VERSION} not on the registry yet, retrying in 30s"
+            sleep 30
+          done
           tar xzf "$tarball"
           echo "deploying gds-lens $(node -p 'require("/tmp/pkg/package/package.json").version')"
 
