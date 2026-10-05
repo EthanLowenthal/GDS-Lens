@@ -41,6 +41,10 @@
                 aria-label="Hide the hierarchy tree"
                 title="Hide the hierarchy tree (H)">✕</button>
         </div>
+        <!-- Which cell is shown as the top, with the way back to the file's
+             own top cells. Only shown while one is (see renderHierarchyCrumb
+             in viewer.js). -->
+        <div id="hierarchyCrumb" class="hidden"></div>
         <!-- Find (see the search block in viewer.js): one box over two
              haystacks, the design's cell names and its own TEXT labels.
              Results take the tree's place while a query is up.
@@ -106,4 +110,22 @@
         <button id="canvasMenuCopy" type="button" role="menuitem">
             <span>Copy coordinate</span><span class="menu-value"></span>
         </button>
+    </div>
+
+    <!-- Keyboard shortcuts. The rows are built each time it opens (see the
+         shortcuts block in viewer.js), since a host that owns the keys can
+         rebind them between one opening and the next. -->
+    <div id="shortcutsOverlay" class="hidden">
+        <div id="shortcutsDialog" role="dialog" aria-modal="true"
+             aria-labelledby="shortcutsTitle" tabindex="-1">
+            <div id="shortcutsHeader">
+                <span id="shortcutsTitle">Keyboard Shortcuts</span>
+                <button id="shortcutsClose" type="button" class="icon-only"
+                        aria-label="Close" title="Close (Esc)">✕</button>
+            </div>
+            <table id="shortcutsTable"><tbody></tbody></table>
+            <div id="shortcutsFooter" class="hidden">
+                <button id="shortcutsCustomize" type="button">Customize...</button>
+            </div>
+        </div>
     </div>

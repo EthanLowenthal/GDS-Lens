@@ -141,11 +141,16 @@ self.onmessage = (event) => {
         // ports, and the labels, none of which are filtered by layer and would
         // otherwise come back once per shard. An unsplit load passes no
         // options and gets the lot, as before.
+        //
+        // `root` is the cell to draw as the top (the Top cell control, or the
+        // hierarchy's "Open as top"), the same for every shard; absent, every
+        // top cell is drawn.
         const shard = message.shard || null;
         const options = shard
             ? {tags: shard.tags, stripes: shard.stripes, labels: shard.index === 0,
                hierarchy: shard.index === 0, releaseFile: true}
-            : null;
+            : {};
+        if (message.root) options.root = message.root;
         console.log("[GDS worker] calling Module.parseGdsToLayers('/input.layout')",
                     shard
                         ? `shard ${shard.index} of ${shard.count}, ${shard.tags.length} tags` +
@@ -154,7 +159,7 @@ self.onmessage = (event) => {
         const result = Module.parseGdsToLayers("/input.layout", options);
         console.log("[GDS worker] parseGdsToLayers returned, ok:", result.ok, "format:", result.format, "error:", result.error);
         // releaseFile already dropped it; unlinking twice would throw.
-        if (!options || !options.releaseFile) Module.FS.unlink("/input.layout");
+        if (!options.releaseFile) Module.FS.unlink("/input.layout");
 
         if (!result.ok) {
             postMessage({type: "gdsResult", ok: false, error: result.error});
@@ -204,7 +209,8 @@ self.onmessage = (event) => {
             {type: "gdsResult", ok: true, shard: shard ? shard.index : 0,
              layers: result.layers, instanceGroups: result.instanceGroups,
              hierarchy: result.hierarchy && result.hierarchy.cells ? result.hierarchy : null,
-             bbox: result.bbox, hasGeometry: result.hasGeometry, ports},
+             bbox: result.bbox, hasGeometry: result.hasGeometry, ports,
+             topCells: result.topCells, root: result.root},
             transferList
         );
         console.log("[GDS worker] postMessage(gdsResult) call returned");

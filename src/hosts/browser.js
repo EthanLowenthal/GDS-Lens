@@ -24,6 +24,9 @@
 //   requestReload()      -> void
 //   setAutoReload(on)    -> void
 //   onGotoResult({ok, x, y}) -> void
+//   shortcuts()          -> Promise<{label, keys}[]>   the host binds H, /, M, [, ]
+//   customizeShortcuts() -> void
+//   setKeyboardContext(active) -> void
 //   connect(viewer)      -> void   the viewer's own surface, for pushing in
 //
 // `connect` is how a host drives the viewer rather than answering it:
@@ -33,6 +36,10 @@
 //   viewer.setLyp(name, text)        viewer.setMarkers(name, text)
 //   viewer.showStale(text)           viewer.goToPoint(x, y)
 //   viewer.toggleDebug()             viewer.element  (the mounted element)
+//   viewer.runAction(action)
+//
+// This host implements none of the shortcut methods, so the viewer keeps
+// handling its own keys.
 
 export function createBrowserHost() {
     // ---- Where a viewer's saved views live ----

@@ -5057,7 +5057,19 @@ val parseGdsToLayers(const std::string& path, val options) {
     bool want_labels = true;
     bool want_hierarchy = true;
     bool release_file = false;
+    // Which cell to draw as the top, by name: the viewer's "Top cell" control
+    // and the hierarchy's "Open as top". Empty means every top cell, as
+    // always. A switch is a fresh parse with this set rather than a redraw of
+    // what is already on the GPU, because the flatten has already thrown the
+    // hierarchy away by then: the static geometry is one world-space soup per
+    // layer with no record of which cell put a polygon there, and the
+    // instancing decision (choose_instanced_cells) was made from placement
+    // counts under the old roots. A cell opened on its own sits at its own
+    // origin, too, which no copy of it in the flattened design does.
+    std::string root_name;
     if (!options.isUndefined() && !options.isNull()) {
+        val root_opt = options["root"];
+        if (root_opt.isString()) root_name = root_opt.as<std::string>();
         val tags = options["tags"];
         if (!tags.isUndefined() && !tags.isNull()) {
             sharded = true;
@@ -5124,6 +5136,18 @@ val parseGdsToLayers(const std::string& path, val options) {
     }
     top_cells.clear();
     top_rawcells.clear();
+
+    // The file's own top cells, by name, whichever one is drawn: the list the
+    // viewer's Top cell control offers. Reported by every shard (it is a few
+    // names), so no shard has to be the one that knows.
+    val top_names = val::array();
+    for (Cell* root : roots) top_names.call<void>("push", std::string(root->name ? root->name : ""));
+
+    // A requested root that names no cell in this file (a reload after the
+    // cell was renamed or deleted) falls back to the default rather than
+    // failing the load; `root` in the result says which one was drawn.
+    Cell* chosen = root_name.empty() ? nullptr : lib.get_cell(root_name.c_str());
+    if (chosen) roots.assign(1, chosen);
 
     std::unordered_map<Cell*, double> base_counts;
     for (Cell* root : roots) base_counts[root] += 1.0;
@@ -5386,6 +5410,8 @@ val parseGdsToLayers(const std::string& path, val options) {
     result.set("layers", layers);
     result.set("instanceGroups", instance_groups_js);
     result.set("hierarchy", hierarchy);
+    result.set("topCells", top_names);
+    result.set("root", chosen ? val(root_name) : val::null());
     result.set("ports", ports_js);
     result.set("bbox", bbox);
     // Whether the box above is a real one. Reported alongside rather than

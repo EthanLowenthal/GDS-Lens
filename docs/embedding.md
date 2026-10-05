@@ -50,6 +50,9 @@ can implement any of the following methods:
 | `onGotoResult({ok, x, y})` | `void` | A `goToPoint` call finished, reporting whether it landed inside. |
 | `isLightTheme()` | `boolean` | The viewer needs to know the theme. Defaults to the OS preference. |
 | `createWorker()` | `Worker` | The parse Worker is needed. Where the scripts cannot be fetched by URL, override this. |
+| `shortcuts()` | `Promise<{label, keys}[]>` | The Keyboard Shortcuts dialog opens. Implementing it takes over the rebindable keys; see [Keyboard shortcuts](#keyboard-shortcuts). |
+| `customizeShortcuts()` | `void` | The user clicks Customize in the Keyboard Shortcuts dialog. Without it, the dialog has no Customize button. |
+| `setKeyboardContext(active)` | `void` | Once at mount, then whenever it changes: `true` while the page has focus and that focus is not in a text field. |
 | `connect(viewer)` | `void` | At mount, handing you the surface described in the following section. |
 
 ### The viewer surface
@@ -59,7 +62,7 @@ rather than answering it:
 
 | Method | Description |
 |---|---|
-| `load(bytes, {reload})` | Display a layout from bytes. |
+| `load(bytes, {reload, slot, name, topCell})` | Display a layout from bytes. |
 | `showLoading(label?)` | Say that a layout is on its way. Call it before fetching the bytes: a viewer that has not been handed anything shows "No layout loaded", and without this that is what it shows for the length of the download. |
 | `showError(message)` | Show a fatal error. |
 | `setLyp(name, text)` | Apply layer properties. |
@@ -69,6 +72,9 @@ rather than answering it:
 | `toggleDebug()` | Show or hide the debug panel. |
 | `setNamedViews(views)` | Replace the saved-view set. |
 | `applyTheme()` | Re-ask `isLightTheme()` after a theme change. |
+| `getTopCells(slot?)` | The file's own top cells, and the cell drawn as the top (`null` when all of them are drawn). Returns the value directly, not a promise. |
+| `setTopCell(name, slot?)` | Draw one cell as the top, or `null` for every top cell. See [Choosing the top cell](#choosing-the-top-cell). |
+| `runAction(action)` | Do what one of the viewer's keys does: `"toggleHierarchy"`, `"focusFind"`, `"toggleMeasure"`, `"previousMarker"`, `"nextMarker"`, or `"showShortcuts"` to open the Keyboard Shortcuts dialog. Unknown actions are ignored. |
 | `element` | The `<gds-lens>` the viewer is mounted in. Bind anything of your own to this rather than to `window`, so it stays inside the component. |
 
 `load()` resolves once the layout is on screen and rejects when it fails (or
@@ -140,6 +146,45 @@ about how a layout is drawn rather than about which layout it is.
 Overlaying assumes the two layouts share a coordinate origin. Two revisions of
 one design normally do; there is no per-layout offset.
 
+### Choosing the top cell
+
+A top cell is a cell that no other cell in the file places. A file can have
+several, and the viewer draws all of them by default. `setTopCell(name)` draws
+one cell instead: that cell and everything it places, at the cell's own origin,
+with the camera framed on it. The name can be any cell in the file, not only a
+top cell. `setTopCell(null)` goes back to every top cell.
+
+```js
+const element = document.querySelector("gds-lens");
+const { cells, current } = await element.getTopCells();  // ["TOP_A", "TOP_B"], null
+await element.setTopCell("TOP_B");
+await element.setTopCell("PIXEL");                       // a cell TOP_B places
+await element.setTopCell(null);                          // back to both tops
+```
+
+In the viewer, each of a file's top cells is a root row in the hierarchy, and
+the **Show as new top** button (⤒ on a row) calls this method for that row's
+cell. **Back** above the tree, or `Esc`, calls it with `null`. Everything that describes the design follows the chosen top:
+the layer list and its shape counts, the hierarchy tree, cell and label search,
+the **Ports** folder, ruler snapping, and the camera's bounds.
+
+The viewer keeps the bytes it was given and parses them again with the chosen
+cell as the root, so a switch takes about as long as the first load of that
+part of the design. It does not ask the host for the file again. Keeping the
+bytes costs memory equal to the file's size, or its compressed size for a
+gzipped file.
+
+The choice is per slot: with two layouts loaded, each has its own, and
+`setTopCell(name, "b")` changes only the second. A reload (`load(bytes,
+{ reload: true })`) keeps the choice while the file still has a cell by that
+name, and draws every top cell otherwise. Loading a different file starts
+from every top cell, unless `load()` is given a `topCell`.
+
+Layer visibility is kept across a switch. Rulers are dropped, as they are on
+any load. Saved views and marker coordinates are in the coordinates of
+whatever top was drawn when they were made, so they do not line up after
+opening a placed cell, which sits at its own origin.
+
 ### Saved views on a page with several viewers
 
 Both view methods are handed the viewer asking, which is the same surface
@@ -162,6 +207,47 @@ element an `id` to have them outlive it.
 An embedder with a real document identity to key on -- a file path, a document
 URI -- should implement `loadViews`/`saveViews` itself rather than inherit any
 of that.
+
+### Keyboard shortcuts
+
+By default the viewer handles its own keys: H shows or hides the hierarchy, /
+opens Find, M switches between Pan and Measure, and [ and ] step through
+markers. The Keyboard Shortcuts button in the Display folder lists them.
+
+A host that implements `shortcuts()` takes these five keys over. The viewer
+stops handling them, and the host binds whatever keys it likes and calls
+`runAction` for each. `shortcuts()` returns the rows to list for them, as
+`{ label, keys }` with `keys` as display text (`"H"`, `"Ctrl+K D"`), and is
+called each time the dialog opens, so a rebinding shows up the next time. The
+dialog lists the viewer's fixed keys after the host's rows: Esc, Up, Down and
+Enter in the find box, Alt and Shift while measuring, drag to pan and scroll to
+zoom. The viewer keeps handling those.
+
+Single-letter bindings must not fire while the user types in the find box.
+`setKeyboardContext(active)` tells the host when they may: it is `true` while
+the page has focus and the focused element is not a text field. The viewer
+lives in a shadow root, so the host cannot work this out from
+`document.activeElement`.
+
+```js
+window.gdsLensHost = {
+    shortcuts: () => [
+        { label: "Show or hide the hierarchy", keys: "Alt+H" },
+        { label: "Find a cell or label", keys: "Ctrl+F" }
+    ],
+    setKeyboardContext(active) { keysEnabled = active; },
+    connect(viewer) {
+        window.addEventListener("keydown", (event) => {
+            if (!keysEnabled) return;
+            if (event.altKey && event.key === "h") viewer.runAction("toggleHierarchy");
+            if (event.ctrlKey && event.key === "f") {
+                event.preventDefault();
+                viewer.runAction("focusFind");
+            }
+        });
+    }
+};
+```
 
 ### Example: a custom host
 

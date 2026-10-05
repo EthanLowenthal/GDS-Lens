@@ -89,6 +89,7 @@ export default [
         files: ["test/browser-smoke.test.js", "test/custom-element.test.js",
             "test/host-contract.test.js", "test/viewer-ui.test.js",
             "test/compare-slots.test.js", "test/parse-split.test.js", "test/frame-cache.test.js", "test/ruler-snap.test.js",
+            "test/top-cell.test.js", "test/shortcuts.test.js",
             "test/esm-bundle.test.js", "test/react.test.js",
             "scripts/check-site.mjs", "scripts/make-og-image.mjs",
             "scripts/bench-render.mjs"],

@@ -16,6 +16,27 @@ version. Before that, `0.x` releases changed it freely.
   `ViewerHost` methods, `loadDisplay` and `saveDisplay`. The default browser
   host keeps them in `localStorage`. Only the user's own changes are saved:
   Text turning on to show a label search's result is not.
+- Choose which top cell is drawn. A file with more than one top cell still
+  draws all of them by default, each as a root row in the hierarchy. The
+  **Show as new top** button (⤒ on a hierarchy row) draws only that cell and
+  what it places, at the cell's own origin. It works on any cell, not only a
+  top cell. The layer list, hierarchy, search, ports and framing follow the
+  chosen top. **Back** above the tree or
+  `Esc` returns to the full layout. A reload keeps the choice while the cell
+  still exists. Each layout in a comparison has its own choice.
+- `getTopCells()` and `setTopCell()` on the element and the viewer surface,
+  a `topCell` option on `load()`, and `topCell` in the `gds-load` event's
+  detail.
+- A **Keyboard Shortcuts** dialog, opened from a button at the bottom of the
+  Display folder, lists the viewer's keys.
+- An embedder can own the rebindable keys (`H`, `/`, `M`, `[`, `]`). Three new
+  optional `ViewerHost` methods: `shortcuts()` lists the host's bindings in the
+  dialog and stops the viewer handling those keys itself;
+  `customizeShortcuts()` adds a Customize button to the dialog; and
+  `setKeyboardContext(active)` reports whether keys typed now are meant for
+  the viewer rather than a text field. `runAction(action)` on the viewer
+  surface runs what each key does, and opens the dialog with
+  `"showShortcuts"`.
 
 ### Fixed
 
@@ -239,11 +260,8 @@ version. Before that, `0.x` releases changed it freely.
   flag, and the Compare folder is not built at all until a second layout is
   loaded.
 
-- **gdsfactory / kfactory ports.** kfactory records each cell's ports as
-  KLayout meta info, which KLayout writes into the layout file itself: a
-  `$$$CONTEXT_INFO$$$` cell in GDSII, `KLAYOUT_CONTEXT` properties in OASIS,
-  each holding strings like `META('kfactory:ports:0')={'name'=>'o1',...}`. The
-  viewer now reads those back (`src/wasm/kfactory_ports.cpp`) -- name, type,
+- **Ports.** Python layout libraries can record each cell's ports as metadata
+  inside the layout file. The viewer now reads those back -- name, type,
   position, direction, width and layer, through the named cross-section --
   and expands them through every placement, so a component's ports are marked
   wherever it sits in the design: a bar across the port, an arrow the way it

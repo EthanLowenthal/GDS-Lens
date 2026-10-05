@@ -80,6 +80,45 @@ export interface Measurement {
     y1: number;
 }
 
+/** Which top cell a layout draws, as `getTopCells()` reports it. */
+export interface TopCellInfo {
+    /** The file's own top cells: the cells nothing else in it places. */
+    cells: string[];
+    /**
+     * The cell drawn as the top, or `null` when every top cell is drawn (the
+     * default). Can name a cell that is not in `cells`, after a cell placed
+     * inside the design was shown as the top cell.
+     */
+    current: string | null;
+}
+
+/**
+ * What a rebindable key does, for `runAction()`. By default the viewer binds
+ * these itself: `toggleHierarchy` to H, `focusFind` to /, `toggleMeasure`
+ * (between Pan and Measure) to M, `previousMarker` and `nextMarker` to [ and
+ * ]. `showShortcuts` opens the Keyboard Shortcuts dialog and has no key of
+ * its own.
+ */
+export type ViewerAction =
+    | "toggleHierarchy"
+    | "focusFind"
+    | "toggleMeasure"
+    | "previousMarker"
+    | "nextMarker"
+    | "showShortcuts";
+
+/** One row of the Keyboard Shortcuts dialog, as a host's `shortcuts()` lists it. */
+export interface ShortcutRow {
+    /** What the key does. */
+    label: string;
+    /**
+     * The key as it should be shown, such as `"H"` or `"Ctrl+K D"`. Each key
+     * is drawn as its own `<kbd>`: chords split on spaces, combinations on
+     * `+`, and alternatives on `" / "`.
+     */
+    keys: string;
+}
+
 /** Options for `load()`. */
 export interface LoadOptions {
     /**
@@ -97,6 +136,12 @@ export interface LoadOptions {
     slot?: Slot;
     /** Filename to show for this layout in the panel's Compare folder. */
     name?: string;
+    /**
+     * The cell to draw as the top, as `setTopCell()` takes it. Omitted, a
+     * reload keeps the current choice and any other load draws every top
+     * cell. A name the file does not have draws every top cell.
+     */
+    topCell?: string | null;
 }
 
 /**
@@ -143,6 +188,20 @@ export interface ViewerSurface {
     setBlend(value: number): Promise<void>;
     getBlend(): number;
 
+    /** Which top cell `slot` (default `"a"`) draws, and the file's own top cells. */
+    getTopCells(slot?: Slot): TopCellInfo;
+    /**
+     * Draws `name` as the top cell of `slot` (default `"a"`): only that cell
+     * and what it places, at the cell's own origin, framed. Any cell in the
+     * file can be named, not only a top cell. `null` goes back to drawing
+     * every top cell. Layer visibility is kept; rulers are dropped, as on any
+     * load. The layout is parsed again from the bytes it was loaded from.
+     *
+     * Resolves once the new top is on screen. Rejects if the layout has no
+     * cell by that name, or nothing is loaded in `slot`.
+     */
+    setTopCell(name: string | null, slot?: Slot): Promise<void>;
+
     // The rest are for an app driving the viewer itself -- framing the view,
     // reading the layer table, placing a ruler.
     getCamera(): Promise<Camera>;
@@ -159,6 +218,13 @@ export interface ViewerSurface {
     addMeasurement(x0: number, y0: number, x1: number, y1: number): Promise<void>;
     /** Rulers do not survive a load into either slot -- re-add them after a `gds-load` if that matters to you. */
     clearMeasurements(): Promise<void>;
+
+    /**
+     * Does what the action's key does. For a host that binds the keys itself
+     * (see `ViewerHost.shortcuts`), and for a toolbar or menu of your own.
+     * An action this viewer does not know is ignored.
+     */
+    runAction(action: ViewerAction): void;
 }
 
 /**
@@ -205,6 +271,27 @@ export interface ViewerHost {
     isLightTheme?(): boolean;
     /** Override where the payload's scripts cannot be fetched by URL. */
     createWorker?(): Worker;
+    /**
+     * Implementing this takes over the rebindable keys (H, /, M, [ and ]): the
+     * viewer stops handling them, and the host binds keys of its own that
+     * call `runAction`. The rows returned are listed at the top of the
+     * Keyboard Shortcuts dialog, above the keys the viewer keeps (Esc, the
+     * find box's Up, Down and Enter, Alt and Shift while measuring, drag and
+     * scroll). Called each time the dialog opens.
+     */
+    shortcuts?(): ShortcutRow[] | Promise<ShortcutRow[]>;
+    /**
+     * Adds a "Customize..." button to the Keyboard Shortcuts dialog, which
+     * closes the dialog and calls this.
+     */
+    customizeShortcuts?(): void;
+    /**
+     * `true` while the page has focus and that focus is not in a text field;
+     * `false` otherwise. For a host that binds single keys, so they do not
+     * fire while the user is typing in the find box. Called once at mount
+     * and then on every change.
+     */
+    setKeyboardContext?(active: boolean): void;
     /** Called at mount, handing over the push-direction surface. */
     connect?(viewer: ViewerSurface): void;
 }
@@ -224,7 +311,14 @@ export type LayoutSource = string | Uint8Array | ArrayBuffer;
  */
 export interface GdsLensEventMap extends HTMLElementEventMap {
     /** A layout finished loading and is on screen. `slot` says which one. */
-    "gds-load": CustomEvent<{ slot: Slot; layerCount: number; cellCount: number; portCount: number }>;
+    "gds-load": CustomEvent<{
+        slot: Slot;
+        layerCount: number;
+        cellCount: number;
+        portCount: number;
+        /** The cell drawn as the top, or `null` for every top cell. See `setTopCell`. */
+        topCell: string | null;
+    }>;
     /** A load failed, or `showError()` was called. `message` is what the viewer shows. */
     "gds-error": CustomEvent<{ message: string }>;
 }
@@ -301,6 +395,8 @@ export declare class GdsLens extends HTMLElement {
     unload(slot?: Slot): Promise<void>;
     setBlend(value: number): Promise<void>;
     getBlend(): Promise<number>;
+    getTopCells(slot?: Slot): Promise<TopCellInfo>;
+    setTopCell(name: string | null, slot?: Slot): Promise<void>;
 
     /**
      * Gives up this element's viewer for good, releasing its WebAssembly

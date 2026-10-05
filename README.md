@@ -65,9 +65,13 @@ a streaming WebAssembly compile — see
   and ASCII DRC results.
 - **Navigates hierarchy**. You can search cells and labels, and measure
   distances.
-- **Shows gdsfactory / kfactory ports**. A layout written by gdsfactory 8+
-  carries its ports as KLayout metadata inside the file; the viewer reads them
-  back and lists the top cell's ports in the panel. **Display > Ports** draws
+- **Chooses the top cell**. A file with several top cells draws all of them by
+  default, each as a root row in the hierarchy. The **Show as new top**
+  button (⤒ on a row) draws that cell on its own, at its own origin. It works
+  on any cell, not only a top cell. **Back** above the tree or `Esc` returns to
+  the full layout.
+- **Shows ports**. A layout written by a Python layout library can carry its
+  ports as metadata inside the file; the viewer reads them back and lists the top cell's ports in the panel. **Display > Ports** draws
   every port as a bar across its width with an arrow the way it faces (and its
   name, close in). Ports inside placed cells are drawn once you zoom in.
   No Python involved.
@@ -128,6 +132,8 @@ The element exposes the following members:
 | `unload(slot?)` | `Promise<void>` | Drops the second layout, leaving a single-layout viewer. |
 | `setBlend(t)` | `Promise<void>` | Crossfades two loaded layouts: `0` shows only A, `1` only B, between overlays them. |
 | `getBlend()` | `Promise<number>` | The current crossfade. |
+| `getTopCells(slot?)` | `Promise<{cells, current}>` | The file's own top cells, and the cell drawn as the top (`null` when all of them are drawn). |
+| `setTopCell(name, slot?)` | `Promise<void>` | Draws one cell as the top: only that cell and what it places, at its own origin, framed. Any cell can be named. `null` draws every top cell again. Rejects if the layout has no cell by that name. |
 
 Every `load()` cancels the one before it *for the same slot*, so two quick
 changes to `src` show the second layout even when the first is the slower
@@ -139,7 +145,7 @@ The element dispatches events on itself. None bubbles.
 
 | Event | `detail` | When |
 |---|---|---|
-| `gds-load` | `{ slot, layerCount, cellCount, portCount }` | A layout finished loading and is on screen, whichever way the load was started — the `src` attribute, `load()`, or a host pushing bytes through its surface. `slot` is which of the two layouts it is. `portCount` is how many ports its kfactory metadata declared, 0 for a plain file. |
+| `gds-load` | `{ slot, layerCount, cellCount, portCount, topCell }` | A layout finished loading and is on screen, whichever way the load was started: the `src` attribute, `load()`, `setTopCell()`, or a host pushing bytes through its surface. `slot` is which of the two layouts it is. `portCount` is how many ports its port metadata declared, 0 for a plain file. `topCell` is the cell drawn as the top, or `null` when every top cell is drawn. |
 | `gds-error` | `{ message }` | A load failed, or `showError()` was called. `message` is the text the viewer shows. |
 
 ```js
@@ -163,9 +169,14 @@ they go to the one under the mouse.
 |---|---|
 | `[` / `]` | Previous / next marker in the selected marker's category. |
 | `m` | Toggle measure mode. Click two points to place a ruler. |
-| `Esc` | Abandon a ruler being placed; with none in progress, clear the finished ones and return to pan mode. Also closes the coordinate menu. |
+| `Esc` | Abandon a ruler being placed; with none in progress, clear the finished ones and return to pan mode. Also closes the coordinate menu. With none of that to do and no hierarchy row selected, go back from a cell shown as the top cell to the full layout. |
 | `h` | Show or hide the cell hierarchy. |
 | `/` | Focus the cell filter box. |
+
+The **Keyboard Shortcuts** button at the bottom of the panel's Display folder
+lists these keys in a dialog. A host can take over the letter and bracket keys
+and bind its own; the dialog then lists the host's bindings. See
+[Keyboard shortcuts](docs/embedding.md#keyboard-shortcuts) in the embedding guide.
 
 #### Several viewers on one page
 

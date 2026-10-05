@@ -317,6 +317,16 @@ export class GdsLens extends ElementBase {
         return (await this.ready).getBlend();
     }
 
+    // Which of the file's top cells is drawn, and a way to draw one cell (any
+    // cell, not only a top one) on its own. See setTopCell in viewer.js.
+    async getTopCells(slot = "a") {
+        return (await this.ready).getTopCells(slot);
+    }
+
+    async setTopCell(name, slot = "a") {
+        return (await this.ready).setTopCell(name, slot);
+    }
+
     // Thin pass-throughs to the surface, same as everything above, for a page
     // that wants to frame the view, read the layer table or place a ruler
     // itself (see docs/embedding.md).

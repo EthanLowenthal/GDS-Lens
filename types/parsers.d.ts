@@ -72,7 +72,7 @@ export function sniffMarkerFormat(text: string): "lyrdb" | "drc" | null;
 /** Parses a whitespace-separated coordinate list into a packed array. */
 export function parsePointList(text: string): Float64Array;
 
-/** Parses a KLayout `.lyrdb` report database. Throws if it is not one. */
+/** Parses a `.lyrdb` report database. Throws if it is not one. */
 export function parseLyrdb(text: string, DOMParserCtor: DOMParserConstructor): MarkerModel;
 
 /** Parses an ASCII DRC results database. */

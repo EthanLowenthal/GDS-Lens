@@ -85,10 +85,10 @@ test("the host is connected and asked for its stored views", opts, async () => {
 });
 
 // The Display folder's checkbox for a toggle, by the label it shows.
-const displayBox = (page, label) => page.evaluate((label) => {
+const displayBox = (page, label) => page.evaluate((name) => {
     const root = document.querySelector("gds-lens").shadowRoot;
     const row = [...root.querySelectorAll(".lil-controller")]
-        .find((r) => r.querySelector(".lil-name")?.textContent === label);
+        .find((r) => r.querySelector(".lil-name")?.textContent === name);
     return row.querySelector("input[type=checkbox]").checked;
 }, label);
 

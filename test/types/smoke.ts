@@ -6,7 +6,7 @@
 
 import type {
     GdsLens, GdsLensEventMap, ViewerHost, ViewerSurface, PickedFile, NamedView, GotoResult,
-    LayoutSource,
+    LayoutSource, TopCellInfo, ShortcutRow, ViewerAction,
 } from "../../types/gds-lens.js";
 import type { MarkerModel, FlatMarkerModel, DOMParserConstructor } from "../../types/parsers.js";
 import type { CellNode } from "../../types/cell-search.js";
@@ -39,7 +39,7 @@ element.addEventListener("click", (event) => {
     void x;
 });
 const loadDetail: GdsLensEventMap["gds-load"]["detail"] =
-    { slot: "a", layerCount: 1, cellCount: 2, portCount: 0 };
+    { slot: "a", layerCount: 1, cellCount: 2, portCount: 0, topCell: null };
 void loadDetail;
 const surface: ViewerSurface = await element.ready;
 surface.element.addEventListener("drop", () => {});
@@ -54,6 +54,15 @@ const sources: Array<0 | 1> = (await element.getLayers()).map((layer) => layer.s
 void sources;
 await element.unload("b");
 void landed;
+
+// --- the top cell ---
+const tops: TopCellInfo = await element.getTopCells();
+const drawn: string | null = tops.current;
+void drawn;
+await element.setTopCell(tops.cells[0] ?? null);
+await element.setTopCell("SUB", "b");
+await element.setTopCell(null);
+await element.load(new Uint8Array(8), { topCell: "SUB" });
 
 // createElement must come back typed, via HTMLElementTagNameMap.
 const created = document.createElement("gds-lens");
@@ -71,6 +80,22 @@ const host: ViewerHost = {
     },
 };
 window.gdsLensHost = host;
+
+// --- a host that owns the keyboard shortcuts ---
+const rows: ShortcutRow[] = [{ label: "Toggle the hierarchy", keys: "Ctrl+K H" }];
+const keyHost: ViewerHost = {
+    shortcuts: () => rows,
+    customizeShortcuts() {},
+    setKeyboardContext(active: boolean) { void active; },
+    connect(viewer: ViewerSurface) {
+        const action: ViewerAction = "toggleHierarchy";
+        viewer.runAction(action);
+        viewer.runAction("showShortcuts");
+    },
+};
+const asyncKeyHost: ViewerHost = { shortcuts: async () => rows };
+void keyHost;
+void asyncKeyHost;
 
 // A read-only embed implements almost nothing -- this must still type.
 const minimalHost: ViewerHost = {};

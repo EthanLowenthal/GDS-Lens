@@ -362,7 +362,8 @@ function unionBbox(into, next, hasGeometry) {
 // entry per layer, not per polygon) and makes the stack the same
 // everywhere, split or not.
 function mergeShardResults(results) {
-    const merged = { layers: [], instanceGroups: [], hierarchy: null, ports: null, bbox: null };
+    const merged = { layers: [], instanceGroups: [], hierarchy: null, ports: null, bbox: null,
+                     topCells: [], root: null };
     // Instanced cells are decided from the hierarchy, which no shard
     // filters, so every shard holding any of a cell's geometry reports
     // that cell as a group of its own -- same placements, a slice of the
@@ -395,12 +396,17 @@ function mergeShardResults(results) {
         }
         if (result.hierarchy) merged.hierarchy = result.hierarchy;
         if (result.ports) merged.ports = result.ports;
+        // Every shard reports the same top cells and the same root (they are
+        // read from the hierarchy, which no shard filters).
+        if (result.topCells) merged.topCells = result.topCells;
+        if (result.root) merged.root = result.root;
         merged.bbox = unionBbox(merged.bbox, result.bbox, result.hasGeometry);
     }
     merged.layers.sort((a, b) => a.layer - b.layer || a.datatype - b.datatype);
     for (const group of merged.instanceGroups) {
         group.layers.sort((a, b) => a.layer - b.layer || a.datatype - b.datatype);
     }
+    merged.hasGeometry = merged.bbox !== null;
     if (!merged.bbox) merged.bbox = { minX: 0, maxX: 0, minY: 0, maxY: 0 };
     return merged;
 }

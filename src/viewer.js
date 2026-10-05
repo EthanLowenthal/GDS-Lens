@@ -350,8 +350,22 @@ export function createViewer(mountTarget) {
         // View state captured for this slot's in-flight reload, re-applied
         // once its geometry is uploaded. Null on a first open.
         viewState: null,
+        // Set by a top-cell switch: frame the new top once it is uploaded,
+        // where a reload keeps the camera.
+        reframe: false,
         name: null,
         hierarchy: null,
+        // The bytes this slot was loaded from, kept so the top cell can be
+        // changed without asking the host for the file again (see setTopCell).
+        // Held as given, so a gzipped file stays compressed here.
+        source: null,
+        // The cell asked to be drawn as the top, or null for every top cell
+        // (the default). Carried across a reload; reset by loading another file.
+        topCell: null,
+        // What the last parse reported: the file's own top cells, and the
+        // cell it actually drew as the top (null when it drew all of them).
+        topCells: [],
+        root: null,
         loaded: false
     }));
 
@@ -455,6 +469,16 @@ export function createViewer(mountTarget) {
     // the embedder does not offer it, and the control for it is hidden.
     const hostCan = (name) => typeof host[name] === "function";
     const hostCall = (name, ...args) => (hostCan(name) ? host[name](...args) : undefined);
+
+    // Where a keystroke is typing rather than a command: a textarea, an
+    // editable element, or an input other than the ones that only take a
+    // click. Shared by the keydown handler and the keyboard context a host
+    // is told about, so the two agree on what "typing" is.
+    const NON_TEXT_INPUTS = new Set(["checkbox", "radio", "button", "submit", "reset", "range", "color", "file", "image"]);
+    const isTextEntry = (el) => !!el && (
+        el.tagName === "TEXTAREA"
+        || (el.tagName === "INPUT" && !NON_TEXT_INPUTS.has(el.type))
+        || el.isContentEditable === true);
     trace("[GDS] host ready; Worker:", typeof Worker, "Blob:", typeof Blob, "bundled worker:", !!workerBundle);
 
     // container: the panel belongs inside the shadow root, not at document level.
@@ -481,6 +505,7 @@ export function createViewer(mountTarget) {
             if (picked) applyMarkers(picked.name, picked.text);
         }),
         resetView: () => modulePromise.then((Module) => Module.resetView()),
+        showShortcuts: () => openShortcuts(),
         showInfill: false,
         showText: false,
         // Off by default, like the text: a photonics layout declares ports on
@@ -558,7 +583,7 @@ export function createViewer(mountTarget) {
     const portsController = displayFolder.add(actions, "showPorts").name("Ports")
         .onChange((show) => setDisplay("showPorts", show));
     portsController.domElement.title =
-        "Show the ports a gdsfactory / kfactory layout declares: a bar across each, an arrow the way it faces, " +
+        "Show the ports the layout declares: a bar across each, an arrow the way it faces, " +
         "its name close in. The top cell's are drawn at every zoom, the placed cells' once zoomed in";
     // Draw each layer as the union of its polygons (boundary + fill only, no
     // internal edges) -- a pure render-mode toggle, no re-parse involved.
@@ -597,6 +622,9 @@ export function createViewer(mountTarget) {
     const lypController = displayFolder.add(actions, "loadLypFile").name("Load .lyp File");
     const markerController = displayFolder.add(actions, "loadMarkerFile").name("Load Marker File (.lyrdb / DRC)");
     displayFolder.add(actions, "resetView").name("Reset View");
+    // Last, under Reset View: it changes nothing, so it sits with the row that
+    // also only acts on the view, out of the way of the toggles.
+    displayFolder.add(actions, "showShortcuts").name("Keyboard Shortcuts");
 
     // On a phone the panel is most of the screen, so it starts collapsed to its
     // title bar rather than opening over the layout: the point of arriving is
@@ -711,6 +739,51 @@ export function createViewer(mountTarget) {
         const count = Module.measurementCount();
         rulerRow.style.display = count > 0 ? "" : "none";
         rulerClearBtn.textContent = `Clear ${count}`;
+    }
+
+    // ---- Top cell ----
+    // A file can hold several top cells (cells nothing else places), and by
+    // default every one of them is drawn; each is a root row in the hierarchy.
+    // A row's "Show as new top" button draws that cell on its own instead,
+    // at its own origin, whether it is one of the file's top cells or a cell
+    // placed inside one. The slot is parsed again from the bytes it was loaded
+    // from with that cell as the root (see `root` on parseGdsToLayers), so the
+    // layer counts, the tree, the search, the ports and the framing all follow
+    // it with no special case of their own. While comparing, each layout has
+    // its own choice, since the two need not share cell names.
+    // Parses the slot again with `name` as its top cell (null for the file's
+    // own top cells), keeping the layer visibility and framing the result.
+    // Resolves once it is on screen.
+    async function setTopCell(name, slotId = "a") {
+        const slot = slotOf(slotId);
+        if (!slot.source) throw new Error(`No layout is loaded in slot "${slot.id}"`);
+        const target = name || null;
+        if (target === slot.topCell && slot.workers.length === 0) return;
+        const cells = slot.hierarchy && slot.hierarchy.cells;
+        if (target && cells && cells.length > 0 && !cells.some((cell) => cell.name === target)) {
+            throw new Error(`No cell named "${target}" in this layout`);
+        }
+        await loadLayout(slot.source, { slot: slot.id, topCell: target }, { reframe: true });
+        // The tree was too big to check the name against up front, and the
+        // parse fell back to the default.
+        if (target && slot.root !== target) throw new Error(`No cell named "${target}" in this layout`);
+    }
+
+    function getTopCells(slotId = "a") {
+        const slot = slotOf(slotId);
+        return { cells: [...slot.topCells], current: slot.root };
+    }
+
+    // Back to every top cell, in each layout that had one opened. Escape does
+    // this once it has nothing else to take down.
+    function resetTopCells() {
+        for (const slot of slots) {
+            if (slot.loaded && slot.topCell) {
+                setTopCell(null, slot.id).catch((err) => {
+                    if (err && err.name !== "AbortError") fail("[GDS] top cell switch failed:", err);
+                });
+            }
+        }
     }
 
     // Rulers are placed by clicking the canvas, and renderer.cpp owns that mouse
@@ -1356,6 +1429,7 @@ export function createViewer(mountTarget) {
     const hierarchyCount = els.hierarchyCount;
     const hierarchyHide = els.hierarchyHide;
     const hierarchyShowBtn = els.hierarchyShowBtn;
+    const hierarchyCrumb = els.hierarchyCrumb;
 
     let hierarchyModel = null;
     // Open branches and the selected row are keyed by their path of cell names
@@ -1579,6 +1653,29 @@ export function createViewer(mountTarget) {
             // Only on the roots, and only while comparing: below the top the
             // branch you are in already says which design you are reading.
             if (depth === 0 && comparing()) row.append(slotChip(cell.slot));
+            // Every row but the one already drawn alone as the top can be
+            // shown as the new top itself (see setTopCell), in the layout it
+            // belongs to.
+            const owner = slotOf(cell.slot);
+            const alone = owner.root === cell.name || (owner.root === null && owner.topCells.length === 1);
+            if (!(depth === 0 && alone)) {
+                const open = document.createElement("button");
+                open.type = "button";
+                open.className = "hier-open";
+                open.textContent = "⤒";
+                // The button's own title, which the browser shows over the
+                // row's: the innermost element with a title is the tooltip.
+                open.title = "Show as new top";
+                open.setAttribute("aria-label", "Show as new top");
+                open.addEventListener("click", (event) => {
+                    // The row's own click would frame the cell in the old top.
+                    event.stopPropagation();
+                    setTopCell(cell.name, owner.id).catch((err) => {
+                        if (err && err.name !== "AbortError") fail("[GDS] show as new top failed:", err);
+                    });
+                });
+                row.append(open);
+            }
             row.title = hierarchyTooltip(cell, node, box, boxes);
 
             const children = document.createElement("div");
@@ -1835,6 +1932,40 @@ export function createViewer(mountTarget) {
         // panel has been opened by hand it stays open for the rest of the session,
         // including across reloads and other files.
         setHierarchyOpen(hierarchyUserChoice === true);
+    }
+
+    // The line over the tree saying which cell is shown as the top, one per
+    // layout that has one, each with the way back to the file's own top
+    // cells. Rebuilt after every load and unload, which is when it changes.
+    function renderHierarchyCrumb() {
+        if (!hierarchyCrumb) return;
+        hierarchyCrumb.textContent = "";
+        // A file's only top cell, picked by name, is the default by another
+        // name: nothing to go back to.
+        const rooted = slots.filter((slot) => slot.loaded && slot.root &&
+            !(slot.topCells.length === 1 && slot.topCells[0] === slot.root));
+        hierarchyCrumb.classList.toggle("hidden", rooted.length === 0);
+        for (const slot of rooted) {
+            const line = document.createElement("div");
+            line.className = "hier-crumb";
+            if (comparing()) line.append(slotChip(slot.id));
+            const name = document.createElement("span");
+            name.className = "hier-crumb-name";
+            name.textContent = `Top: ${slot.root}`;
+            name.title = `${slot.root} is drawn as the top cell`;
+            const back = document.createElement("button");
+            back.type = "button";
+            const home = slot.topCells.length === 1 ? slot.topCells[0] : "all top cells";
+            back.textContent = slot.topCells.length === 1 ? `Back to ${home}` : "Back to all";
+            back.title = `Draw ${home} again (Esc)`;
+            back.addEventListener("click", () => {
+                setTopCell(null, slot.id).catch((err) => {
+                    if (err && err.name !== "AbortError") fail("[GDS] top cell switch failed:", err);
+                });
+            });
+            line.append(name, back);
+            hierarchyCrumb.append(line);
+        }
     }
 
     // Both the ✕ and the reopen button are the user speaking, as is the H key
@@ -2328,7 +2459,7 @@ export function createViewer(mountTarget) {
         // The count is of what the list holds, so a file whose ports are all
         // inside placed cells gets no "(0)" over a canvas full of them.
         portsFolder = gui.addFolder(topPorts.length ? `Ports (${topPorts.length})` : "Ports");
-        portsFolder.domElement.title = `${plural(declared, "port")} declared in this file's kfactory ` +
+        portsFolder.domElement.title = `${plural(declared, "port")} declared in this file's port ` +
             `metadata; the ${topPorts.length} on the top cell are listed here and always drawn`;
         // Open: the list is the design's own interface, and short.
         portsFolder.open();
@@ -2639,6 +2770,20 @@ export function createViewer(mountTarget) {
         // With two viewers on the page both hear this, so only the one the
         // user last pointed at acts on it. A single viewer always owns the
         // keyboard, so this is a no-op in the common case.
+        // The shortcuts dialog is modal: while it is up, Escape closes it and
+        // does nothing else, and the viewer's other keys are left alone.
+        // Checked before hasKeyboard, since a host can open it on a viewer
+        // the user has not clicked.
+        if (shortcutsOpen()) {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                closeShortcuts();
+            } else if (event.key === "Tab") {
+                trapShortcutsFocus(event);
+            }
+            return;
+        }
         if (!hasKeyboard()) return;
         // Don't hijack typing in lil-gui's text/number inputs -- but focused
         // checkboxes and buttons must not block marker stepping.
@@ -2646,15 +2791,12 @@ export function createViewer(mountTarget) {
         // menu's dismissal above: event.target here is the <gds-lens> host, so
         // this guard used to see "GDS-LENS" for every keystroke and let m/h//
         // through while someone was typing in a lil-gui text box.
-        const t = event.composedPath()[0] || event.target;
-        const tag = t && t.tagName;
-        if (tag === "TEXTAREA" || (tag === "INPUT" && t.type !== "checkbox")) return;
-        if (event.key === "[") stepMarker(-1);
-        else if (event.key === "]") stepMarker(1);
-        // Mode switching from the keyboard, since measuring is a two-hand job
-        // (click, click, then back to panning): M enters measure mode, Escape
-        // always lands back in pan mode and drops the ruler.
-        else if (event.key === "m" || event.key === "M") setMode(currentMode === "measure" ? "pan" : "measure");
+        if (isTextEntry(event.composedPath()[0] || event.target)) return;
+        // A host that lists its own shortcuts has bound H, /, M, [ and ]
+        // itself and calls runAction for them, so the viewer leaves those keys
+        // alone; acting on them here as well would run each action twice, or
+        // run it on a key the user has since rebound to something else.
+        if (!hostOwnsKeys && runKeyAction(event)) return;
         // Escape is the "put the canvas back" key: it takes down the things the
         // viewer draws on top of the layout at the user's request. For rulers that
         // is two steps rather than one (see escapeMeasure in renderer.cpp) -- the
@@ -2662,30 +2804,259 @@ export function createViewer(mountTarget) {
         // nothing left to abandon clears the finished ones and leaves the mode.
         // A finished measurement is an annotation, so it shouldn't disappear on the
         // same keystroke that backs out of a half-drawn one.
-        else if (event.key === "Escape") {
+        if (event.key === "Escape") {
             // The canvas menu first and alone: it's the most recent thing put on
             // screen, and Escape shouldn't also throw away a measurement behind it.
             if (canvasMenuEl && !canvasMenuEl.classList.contains("hidden")) {
                 hideCanvasMenu();
                 return;
             }
+            // With nothing else left for it to take down, Escape goes back from
+            // a cell shown as the top to the file's own top cells.
+            const selected = hierarchySelectedPath !== null;
             modulePromise.then((Module) => {
+                const idle = currentMode === "pan" && Module.measurementCount() === 0 && !selected;
                 if (!Module.escapeMeasure()) setMode("pan");
                 refreshRulerRow(Module);
+                if (idle) resetTopCells();
             });
             hierarchyDeselect();
         }
-        // H shows/hides the hierarchy tree -- it's the one panel that takes a
-        // slice of the viewport, so getting it out of the way is worth a key.
-        else if (event.key === "h" || event.key === "H") toggleHierarchy();
-        // "/" jumps to the find box (opening the panel if it's away), the way it
-        // does in a file tree. preventDefault so the slash itself doesn't land in
-        // the box that just took focus.
-        else if (event.key === "/") {
-            event.preventDefault();
-            focusFindBox();
-        }
     }, { capture: true, signal: disposeSignal });
+
+    // The rebindable keys, for a host that has not taken them over. Returns
+    // whether the key was one of them.
+    function runKeyAction(event) {
+        const action = {
+            "[": "previousMarker",
+            "]": "nextMarker",
+            m: "toggleMeasure",
+            M: "toggleMeasure",
+            h: "toggleHierarchy",
+            H: "toggleHierarchy",
+            "/": "focusFind"
+        }[event.key];
+        if (!action) return false;
+        // So the slash itself doesn't land in the find box that just took focus.
+        if (action === "focusFind") event.preventDefault();
+        runAction(action);
+        return true;
+    }
+
+    // What the rebindable keys do, by name rather than by key, so a host that
+    // binds the keys itself (see hostOwnsKeys) runs exactly the same code.
+    function runAction(action) {
+        switch (action) {
+            // H shows/hides the hierarchy tree -- it's the one panel that takes a
+            // slice of the viewport, so getting it out of the way is worth a key.
+            case "toggleHierarchy": toggleHierarchy(); break;
+            // "/" jumps to the find box (opening the panel if it's away), the way
+            // it does in a file tree.
+            case "focusFind": focusFindBox(); break;
+            // Mode switching from the keyboard, since measuring is a two-hand job
+            // (click, click, then back to panning): M enters measure mode, Escape
+            // always lands back in pan mode and drops the ruler.
+            case "toggleMeasure": setMode(currentMode === "measure" ? "pan" : "measure"); break;
+            case "previousMarker": stepMarker(-1); break;
+            case "nextMarker": stepMarker(1); break;
+            case "showShortcuts": openShortcuts(); break;
+            // Anything else is a newer host talking to an older viewer.
+            default: break;
+        }
+    }
+
+    // ---- Keyboard shortcuts dialog ----
+    // Lists every key the viewer answers to. A host that implements
+    // shortcuts() owns the rebindable ones, and its rows (asked for on every
+    // opening, since the user can rebind between two) replace the built-in
+    // list of them. The rows after those are the keys no host can rebind:
+    // they act inside the viewer's own controls, or modify a mouse action.
+    const hostOwnsKeys = hostCan("shortcuts");
+    const BUILT_IN_SHORTCUTS = [
+        { keys: "H", label: "Show or hide the cell hierarchy" },
+        { keys: "/", label: "Find a cell or label" },
+        { keys: "M", label: "Switch between Pan and Measure" },
+        { keys: "[", label: "Previous marker" },
+        { keys: "]", label: "Next marker" }
+    ];
+    const FIXED_SHORTCUTS = [
+        { keys: "Esc", label: "Close a menu, cancel a ruler being placed, then clear the rulers and the selection" },
+        { keys: "Up / Down", label: "In Find: move through the results" },
+        { keys: "Enter", label: "In Find: go to the highlighted result" },
+        { keys: "Alt", label: "While measuring: place a point without snapping" },
+        { keys: "Shift", label: "While measuring: keep the ruler horizontal or vertical" },
+        { keys: "Drag", label: "Pan the view" },
+        { keys: "Scroll", label: "Zoom the view" }
+    ];
+    const shortcutsOverlay = els.shortcutsOverlay;
+    const shortcutsDialog = els.shortcutsDialog;
+    const shortcutsBody = els.shortcutsTable && els.shortcutsTable.tBodies[0];
+    // Where focus was before the dialog took it, to hand it back on close.
+    let shortcutsReturnFocus = null;
+    // Bumped on every opening and closing, so a host's rows that arrive after
+    // the dialog was closed (or opened again) are dropped.
+    let shortcutsGeneration = 0;
+
+    const shortcutsOpen = () => !!shortcutsOverlay && !shortcutsOverlay.classList.contains("hidden");
+
+    // "Ctrl+K D" as <kbd>Ctrl</kbd>+<kbd>K</kbd> <kbd>D</kbd>: chords split on
+    // spaces, combinations on "+", alternatives on " / ". The "+" split needs
+    // a character after it, so a key that is itself "+" survives.
+    function renderKeys(cell, keys) {
+        String(keys).split(" / ").forEach((alternative, i) => {
+            if (i > 0) cell.append(" / ");
+            alternative.split(" ").filter(Boolean).forEach((chord, j) => {
+                if (j > 0) cell.append(" ");
+                chord.split(/\+(?=.)/).forEach((key, k) => {
+                    if (k > 0) cell.append("+");
+                    const kbd = document.createElement("kbd");
+                    kbd.textContent = key;
+                    cell.append(kbd);
+                });
+            });
+        });
+    }
+
+    function renderShortcuts(rows) {
+        if (!shortcutsBody) return;
+        shortcutsBody.replaceChildren();
+        const valid = (Array.isArray(rows) ? rows : [])
+            .filter((row) => row && typeof row.label === "string" && typeof row.keys === "string");
+        valid.concat(FIXED_SHORTCUTS).forEach((row, i) => {
+            const tr = document.createElement("tr");
+            if (i === valid.length && i > 0) tr.className = "shortcut-fixed-first";
+            const keys = document.createElement("td");
+            keys.className = "shortcut-keys";
+            renderKeys(keys, row.keys);
+            const label = document.createElement("td");
+            label.className = "shortcut-label";
+            label.textContent = row.label;
+            tr.append(keys, label);
+            shortcutsBody.append(tr);
+        });
+    }
+
+    function openShortcuts() {
+        if (!shortcutsOverlay) return;
+        const generation = ++shortcutsGeneration;
+        if (!shortcutsOpen()) {
+            // The deepest focused element: the viewer's own controls are in
+            // its shadow root, where document.activeElement only sees the host.
+            shortcutsReturnFocus = deepActiveElement();
+        }
+        if (hostOwnsKeys) {
+            // The fixed rows straight away, the host's when they arrive.
+            renderShortcuts([]);
+            Promise.resolve()
+                .then(() => host.shortcuts())
+                .then((rows) => {
+                    if (generation === shortcutsGeneration) renderShortcuts(rows);
+                }, (err) => fail("[GDS] the host's shortcuts() failed:", err));
+        } else {
+            renderShortcuts(BUILT_IN_SHORTCUTS);
+        }
+        if (els.shortcutsFooter) els.shortcutsFooter.classList.toggle("hidden", !hostCan("customizeShortcuts"));
+        hideCanvasMenu();
+        shortcutsOverlay.classList.remove("hidden");
+        shortcutsDialog.focus();
+    }
+
+    function closeShortcuts() {
+        if (!shortcutsOpen()) return;
+        shortcutsGeneration++;
+        shortcutsOverlay.classList.add("hidden");
+        const target = shortcutsReturnFocus;
+        shortcutsReturnFocus = null;
+        if (target && target.isConnected && target !== document.body && typeof target.focus === "function") {
+            target.focus();
+        } else {
+            // Nothing to go back to: don't leave focus on a hidden dialog.
+            shortcutsDialog.blur();
+        }
+    }
+
+    // Keeps Tab inside the dialog while it is up, as aria-modal promises.
+    function trapShortcutsFocus(event) {
+        const focusable = [...shortcutsDialog.querySelectorAll("button")]
+            .filter((el) => el.offsetParent !== null);
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const current = viewerRoot.activeElement;
+        if (event.shiftKey && (current === first || current === shortcutsDialog)) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && current === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    }
+
+    if (shortcutsOverlay) {
+        els.shortcutsClose?.addEventListener("click", closeShortcuts);
+        els.shortcutsCustomize?.addEventListener("click", () => {
+            closeShortcuts();
+            hostCall("customizeShortcuts");
+        });
+        // A click on the dimmed area around the dialog, not inside it.
+        shortcutsOverlay.addEventListener("click", (event) => {
+            if (event.target === shortcutsOverlay) closeShortcuts();
+        });
+    }
+
+    // ---- Keyboard context ----
+    // A host that binds single keys (H, M, /) needs to know when a keystroke
+    // is meant for the viewer rather than for a text box, and it cannot see
+    // into the shadow root to find out. setKeyboardContext(active) tells it:
+    // true while this page has focus and that focus is not in a text field.
+    // Called once at mount and then only on a change.
+    let keyboardContext = null;
+
+    function deepActiveElement() {
+        let el = document.activeElement;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+        return el;
+    }
+
+    function reportKeyboardContext(focused) {
+        if (!hostCan("setKeyboardContext")) return;
+        const active = document.hasFocus() && !isTextEntry(focused);
+        if (active === keyboardContext) return;
+        keyboardContext = active;
+        hostCall("setKeyboardContext", active);
+    }
+
+    // focusin and focusout are composed, so a listener on window hears focus
+    // entering or leaving the viewer; composedPath()[0] is the element itself
+    // rather than the <gds-lens> it is retargeted to. Focus moving between two
+    // elements inside the shadow root never reaches window, though (both ends
+    // retarget to the host, and an event whose target and relatedTarget are
+    // the same node is not dispatched to it), so the shadow root gets the
+    // same listeners. adopt() adds them to the new root after a move.
+    function watchFocus(target) {
+        if (!hostCan("setKeyboardContext")) return;
+        target.addEventListener("focusin", (event) => {
+            reportKeyboardContext(event.composedPath()[0]);
+        }, { signal: disposeSignal });
+        // A focusout with somewhere to go is followed by that element's
+        // focusin, so only focus dropping to nothing is reported here.
+        // Reporting both would flicker the context between two text fields.
+        target.addEventListener("focusout", (event) => {
+            if (!event.relatedTarget) reportKeyboardContext(null);
+        }, { signal: disposeSignal });
+    }
+
+    if (hostCan("setKeyboardContext")) {
+        watchFocus(window);
+        watchFocus(viewerRoot);
+        window.addEventListener("focus", (event) => {
+            if (event.target === window) reportKeyboardContext(deepActiveElement());
+        }, { signal: disposeSignal });
+        window.addEventListener("blur", (event) => {
+            if (event.target === window) reportKeyboardContext(null);
+        }, { signal: disposeSignal });
+        reportKeyboardContext(deepActiveElement());
+    }
 
     // ---- "Newer version on disk" banner ----
     // A host that watches the layout file calls viewer.showStale() when it changes
@@ -2755,7 +3126,7 @@ export function createViewer(mountTarget) {
                 Module.setLayerVisible(layer.layer, layer.datatype, wasVisible);
             }
         }
-        Module.setCamera(saved.camera.zoom, saved.camera.panX, saved.camera.panY);
+        if (saved.camera) Module.setCamera(saved.camera.zoom, saved.camera.panX, saved.camera.panY);
     }
 
     // ---- Named views ----
@@ -3367,6 +3738,7 @@ export function createViewer(mountTarget) {
         viewerRoot = next;
 
         themeObserver.observe(rootEl, { attributes: true, attributeFilter: ["class"] });
+        watchFocus(next);
         element.addEventListener("pointerdown", () => { activeViewer = element; },
                                  { capture: true, signal: disposeSignal });
         if (hadKeyboard) activeViewer = element;
@@ -3413,12 +3785,22 @@ export function createViewer(mountTarget) {
         return source;
     }
 
-    async function loadLayout(source, { reload = false, slot: slotId = "a", name = null } = {}) {
+    // `reframe` is the top-cell switch's own mode (see setTopCell), not part of
+    // the public options: like a reload it keeps the layer visibility, but it
+    // frames the new top instead of keeping the camera.
+    async function loadLayout(source, { reload = false, slot: slotId = "a", name = null, topCell } = {},
+                              { reframe = false } = {}) {
         const slot = slotOf(slotId);
         const bytes = asBytes(source);
         trace("[GDS] init payload: fileData byteLength =", bytes && bytes.byteLength,
                     "reload:", !!reload, "slot:", slot.id);
         if (name !== null) slot.name = name;
+        slot.source = bytes;
+        // A reload (and a switch) keeps the chosen top; a different file starts
+        // from every top cell again, unless the caller names one.
+        if (topCell !== undefined) slot.topCell = topCell || null;
+        else if (!reload && !reframe) slot.topCell = null;
+        slot.reframe = reframe;
         // A reload supersedes any load still running *for this slot* (the file
         // can change again while a slow one is in flight) -- drop the old
         // worker rather than letting two of them race to upload geometry. The
@@ -3452,9 +3834,12 @@ export function createViewer(mountTarget) {
         // modulePromise: the geometry has to be read *before* the new parse
         // lands, and a .then() would run after this handler returns.
         slot.viewState = null;
-        if (reload && resolvedModule) {
+        if ((reload || reframe) && resolvedModule) {
             try {
                 slot.viewState = captureViewState(resolvedModule);
+                // The camera was looking at the old top; the new one is framed
+                // after the upload instead.
+                if (reframe && slot.viewState) slot.viewState.camera = null;
             } catch (err) {
                 // Nothing loaded yet, or the module is wedged -- reload as if
                 // it were a first open (framed on the design) rather than
@@ -3505,9 +3890,14 @@ export function createViewer(mountTarget) {
         slot.name = null;
         slot.hierarchy = null;
         slot.viewState = null;
+        slot.source = null;
+        slot.topCell = null;
+        slot.topCells = [];
+        slot.root = null;
         return modulePromise.then((Module) => {
             Module.clearSlot(slot.index);
             renderCompareFolder();
+            renderHierarchyCrumb();
             renderLayerList(Module.getLayers());
             renderHierarchy();
             refreshRulerRow(Module);
@@ -3595,6 +3985,10 @@ export function createViewer(mountTarget) {
             return () => adoptCallbacks.delete(callback);
         },
         load: loadLayout,
+        // Which top cell is drawn, and a way to change it: the hierarchy's
+        // "Show as new top" is setTopCell.
+        getTopCells,
+        setTopCell,
         // For the wait before load(): a host (or the element) that is fetching
         // bytes says so, instead of leaving the viewer looking idle.
         showLoading,
@@ -3648,7 +4042,11 @@ export function createViewer(mountTarget) {
         // 0 shows only the first layout, 1 only the second, and anything
         // between crossfades them. The Compare folder's slider is this.
         setBlend: setCompareBlend,
-        getBlend: () => compareState.blend
+        getBlend: () => compareState.blend,
+        // ---- Keyboard ----
+        // For a host that binds the viewer's keys itself (see shortcuts() in
+        // the host interface): runs what the key would have run.
+        runAction
     };
 
     // Controls whose host service is missing have nothing behind them, so they
@@ -3715,14 +4113,12 @@ export function createViewer(mountTarget) {
     // One shard's own copy of the file. There is no sharing it between Workers
     // -- that is what SharedArrayBuffer would have been for, and the whole
     // reason this is several Workers rather than several threads -- so each
-    // gets a copy, and the last one to be handed out takes the original
-    // instead of copying it one more time.
+    // gets a copy. The original is never handed over: the slot keeps it to
+    // parse again from when the top cell changes (see setTopCell).
     //
     // Copies are made one at a time and transferred immediately, so the main
     // thread holds the file plus at most one copy rather than N of them.
-    function fileCopyFor(bytes, index, count) {
-        const own = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength;
-        if (index === count - 1 && own) return bytes.buffer;
+    function fileCopyFor(bytes) {
         return bytes.slice().buffer;
     }
 
@@ -3765,7 +4161,7 @@ export function createViewer(mountTarget) {
             const shard = shards[index] === null
                 ? null
                 : { index, count: shards.length, ...shards[index] };
-            startWorker(worker, fileCopyFor(bytes, index, shards.length), slot, index, shard);
+            startWorker(worker, fileCopyFor(bytes), slot, index, shard);
         }
     }
 
@@ -3839,8 +4235,9 @@ export function createViewer(mountTarget) {
         trace("[GDS] posting 'parse' message to worker...");
         // `debug` is whether the worker may write to the real console as well
         // as relaying to the panel; see the console patch in wasm-worker.js.
+        // `root` is the cell to draw as the top, null for all of them.
         worker.postMessage(
-            { type: "parse", fileData: transfer, debug: traceToConsole, shard },
+            { type: "parse", fileData: transfer, debug: traceToConsole, shard, root: slot.topCell },
             [transfer]
         );
         trace("[GDS] worker.postMessage('parse') call returned");
@@ -3882,9 +4279,22 @@ export function createViewer(mountTarget) {
                 }
                 slot.viewState = null;
             }
+            // A new top is framed whether or not another layout is on screen:
+            // the user asked to look at this cell. With two loaded, the fit
+            // covers both, as it does for Reset View.
+            if (slot.reframe) {
+                Module.resetView();
+                slot.reframe = false;
+            }
             slot.loaded = true;
             slot.hierarchy = workerMessage.hierarchy || null;
+            slot.topCells = workerMessage.topCells || [];
+            slot.root = workerMessage.root || null;
+            // The chosen cell is gone from the file (a reload after it was
+            // renamed or deleted), so the parse drew the default instead.
+            if (!slot.root) slot.topCell = null;
             renderCompareFolder();
+            renderHierarchyCrumb();
             renderLayerList(Module.getLayers());
             renderHierarchy();
             applyPorts(Module, workerMessage.ports, workerMessage.hierarchy);
@@ -3904,7 +4314,8 @@ export function createViewer(mountTarget) {
                     slot: slot.id,
                     layerCount: workerMessage.layers.length,
                     cellCount: workerMessage.hierarchy ? workerMessage.hierarchy.cellCount : 0,
-                    portCount: workerMessage.hierarchy ? workerMessage.hierarchy.portCount || 0 : 0
+                    portCount: workerMessage.hierarchy ? workerMessage.hierarchy.portCount || 0 : 0,
+                    topCell: slot.root
                 }
             }));
             settleLoad("resolve", undefined, slot);

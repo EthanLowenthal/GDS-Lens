@@ -358,6 +358,22 @@
         .hier-count { flex: none; color: var(--fg-faint); }
         .hier-row.hier-selected .hier-twisty, .hier-row.hier-selected .hier-count { color: var(--accent-fg); }
         .hier-children.hidden { display: none; }
+        /* "Show as new top": on the row under the pointer, the selected row and a
+           keyboard-focused one, and out of the way on the rest, so a tree of
+           a thousand rows is not a column of buttons. */
+        .hier-open { flex: none; visibility: hidden; background: none; border: 0; font: inherit;
+                     color: inherit; cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        .hier-row:hover .hier-open, .hier-row.hier-selected .hier-open, .hier-open:focus-visible { visibility: visible; }
+        .hier-open:hover { opacity: 1; }
+        #hierarchyCrumb { flex: none; padding: 4px 8px; border-bottom: 1px solid var(--border);
+                          display: flex; flex-direction: column; gap: 3px; }
+        #hierarchyCrumb.hidden { display: none; }
+        .hier-crumb { display: flex; align-items: center; gap: 6px; min-width: 0; }
+        .hier-crumb-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .hier-crumb button { flex: none; font-family: inherit; font-size: 10px; background: var(--surface);
+                             color: var(--fg-dim); border: 1px solid var(--border-strong); border-radius: 3px;
+                             padding: 1px 6px; cursor: pointer; }
+        .hier-crumb button:hover { color: var(--fg); }
         /* ---- Find (see the search block in viewer.js) ----
            Sits between the header and the tree: it's a way into the same
            panel, not a second panel. One row while it's closed, which is how
@@ -509,6 +525,40 @@
         #debugLog .err { color: var(--log-err); }
         #debugToggleBtn { position: absolute; bottom: 8px; left: 8px; z-index: 41; font-family: monospace; font-size: 10px; background: var(--surface); color: var(--fg-dim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 8px; cursor: pointer; opacity: 0.6; }
         #debugToggleBtn:hover { opacity: 1; }
+        /* Keyboard shortcuts dialog. Above everything else the viewer draws
+           (the canvas menu is z 50), since it is modal. It uses the panel's
+           palette, like the canvas menu: it is part of the controls, not a
+           note about the layout. */
+        #shortcutsOverlay { position: absolute; inset: 0; z-index: 60; display: flex;
+                            align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.4); }
+        #shortcutsOverlay.hidden { display: none; }
+        #shortcutsDialog { box-sizing: border-box; width: min(420px, calc(100% - 32px)); max-height: calc(100% - 32px);
+                           display: flex; flex-direction: column; background: var(--panel-bg); color: var(--panel-fg);
+                           border: 1px solid var(--border-strong); border-radius: 4px;
+                           box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4); font-family: monospace; font-size: 11px; }
+        #shortcutsDialog:focus { outline: none; }
+        #shortcutsHeader { display: flex; align-items: center; gap: 8px; flex: none; padding: 6px 8px;
+                           background: var(--panel-title-bg); border-bottom: 1px solid var(--border); font-weight: bold; }
+        #shortcutsTitle { flex: 1; }
+        #shortcutsClose { background: none; border: 0; font: inherit; color: inherit;
+                          cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        #shortcutsClose:hover, #shortcutsClose:focus-visible { opacity: 1; }
+        #shortcutsTable { display: block; flex: 1 1 auto; overflow: auto; border-collapse: collapse; padding: 4px 0; }
+        #shortcutsTable td { padding: 3px 8px; vertical-align: baseline; }
+        #shortcutsTable td.shortcut-keys { white-space: nowrap; color: var(--fg-dim); }
+        #shortcutsTable td.shortcut-label { width: 100%; }
+        /* The viewer's fixed keys follow the host's, under a rule. */
+        #shortcutsTable tr.shortcut-fixed-first td { border-top: 1px solid var(--border); padding-top: 6px; }
+        #shortcutsTable kbd { display: inline-block; min-width: 1em; padding: 0 4px; text-align: center;
+                              font-family: inherit; font-size: 10px; color: var(--panel-fg);
+                              background: var(--panel-widget); border: 1px solid var(--border-strong);
+                              border-radius: 3px; }
+        #shortcutsFooter { display: flex; justify-content: flex-end; flex: none; padding: 6px 8px;
+                           border-top: 1px solid var(--border); }
+        #shortcutsFooter.hidden { display: none; }
+        #shortcutsCustomize { font-family: inherit; font-size: 11px; background: var(--panel-widget); color: var(--panel-fg);
+                              border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 10px; cursor: pointer; }
+        #shortcutsCustomize:hover { background: var(--panel-widget-hover); }
 
         /* The progress bars are the only motion in the viewer. Someone who has
            asked the OS for less of it still needs the bar to show progress --
