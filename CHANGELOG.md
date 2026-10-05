@@ -9,6 +9,20 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+### Added
+
+- The Display toggles (Infill, Text, Ports, Merge Overlaps, Grid) are
+  remembered across layouts. A host gets them through two new optional
+  `ViewerHost` methods, `loadDisplay` and `saveDisplay`. The default browser
+  host keeps them in `localStorage`. Only the user's own changes are saved:
+  Text turning on to show a label search's result is not.
+
+### Fixed
+
+- `docs/embedding.md` gave the old instancing rule (eight placements) and a
+  115 million polygon figure measured under it. It now gives the current rule
+  and measured load limits.
+
 ## [1.5.0] - 2026-09-23
 
 ### Changed

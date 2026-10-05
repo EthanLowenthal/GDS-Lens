@@ -19,6 +19,15 @@ export interface NamedView {
     [key: string]: unknown;
 }
 
+/** The Display folder's toggles, as `loadDisplay`/`saveDisplay` pass them. */
+export interface DisplayPrefs {
+    showInfill: boolean;
+    showText: boolean;
+    showPorts: boolean;
+    mergeOverlaps: boolean;
+    showGrid: boolean;
+}
+
 /** The result of a `goToPoint`, reported back to the host. */
 export interface GotoResult {
     ok: boolean;
@@ -174,6 +183,18 @@ export interface ViewerHost {
      */
     loadViews?(viewer?: ViewerSurface): Promise<NamedView[]> | NamedView[];
     saveViews?(views: NamedView[], viewer?: ViewerSurface): void;
+    /**
+     * Called once at mount, for the Display toggles to start with. Keys that
+     * are missing or not booleans keep the viewer's defaults. Ignored if the
+     * user has already flipped a toggle by the time it resolves.
+     */
+    loadDisplay?(viewer?: ViewerSurface): Promise<Partial<DisplayPrefs> | null> | Partial<DisplayPrefs> | null;
+    /**
+     * The user flipped a Display toggle; `prefs` holds all of them. Not called
+     * when the viewer changes one itself, such as turning Text on to show a
+     * label search's result.
+     */
+    saveDisplay?(prefs: DisplayPrefs, viewer?: ViewerSurface): void;
     /** `existing` is the names already in use; `null` means cancelled. */
     promptViewName?(existing: string[]): Promise<string | null> | string | null;
     /** The user asked to re-read the layout. */

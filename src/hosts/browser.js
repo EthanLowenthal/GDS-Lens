@@ -18,6 +18,8 @@
 //   unloadMarkers()      -> void
 //   loadViews(viewer)         -> Promise<view[]>
 //   saveViews(views, viewer)  -> void
+//   loadDisplay(viewer)       -> Promise<{showInfill, ...} | null>
+//   saveDisplay(prefs, viewer) -> void
 //   promptViewName(existingNames) -> Promise<string | null>
 //   requestReload()      -> void
 //   setAutoReload(on)    -> void
@@ -62,6 +64,7 @@ export function createBrowserHost() {
     // viewer later must not move the first one's views out from under it, and a
     // viewer adopted by a new element keeps the bucket it has been using.
     const VIEWS_KEY = "gds-lens:named-views";
+    const DISPLAY_KEY = "gds-lens:display";
     const viewsKeys = new WeakMap();
     // Rule 4's viewers. Keyed on the viewer surface rather than the element,
     // which is the one identity that survives being adopted by a new element.
@@ -151,6 +154,23 @@ export function createBrowserHost() {
             } catch {
                 // Full or blocked storage: the views stay live in this page,
                 // they just will not outlive it. Not worth interrupting for.
+            }
+        },
+        // The Display toggles are a preference for how layouts are drawn, so
+        // they are kept for the whole origin rather than per viewer.
+        loadDisplay: async () => {
+            try {
+                return JSON.parse(localStorage.getItem(DISPLAY_KEY) || "null");
+            } catch {
+                return null;
+            }
+        },
+        saveDisplay: (prefs) => {
+            try {
+                localStorage.setItem(DISPLAY_KEY, JSON.stringify(prefs));
+            } catch {
+                // Full or blocked storage: the toggles apply, they just are
+                // not remembered.
             }
         },
         // A plain page has to be told which layout to show. Three ways in,

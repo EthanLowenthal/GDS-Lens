@@ -32,6 +32,12 @@ window.gdsLensHost = {
     unloadMarkers: () => record("unloadMarkers"),
     loadViews: () => { record("loadViews"); return Promise.resolve(window.__views || []); },
     saveViews: (views) => record("saveViews", views.length),
+    loadDisplay: () => {
+        record("loadDisplay");
+        const stored = new URLSearchParams(location.search).get("display");
+        return Promise.resolve(stored ? JSON.parse(stored) : null);
+    },
+    saveDisplay: (prefs) => record("saveDisplay", prefs),
     promptViewName: (names) => { record("promptViewName", names); return Promise.resolve("Overview"); },
     requestReload: () => record("requestReload"),
     setAutoReload: (on) => record("setAutoReload", on),
@@ -42,11 +48,11 @@ window.gdsLensHost = {
 
 // Substituting gds-lens-host.js is the whole setup: the payload's own default host
 // never runs, so nothing else has to be stubbed.
-async function mounted(fn) {
+async function mounted(fn, query = "") {
     await withPayload(defaultVariant, async (page, port) => {
         const pageErrors = [];
         page.on("pageerror", (e) => pageErrors.push(String(e)));
-        await page.goto(`http://127.0.0.1:${port}/gds-lens.html`);
+        await page.goto(`http://127.0.0.1:${port}/gds-lens.html${query}`);
         // Getting a layout in is the host's job, and this mock replaces the
         // default host that would otherwise handle ?src=. Driving it through
         // the surface connect() hands over is the point: it is the same call
@@ -76,6 +82,45 @@ test("the host is connected and asked for its stored views", opts, async () => {
         assert.ok(await page.evaluate(() => typeof window.viewer.load === "function"),
             "connect() should hand over the viewer surface");
     });
+});
+
+// The Display folder's checkbox for a toggle, by the label it shows.
+const displayBox = (page, label) => page.evaluate((label) => {
+    const root = document.querySelector("gds-lens").shadowRoot;
+    const row = [...root.querySelectorAll(".lil-controller")]
+        .find((r) => r.querySelector(".lil-name")?.textContent === label);
+    return row.querySelector("input[type=checkbox]").checked;
+}, label);
+
+test("stored Display toggles are applied, and only the user's changes saved", opts, async () => {
+    // Ports and Grid flipped from their defaults, plus a value of the wrong
+    // type and an unknown key, which must both be ignored.
+    const stored = { showPorts: true, showGrid: false, showText: "yes", bogus: true };
+    await mounted(async (page) => {
+        assert.ok((await calls(page)).includes("loadDisplay"), "the viewer never asked for stored toggles");
+        await page.waitForFunction(() => {
+            const root = document.querySelector("gds-lens").shadowRoot;
+            return [...root.querySelectorAll(".lil-controller")].some((r) =>
+                r.querySelector(".lil-name")?.textContent === "Ports"
+                && r.querySelector("input[type=checkbox]").checked);
+        }, { timeout: 10_000 });
+        assert.equal(await displayBox(page, "Grid"), false);
+        assert.equal(await displayBox(page, "Text"), false, "a non-boolean stored value was applied");
+        assert.ok(!(await calls(page)).includes("saveDisplay"),
+            "putting the stored toggles back should not save them again");
+
+        await page.evaluate(() => {
+            const root = document.querySelector("gds-lens").shadowRoot;
+            const row = [...root.querySelectorAll(".lil-controller")]
+                .find((r) => r.querySelector(".lil-name")?.textContent === "Infill");
+            row.querySelector("input[type=checkbox]").click();
+        });
+        const saved = await page.evaluate(() =>
+            window.__calls.filter((c) => c.name === "saveDisplay").map((c) => c.args));
+        assert.deepEqual(saved, [{
+            showInfill: true, showText: false, showPorts: true, mergeOverlaps: false, showGrid: false
+        }]);
+    }, `?display=${encodeURIComponent(JSON.stringify(stored))}`);
 });
 
 test("a .lyp pushed by the host names the layers", opts, async () => {

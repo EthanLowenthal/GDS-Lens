@@ -42,6 +42,8 @@ can implement any of the following methods:
 | `unloadMarkers()` | `void` | The loaded marker database is dismissed. |
 | `loadViews(viewer)` | `Promise<View[]>` | Once at mount, for saved camera positions. |
 | `saveViews(views, viewer)` | `void` | The saved-view set changed. Persist it. |
+| `loadDisplay(viewer)` | `Promise<DisplayPrefs \| null>` | Once at mount, for the Display toggles (Infill, Text, Ports, Merge Overlaps, Grid) to start with. |
+| `saveDisplay(prefs, viewer)` | `void` | The user flipped a Display toggle. Persist all of them. |
 | `promptViewName(existing)` | `Promise<string \| null>` | A view is being saved. `existing` is the names already used. |
 | `requestReload()` | `void` | The user asks to re-read the layout. |
 | `setAutoReload(on)` | `void` | The user asks to always reload on change. |
@@ -304,12 +306,13 @@ Parsing, flattening, and triangulating all happen inside a 32-bit WebAssembly
 module, so everything has to fit in one 4 GB address space. Two cases bound
 what fits:
 
-- **Flat geometry is the expensive case**. It costs roughly 1 KB per polygon
-  end to end, so a couple of million top-level polygons is the practical
-  ceiling.
-- **Hierarchy is nearly free**. A cell placed eight or more times becomes a GPU
-  instance batch: 24 bytes per placement rather than a full geometry copy. A
-  design that flattens to 115 million polygons loads in about 2 GB.
+- **Distinct geometry is the expensive case**. Every polygon outside an
+  instanced cell is stored and triangulated, so the limit follows vertex count:
+  about 10 million flat rectangles, or 2.3 million flat 40-vertex curves.
+- **Instanced cells are cheap**. A cell is instanced when its flattened copies
+  would add more than 250,000 points, so a cell placed many times costs a
+  transform per placement rather than a copy. 100 cells of 40 rectangles load
+  at 20 million placements, which is 820 million polygons once flattened.
 
 Past that the module aborts, and the viewer turns the error into an explanation
 rather than an engine string.

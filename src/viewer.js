@@ -512,12 +512,39 @@ export function createViewer(mountTarget) {
         showGrid: (Module, on) => Module.setShowGrid(on)
     };
 
+    // The toggles are remembered across layouts: the host's saveDisplay is
+    // handed all of them whenever the user flips one, and loadDisplay hands
+    // them back at mount (see the end of this block). Only the user's own
+    // changes are saved. A toggle the viewer flips for itself, such as Text
+    // turning on to show a label search's hit, or the stored values being put
+    // back, goes through setDisplayQuietly and is not.
+    let saveDisplayChanges = true;
+    // Set by the first toggle the user flips, so stored values arriving after
+    // it do not overwrite what they just chose.
+    let displayTouched = false;
+
     function setDisplay(key, value) {
         actions[key] = value;
+        if (saveDisplayChanges) {
+            displayTouched = true;
+            const prefs = {};
+            for (const name of Object.keys(DISPLAY_SETTERS)) prefs[name] = actions[name];
+            hostCall("saveDisplay", prefs, viewer);
+        }
         return modulePromise.then((Module) => DISPLAY_SETTERS[key](Module, value));
     }
 
-    displayFolder.add(actions, "showInfill").name("Infill")
+    // lil-gui's setValue runs onChange synchronously, so the flag covers it.
+    function setDisplayQuietly(controller, value) {
+        saveDisplayChanges = false;
+        try {
+            controller.setValue(value);
+        } finally {
+            saveDisplayChanges = true;
+        }
+    }
+
+    const infillController = displayFolder.add(actions, "showInfill").name("Infill")
         .onChange((show) => setDisplay("showInfill", show));
     // Draw the layout's own labels (GDSII/OASIS TEXT elements) at a fixed
     // on-screen size, in each label's layer color -- off by default because a
@@ -535,13 +562,33 @@ export function createViewer(mountTarget) {
         "its name close in. The top cell's are drawn at every zoom, the placed cells' once zoomed in";
     // Draw each layer as the union of its polygons (boundary + fill only, no
     // internal edges) -- a pure render-mode toggle, no re-parse involved.
-    displayFolder.add(actions, "mergeOverlaps").name("Merge Overlaps")
+    const mergeController = displayFolder.add(actions, "mergeOverlaps").name("Merge Overlaps")
         .onChange((on) => setDisplay("mergeOverlaps", on));
     // Background reference grid, pitched at a power-of-ten nm/µm/mm step that
     // follows the zoom (see draw_grid).
     const gridController = displayFolder.add(actions, "showGrid").name("Grid")
         .onChange((show) => setDisplay("showGrid", show));
     gridController.domElement.title = "Show the background grid, spaced at a round step that follows the zoom";
+
+    const displayControllers = {
+        showInfill: infillController,
+        showText: textController,
+        showPorts: portsController,
+        mergeOverlaps: mergeController,
+        showGrid: gridController
+    };
+
+    // Puts back the toggles the host remembered. Anything that is not a
+    // boolean for a known toggle is ignored, so stored state from an older or
+    // newer version cannot break the panel.
+    function applyStoredDisplay(prefs) {
+        if (!prefs || typeof prefs !== "object" || displayTouched) return;
+        for (const [key, controller] of Object.entries(displayControllers)) {
+            if (typeof prefs[key] === "boolean" && prefs[key] !== actions[key]) {
+                setDisplayQuietly(controller, prefs[key]);
+            }
+        }
+    }
 
     // The two file loaders live under the toggles because that's the order they're
     // used in over a session: the render toggles are a preference, and a .lyp or a
@@ -2091,7 +2138,8 @@ export function createViewer(mountTarget) {
             // wrong end to a search, so finding one turns text on rather than
             // explaining why it isn't there. setValue (not the bare flag) so the
             // checkbox and wasm both follow.
-            if (!actions.showText) textController.setValue(true);
+            // Quietly, so a search does not change the remembered default.
+            if (!actions.showText) setDisplayQuietly(textController, true);
             markLabelHit(Module, hit);
         });
     }
@@ -3618,6 +3666,7 @@ export function createViewer(mountTarget) {
     Promise.resolve(hostCall("loadViews", viewer)).then((views) => {
         if (views) setNamedViews(views);
     });
+    Promise.resolve(hostCall("loadDisplay", viewer)).then(applyStoredDisplay);
 
     hostCall("connect", viewer);
 
