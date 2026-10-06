@@ -44,7 +44,12 @@ const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 
 const errors = [];
 page.on("pageerror", (err) => errors.push(String(err)));
-page.on("requestfailed", (req) => errors.push(`${req.url()}: ${req.failure()?.errorText}`));
+// /js/analytics.js belongs to the lowenth.al site the page is deployed under,
+// not to this payload, so it is expected to be missing here.
+page.on("requestfailed", (req) => {
+    if (new URL(req.url()).pathname === "/js/analytics.js") return;
+    errors.push(`${req.url()}: ${req.failure()?.errorText}`);
+});
 
 const fail = async (message) => {
     console.error(`FAIL ${message}`);

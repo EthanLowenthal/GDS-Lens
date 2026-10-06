@@ -7,9 +7,14 @@
      -sDYNAMIC_EXECUTION=0: it compiles WebAssembly without needing
      'unsafe-eval'. worker-src blob: is the parse worker. connect-src allows
      https: so a ?src= link can point at a layout hosted anywhere, which is
-     what makes a demo shareable. -->
+     what makes a demo shareable. The googletagmanager and google-analytics
+     sources are the site-wide analytics below, which already fit connect-src. -->
 <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; worker-src blob:; connect-src 'self' https:; img-src 'self' data:;">
+    content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval' https://www.googletagmanager.com; worker-src blob:; connect-src 'self' https:; img-src 'self' data: https://*.google-analytics.com https://*.googletagmanager.com;">
+<!-- lowenth.al's shared Google Analytics, from the main site rather than this
+     repo, so it is absent (and harmless) when the page is served on its own.
+     It reports the path only, never ?src=, so layout links stay out of it. -->
+<script src="/js/analytics.js"></script>
 <title>GDS Lens - GDSII and OASIS layouts in your browser</title>
 <meta name="description" content="Open a GDSII or OASIS chip layout in your browser. No install, no server, and nothing is uploaded.">
 <link rel="canonical" href="https://lowenth.al/GDS-Lens/">
