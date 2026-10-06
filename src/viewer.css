@@ -176,6 +176,40 @@
            the value being copied rather than as a menu shortcut. */
         #canvasMenu .menu-value { margin-left: auto; font-family: monospace; font-size: 11px; color: var(--fg-dim); }
         #canvasMenu button:hover .menu-value, #canvasMenu button:focus .menu-value { color: inherit; }
+        /* The selected shape's card (see the click-to-inspect block in
+           viewer.js). Panel palette, like the canvas menu: it is the viewer
+           answering a question, not a mark on the layout. Placed by script, in
+           whichever free corner keeps it off the shape; below the canvas menu
+           and the debug panel, above the hierarchy panel (z 27) it sits beside.
+           Its text is selectable, which is the fallback when a host blocks the
+           clipboard. */
+        #inspectCard { position: absolute; z-index: 35; box-sizing: border-box; width: min(320px, calc(100% - 16px));
+                       background: var(--panel-bg); color: var(--panel-fg);
+                       border: 1px solid var(--border-strong); border-radius: 4px;
+                       box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4); font-family: monospace; font-size: 11px;
+                       user-select: text; }
+        #inspectCard.hidden { display: none; }
+        #inspectHeader { display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+                         background: var(--panel-title-bg); border-bottom: 1px solid var(--border);
+                         border-radius: 4px 4px 0 0; font-weight: bold; }
+        /* The layer's own fill and frame colors, as the layer list draws them. */
+        #inspectSwatch { flex: none; width: 10px; height: 10px; border: 1px solid; border-radius: 2px; }
+        #inspectTitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #inspectClose { background: none; border: 0; font: inherit; color: inherit;
+                        cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        #inspectClose:hover, #inspectClose:focus-visible { opacity: 1; }
+        #inspectTable { border-collapse: collapse; margin: 4px 0; width: 100%; }
+        #inspectTable th { text-align: left; font-weight: normal; color: var(--fg-dim); padding: 2px 8px;
+                           white-space: nowrap; vertical-align: baseline; }
+        #inspectTable td { padding: 2px 8px 2px 0; width: 100%; word-break: break-word; vertical-align: baseline; }
+        #inspectTable .slot-chip { margin-left: 0; }
+        #inspectStatus { padding: 0 8px 4px; color: var(--fg-faint); }
+        #inspectStatus:empty { display: none; }
+        #inspectActions { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); }
+        #inspectActions button { font-family: inherit; font-size: 11px; background: var(--panel-widget);
+                                 color: var(--panel-fg); border: 1px solid var(--border-strong); border-radius: 3px;
+                                 padding: 2px 8px; cursor: pointer; }
+        #inspectActions button:hover, #inspectActions button:focus-visible { background: var(--panel-widget-hover); }
         /* The bar is drawn in the ink color over an outline of the background,
            so it stays readable whichever of the two it happens to sit on top of
            (it floats over the geometry, not over a panel). */

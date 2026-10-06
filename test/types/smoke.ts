@@ -6,7 +6,7 @@
 
 import type {
     GdsLens, GdsLensEventMap, ViewerHost, ViewerSurface, PickedFile, NamedView, GotoResult,
-    LayoutSource, TopCellInfo, ShortcutRow, ViewerAction,
+    LayoutSource, TopCellInfo, ShortcutRow, ViewerAction, ShapeInfo,
 } from "../../types/gds-lens.js";
 import type { MarkerModel, FlatMarkerModel, DOMParserConstructor } from "../../types/parsers.js";
 import type { CellNode } from "../../types/cell-search.js";
@@ -64,6 +64,23 @@ await element.setTopCell("SUB", "b");
 await element.setTopCell(null);
 await element.load(new Uint8Array(8), { topCell: "SUB" });
 
+// --- the selected shape ---
+const picked: ShapeInfo | null = await element.selectAt(15, 15);
+if (picked) {
+    const where: string = `${picked.pathText} ${picked.path[0].placement ?? ""} ${picked.slot}`;
+    const area: number = picked.area + picked.bbox.maxX + picked.points.length;
+    void where;
+    void area;
+}
+await element.selectAt(15, 15, 1);
+const current: ShapeInfo | null = await element.getSelection();
+void current;
+await element.clearSelection();
+element.addEventListener("gds-select", (event) => {
+    const layer: number | undefined = event.detail?.layer;
+    void layer;
+});
+
 // createElement must come back typed, via HTMLElementTagNameMap.
 const created = document.createElement("gds-lens");
 await created.goToPoint(0, 0);
@@ -82,7 +99,10 @@ const host: ViewerHost = {
 window.gdsLensHost = host;
 
 // --- a host that owns the keyboard shortcuts ---
-const rows: ShortcutRow[] = [{ label: "Toggle the hierarchy", keys: "Ctrl+K H" }];
+const rows: ShortcutRow[] = [
+    { label: "Toggle the hierarchy", keys: "Ctrl+K H", action: "toggleHierarchy" },
+    { label: "Something of the host's own", keys: "F7" },
+];
 const keyHost: ViewerHost = {
     shortcuts: () => rows,
     customizeShortcuts() {},
@@ -91,6 +111,10 @@ const keyHost: ViewerHost = {
         const action: ViewerAction = "toggleHierarchy";
         viewer.runAction(action);
         viewer.runAction("showShortcuts");
+        viewer.refreshShortcuts();
+        const shape: ShapeInfo | null = viewer.getSelection();
+        void shape;
+        viewer.clearSelection();
     },
 };
 const asyncKeyHost: ViewerHost = { shortcuts: async () => rows };

@@ -33,7 +33,7 @@ const RULER = [1, 1, 9, 4];
 // so the cache's own reprojection cannot fail or pass it. Read once settled at
 // the starting camera, and once mid-pan: a reprojected frame, which is the one
 // that never set the camera for the overlays.
-async function rulerPixels(cacheMin) {
+async function overlayPixels(cacheMin, overlay = "ruler") {
     let result = null;
     await withPayload(defaultVariant, async (page, port) => {
         const pageErrors = [];
@@ -46,7 +46,7 @@ async function rulerPixels(cacheMin) {
                 ?.getElementById("loadingOverlay")?.classList.contains("hidden"),
             { timeout: 60_000 });
 
-        result = await page.evaluate(async (ruler) => {
+        result = await page.evaluate(async ([ruler, kind]) => {
             const element = document.querySelector("gds-lens");
             const canvas = element.shadowRoot.getElementById("glCanvas");
             const gl = canvas.getContext("webgl2");
@@ -88,14 +88,17 @@ async function rulerPixels(cacheMin) {
             };
 
             const without = await settledThenMoved();
-            await element.addMeasurement(...ruler);
+            // The ruler, or the outline of a shape selected by clicking it
+            // (through selectAt, which is what a click calls).
+            if (kind === "ruler") await element.addMeasurement(...ruler);
+            else if (!await element.selectAt(ruler[0], ruler[1])) throw new Error("nothing to select");
             const withRuler = await settledThenMoved();
             return {
                 width: canvas.width,
                 settled: changed(without.settled, withRuler.settled),
                 moved: changed(without.moved, withRuler.moved)
             };
-        }, RULER);
+        }, [RULER, overlay]);
         result.pageErrors = pageErrors;
     });
     return result;
@@ -110,8 +113,8 @@ const extent = (indices, width) => {
 };
 
 test("the ruler draws in the same place with the layer cache on as off", { skip }, async () => {
-    const direct = await rulerPixels(1e15);
-    const cached = await rulerPixels(0);
+    const direct = await overlayPixels(1e15);
+    const cached = await overlayPixels(0);
 
     assert.deepEqual(direct.pageErrors, [], "the uncached run threw");
     assert.deepEqual(cached.pageErrors, [], "the cached run threw");
@@ -124,5 +127,22 @@ test("the ruler draws in the same place with the layer cache on as off", { skip 
         `${extent(direct.settled, direct.width)} without`);
     assert.deepStrictEqual(cached.moved, direct.moved,
         `mid-pan: the ruler spans ${extent(cached.moved, cached.width)} with the cache, ` +
+        `${extent(direct.moved, direct.width)} without`);
+});
+
+// The same check for a selected shape's outline: drawn over the layers like
+// the ruler, so it has to follow the shape through a reprojected frame too.
+test("a selected shape's outline draws in the same place with the layer cache on as off", { skip }, async () => {
+    const direct = await overlayPixels(1e15, "selection");
+    const cached = await overlayPixels(0, "selection");
+
+    assert.deepEqual(direct.pageErrors, [], "the uncached run threw");
+    assert.deepEqual(cached.pageErrors, [], "the cached run threw");
+    assert.ok(direct.settled.length > 0 && direct.moved.length > 0, "the outline drew nothing without the cache");
+    assert.deepStrictEqual(cached.settled, direct.settled,
+        `settled: the outline spans ${extent(cached.settled, cached.width)} with the cache, ` +
+        `${extent(direct.settled, direct.width)} without`);
+    assert.deepStrictEqual(cached.moved, direct.moved,
+        `mid-pan: the outline spans ${extent(cached.moved, cached.width)} with the cache, ` +
         `${extent(direct.moved, direct.width)} without`);
 });

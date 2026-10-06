@@ -65,6 +65,12 @@ a streaming WebAssembly compile — see
   and ASCII DRC results.
 - **Navigates hierarchy**. You can search cells and labels, and measure
   distances.
+- **Inspects shapes**. In Pan mode, click a shape to select it. A card shows
+  its layer, the cell that holds it and the path to that cell from the top,
+  including which placement of a repeated cell it is in, and its bounding
+  box, size, area, perimeter and vertex count. Click the same spot again for
+  the shape under it. The card can frame the shape, copy its details, or show
+  its cell as the new top.
 - **Chooses the top cell**. A file with several top cells draws all of them by
   default, each as a root row in the hierarchy. The **Show as new top**
   button (⤒ on a row) draws that cell on its own, at its own origin. It works
@@ -134,6 +140,9 @@ The element exposes the following members:
 | `getBlend()` | `Promise<number>` | The current crossfade. |
 | `getTopCells(slot?)` | `Promise<{cells, current}>` | The file's own top cells, and the cell drawn as the top (`null` when all of them are drawn). |
 | `setTopCell(name, slot?)` | `Promise<void>` | Draws one cell as the top: only that cell and what it places, at its own origin, framed. Any cell can be named. `null` draws every top cell again. Rejects if the layout has no cell by that name. |
+| `getSelection()` | `Promise<ShapeInfo \| null>` | The shape selected by a click on the canvas or by `selectAt()`, or `null`. |
+| `selectAt(x, y, index?)` | `Promise<ShapeInfo \| null>` | Selects the shape under a point in microns, as a click there does, and resolves to it. `index` picks the shape that many after the first, in order of how near each shape's outline is to the point. Resolves `null`, and clears the selection, when no shape on a visible layer is there. |
+| `clearSelection()` | `Promise<void>` | Clears the selection. |
 
 Every `load()` cancels the one before it *for the same slot*, so two quick
 changes to `src` show the second layout even when the first is the slower
@@ -147,6 +156,7 @@ The element dispatches events on itself. None bubbles.
 |---|---|---|
 | `gds-load` | `{ slot, layerCount, cellCount, portCount, topCell }` | A layout finished loading and is on screen, whichever way the load was started: the `src` attribute, `load()`, `setTopCell()`, or a host pushing bytes through its surface. `slot` is which of the two layouts it is. `portCount` is how many ports its port metadata declared, 0 for a plain file. `topCell` is the cell drawn as the top, or `null` when every top cell is drawn. |
 | `gds-error` | `{ message }` | A load failed, or `showError()` was called. `message` is the text the viewer shows. |
+| `gds-select` | `ShapeInfo` or `null` | The selection changed: a click on the canvas, `selectAt()`, `Esc`, or a reload of the layout the shape is in. `null` means it was cleared. |
 
 ```js
 viewer.addEventListener("gds-load", (event) => {
@@ -169,7 +179,7 @@ they go to the one under the mouse.
 |---|---|
 | `[` / `]` | Previous / next marker in the selected marker's category. |
 | `m` | Toggle measure mode. Click two points to place a ruler. |
-| `Esc` | Abandon a ruler being placed; with none in progress, clear the finished ones and return to pan mode. Also closes the coordinate menu. With none of that to do and no hierarchy row selected, go back from a cell shown as the top cell to the full layout. |
+| `Esc` | Abandon a ruler being placed; with none in progress, clear the finished ones and return to pan mode. Also closes the coordinate menu, and clears the selected shape and hierarchy row. With none of that to do, go back from a cell shown as the top cell to the full layout. |
 | `h` | Show or hide the cell hierarchy. |
 | `/` | Focus the cell filter box. |
 

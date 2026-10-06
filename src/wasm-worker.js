@@ -101,10 +101,64 @@ function moduleArgs() {
     return { locateFile: (file) => new URL(file, base).href };
 }
 
+// Click to inspect (see inspect.hpp in the engine), in two Workers of this
+// same script. The first reads the file and hands the index it built back as
+// flat arrays ('inspect' -> 'inspectSnapshot'), and is terminated: reading
+// takes far more memory than the index, and a wasm heap never gives memory
+// back. The second takes the arrays ('inspectRestore' -> 'inspectReady') and
+// stays up answering 'inspectAt', holding the index and nothing else, until
+// the viewer terminates it because the layout it describes was replaced.
+let inspectModule = null;
+
+const SNAPSHOT_ARRAYS = ["roots", "counts", "xy", "starts", "tagIndex", "tags", "placements", "reps", "boxes"];
+
+function startInspect(message) {
+    debugToConsole = !!message.debug;
+    createGdstkModule(moduleArgs()).then((Module) => {
+        Module.FS.writeFile("/input.layout", new Uint8Array(message.fileData));
+        const options = { releaseFile: true, snapshot: true };
+        if (message.root) options.root = message.root;
+        const result = Module.inspectLoad("/input.layout", options);
+        console.log("[GDS worker] inspect index:", result.ok ? `${result.polygons} polygons, ` +
+                    `${result.placements} placements` : result.error);
+        const transferList = result.ok ? SNAPSHOT_ARRAYS.map((name) => result.snapshot[name].buffer) : [];
+        postMessage({ type: "inspectSnapshot", ...result }, transferList);
+    }).catch((err) => {
+        console.error("[GDS worker] inspect index failed:", err, err && err.stack);
+        postMessage({ type: "inspectSnapshot", ok: false, error: describeLoadFailure(err, "Inspect worker failed") });
+    });
+}
+
+function restoreInspect(message) {
+    debugToConsole = !!message.debug;
+    createGdstkModule(moduleArgs()).then((Module) => {
+        Module.inspectRestore(message.snapshot);
+        inspectModule = Module;
+        postMessage({ type: "inspectReady", ok: true });
+    }).catch((err) => {
+        console.error("[GDS worker] inspect restore failed:", err, err && err.stack);
+        postMessage({ type: "inspectReady", ok: false, error: describeLoadFailure(err, "Inspect worker failed") });
+    });
+}
+
+function answerInspect(message) {
+    if (!inspectModule) {
+        postMessage({ type: "inspectHits", id: message.id, hits: [], total: 0, truncated: false });
+        return;
+    }
+    const result = inspectModule.inspectAt(message.x, message.y, message.tolerance, message.ranks, message.limit);
+    const transferList = result.hits.map((hit) => hit.points.buffer);
+    postMessage({ type: "inspectHits", id: message.id, hits: result.hits, total: result.total,
+                  truncated: result.truncated }, transferList);
+}
+
 console.log("[GDS worker] registering onmessage handler");
 self.onmessage = (event) => {
     const message = event.data;
     console.log("[GDS worker] received message, type:", message.type);
+    if (message.type === "inspect") return startInspect(message);
+    if (message.type === "inspectRestore") return restoreInspect(message);
+    if (message.type === "inspectAt") return answerInspect(message);
     if (message.type !== "parse") return;
     debugToConsole = !!message.debug;
     // report_progress() in renderer.cpp posts 'gdsProgress' straight from

@@ -9,7 +9,26 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-05
+
 ### Added
+
+- Click to inspect. In Pan mode, a click selects the shape on a visible layer
+  whose outline is nearest the pointer, and outlines it. A card shows its layer and
+  color, the cell that holds it and the path to that cell from the top
+  (including which placement of a repeated cell it is in), its bounding box,
+  size, area, perimeter and vertex count, and in a comparison which layout it
+  is from. Clicking the same spot again selects the shape under it. Empty
+  space, `Esc` and the card's ✕ clear the selection. The card's buttons show
+  the cell as the new top, frame the shape, and copy its details as text.
+- `getSelection()`, `selectAt(x, y, index?)` and `clearSelection()` on the
+  element and the viewer surface, and a `gds-select` event carrying the
+  selected shape, or `null` when the selection is cleared.
+- Tooltips that name a key (the hierarchy's H, Find's /) take it from a
+  host's `shortcuts()` rows, through a new optional `action` field on each
+  row, and leave it out when no row binds that action.
+  `refreshShortcuts()` on the viewer surface asks the host for its rows again
+  after the user rebinds a key.
 
 - The Display toggles (Infill, Text, Ports, Merge Overlaps, Grid) are
   remembered across layouts. A host gets them through two new optional
@@ -725,7 +744,8 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.2.0...v1.3.0

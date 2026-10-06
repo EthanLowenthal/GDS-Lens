@@ -358,6 +358,20 @@ export class GdsLens extends ElementBase {
         return (await this.ready).clearMeasurements();
     }
 
+    // The shape a click on the canvas selected, and the same pick made from
+    // code (world µm). See the click-to-inspect block in viewer.js.
+    async getSelection() {
+        return (await this.ready).getSelection();
+    }
+
+    async selectAt(x, y, index = 0) {
+        return (await this.ready).selectAt(x, y, index);
+    }
+
+    async clearSelection() {
+        return (await this.ready).clearSelection();
+    }
+
     // Parks the viewer without tearing anything down. The element is very
     // often coming straight back -- React and friends recreate the node on
     // re-render -- and discarding the wasm instance and GL context only to

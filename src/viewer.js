@@ -2,7 +2,7 @@ import { rankCellMatches, cellPathToTarget } from "./cell-search.js";
 import { parseMarkerFile, flattenMarkerModel } from "./marker-parsers.js";
 import { describeLoadFailure, describeDecodeFailure } from "./load-errors.js";
 import { decodeLayoutBytes, looksGzipped } from "./layout-bytes.js";
-import { scanGdsTags, planShards, shardCount, mergeShardResults } from "./parse-split.js";
+import { scanGdsTags, planShards, shardCount, mergeShardResults, packTag } from "./parse-split.js";
 // Resolved by the build to engine-source.js (the served payloads) or
 // engine-source.esm.js (the bundled module). A bare specifier because
 // esbuild's alias only rewrites those, not relative paths.
@@ -366,7 +366,10 @@ export function createViewer(mountTarget) {
         // cell it actually drew as the top (null when it drew all of them).
         topCells: [],
         root: null,
-        loaded: false
+        loaded: false,
+        // The click-to-inspect worker for what this slot drew, started on the
+        // first click (see inspectorFor) and dropped when that changes.
+        inspector: null
     }));
 
     function abortError(message) {
@@ -425,7 +428,10 @@ export function createViewer(mountTarget) {
         canvasResizeObserver?.disconnect();
         disposeController.abort();
         if (activeViewer === hostElement) activeViewer = null;
-        for (const slot of slots) stopWorkers(slot);
+        for (const slot of slots) {
+            stopWorkers(slot);
+            dropInspector(slot);
+        }
         settleLoad("reject", abortError("the viewer was destroyed"));
         // Through the promise rather than resolvedModule: a viewer destroyed
         // while its module is still instantiating must still let go of the
@@ -642,7 +648,7 @@ export function createViewer(mountTarget) {
     // which is exactly the wrong mental model. Wasm only needs the boolean; the
     // row below is the whole difference.
     const MODES = [
-        { id: "pan", label: "Pan", title: "Drag to pan the view, wheel to zoom" },
+        { id: "pan", label: "Pan", title: "Drag to pan the view, wheel to zoom, click a shape to inspect it" },
         {
             id: "measure",
             label: "Measure",
@@ -2761,6 +2767,461 @@ export function createViewer(mountTarget) {
         window.addEventListener("blur", hideCanvasMenu, { signal: disposeSignal });
     }
 
+    // ---- Click to inspect ----
+    // In Pan mode a click (a press and release that did not drag) selects the
+    // shape under the pointer whose outline is nearest it, outlines it, and
+    // describes it in the card. Clicking the same spot again steps to the next
+    // shape there, and empty space or Escape clears it.
+    //
+    // The renderer cannot say what is under a point: its geometry is flattened
+    // into per-layer GPU buffers with no record of which cell drew what. So
+    // each slot gets an inspect worker of its own on its first click, which
+    // reads the slot's bytes again and keeps them as a hierarchy (see
+    // inspect.hpp in the engine). It lives until that slot's layout is
+    // replaced or unloaded.
+
+    // How far a press can travel and still count as a click rather than a
+    // drag, and how close a second click has to land to step down through the
+    // shapes under the first rather than start again. CSS pixels.
+    const CLICK_SLOP_PX = 4;
+    // How close to a shape's edge a click counts as on it, so a hairline wire
+    // can be picked without zooming in until it is wide. CSS pixels.
+    const PICK_TOLERANCE_PX = 3;
+    // Shapes returned per layout per click, nearest outline first. Deeper than anyone
+    // steps through by clicking; it bounds what one click copies back.
+    const MAX_PICK_HITS = 64;
+
+    const inspectCardEl = els.inspectCard;
+    // The selected shape (a ShapeInfo, see types/gds-lens.d.ts), the point it
+    // was picked at, and the stack of shapes there it is one of.
+    let selection = null;
+    let lastPick = null;
+    // Bumped by every pick and every clear, so an answer that arrives after a
+    // newer click (or after Escape) is dropped rather than applied.
+    let pickGeneration = 0;
+
+    // The slot's inspect worker, started on first use. Resolves to a function
+    // that runs one query on it.
+    //
+    // Two Workers, one after the other (see wasm-worker.js): one reads the
+    // layout and hands back the index it built, and is terminated; a fresh
+    // one takes the index and answers clicks. Reading needs the whole file as
+    // gdstk objects, and a wasm heap never shrinks, so the Worker that stays
+    // up must not be the one that read it.
+    function inspectorFor(slot) {
+        if (slot.inspector) return slot.inspector.ready;
+        const pending = new Map();
+        let nextId = 0;
+        const inspector = { worker: null, pending, ready: null, grid: 0.001 };
+        slot.inspector = inspector;
+        // A Worker for this inspector that reports its own messages through
+        // `handle`, and is forgotten if the inspector has been dropped.
+        const start = (handle, reject) => {
+            const worker = createParseWorker();
+            inspector.worker = worker;
+            worker.onerror = (err) => reject(new Error(err.message || "the inspect worker failed to start"));
+            worker.onmessage = (event) => {
+                const message = event.data;
+                if (message.type === "gdsLog") {
+                    appendDebugLine("[inspect] " + message.text, message.level === "error");
+                } else if (slot.inspector === inspector) {
+                    handle(message, worker);
+                }
+            };
+            return worker;
+        };
+        inspector.ready = new Promise((resolve, reject) => {
+            const answer = (message) => {
+                if (message.type === "inspectReady") {
+                    if (!message.ok) {
+                        reject(new Error(message.error || "the layout could not be indexed"));
+                        return;
+                    }
+                    resolve((x, y, tolerance, ranks) => new Promise((done) => {
+                        const id = nextId++;
+                        pending.set(id, done);
+                        inspector.worker.postMessage({ type: "inspectAt", id, x, y, tolerance, ranks,
+                                                       limit: MAX_PICK_HITS });
+                    }));
+                } else if (message.type === "inspectHits") {
+                    const done = pending.get(message.id);
+                    pending.delete(message.id);
+                    if (done) done(message);
+                }
+            };
+            const read = (message, reader) => {
+                if (message.type !== "inspectSnapshot") return;
+                reader.terminate();
+                if (!message.ok) {
+                    reject(new Error(message.error || "the layout could not be read"));
+                    return;
+                }
+                trace("[GDS] inspect index for slot", slot.id, "built:", message.polygons, "polygons,",
+                      message.placements, "placements");
+                inspector.grid = message.grid;
+                const snapshot = message.snapshot;
+                const transfer = ["roots", "counts", "xy", "starts", "tagIndex", "tags", "placements", "reps", "boxes"]
+                    .map((name) => snapshot[name].buffer);
+                try {
+                    start(answer, reject).postMessage({ type: "inspectRestore", snapshot, debug: traceToConsole },
+                                                      transfer);
+                } catch (err) {
+                    reject(err);
+                }
+            };
+            // The layout as drawn: the bytes it was loaded from, expanded if
+            // they were gzipped, read with the same top cell the parse used.
+            const bytes = slot.source;
+            const expanded = looksGzipped(bytes)
+                ? decodeLayoutBytes(bytes, MAX_LAYOUT_BYTES).then((decoded) => {
+                    if (!decoded.ok) throw new Error(describeDecodeFailure(decoded));
+                    return decoded.bytes;
+                })
+                : Promise.resolve(bytes);
+            expanded.then((plain) => {
+                if (slot.inspector !== inspector) return;
+                const transfer = fileCopyFor(plain);
+                start(read, reject).postMessage(
+                    { type: "inspect", fileData: transfer, root: slot.root, debug: traceToConsole }, [transfer]);
+            }).catch(reject);
+        });
+        // A rejection here is reported by the pick that asked; this keeps the
+        // one nobody awaits (a slot reloaded mid-build) from being unhandled.
+        inspector.ready.catch(() => {});
+        return inspector.ready;
+    }
+
+    // Lets go of a slot's inspect worker, for when what it indexed is gone.
+    function dropInspector(slot) {
+        if (!slot.inspector) return;
+        slot.inspector.worker?.terminate();
+        for (const done of slot.inspector.pending.values()) done({ hits: [], total: 0 });
+        slot.inspector = null;
+    }
+
+    // Every shape under a world point across the loaded layouts, the one
+    // whose outline is nearest the point first (see Index::query in
+    // inspect.cpp for why), then the smaller, then the renderer's draw order:
+    // later layers are drawn over earlier ones.
+    // Layers that are not drawn -- hidden, or in a layout crossfaded fully
+    // out -- are skipped.
+    async function shapesAt(Module, x, y) {
+        const stack = Module.getLayerStack();
+        const zoom = Module.getCamera().zoom;
+        const tolerance = PICK_TOLERANCE_PX / zoom;
+        const asks = slots.filter((slot) => slot.loaded && slot.source).map(async (slot) => {
+            const ranks = [];
+            stack.forEach((entry, rank) => {
+                if (entry.source === slot.index) ranks.push(packTag(entry.layer, entry.datatype), rank);
+            });
+            if (ranks.length === 0) return [];
+            const query = await inspectorFor(slot);
+            const answer = await query(x, y, tolerance, ranks);
+            const byTag = new Map();
+            for (let i = 0; i < ranks.length; i += 2) byTag.set(ranks[i], ranks[i + 1]);
+            return answer.hits.map((hit) => ({
+                ...hit, slot, rank: byTag.get(packTag(hit.layer, hit.datatype)) ?? -1
+            }));
+        });
+        const hits = (await Promise.all(asks)).flat();
+        hits.sort((a, b) => (a.edgeDistance - b.edgeDistance) || (a.area - b.area) || (b.rank - a.rank));
+        return hits;
+    }
+
+    // Digits for a value in µm: as many as the file's database unit has, so a
+    // coordinate reads exactly as it is stored (0.001 µm for the usual 1 nm
+    // unit), with trailing zeros dropped. The panel's own fmtCoord rounds to
+    // four significant figures, which turns 12345.678 into 12350.
+    function unitDecimals(grid) {
+        if (!(grid > 0)) return 3;
+        return Math.max(0, Math.min(9, Math.ceil(-Math.log10(grid) - 1e-9)));
+    }
+    function fmtUm(value, decimals) {
+        const fixed = Number(value.toFixed(decimals));
+        return String(Object.is(fixed, -0) ? 0 : fixed);
+    }
+
+    // How a path step was reached, when its parent places it more than once:
+    // "#2" for the second of several references to the same cell, "[2,1]" for
+    // a copy in an array (column, row), "[5]" for one in a listed repetition.
+    function placementLabel(step) {
+        const parts = [];
+        if (step.siblings > 1) parts.push(`#${step.sibling + 1}`);
+        if (step.copies > 1) parts.push(step.column >= 0 ? `[${step.column},${step.row}]` : `[${step.copy}]`);
+        return parts.length > 0 ? parts.join(" ") : null;
+    }
+
+    // A query hit as the ShapeInfo the card, getSelection and gds-select share.
+    function describeHit(Module, hit, index, count) {
+        const pts = Array.from(hit.points);
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        let perimeter = 0;
+        const n = pts.length / 2;
+        for (let k = 0; k < n; k++) {
+            const x = pts[2 * k], y = pts[2 * k + 1];
+            minX = Math.min(minX, x);
+            maxX = Math.max(maxX, x);
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+            const m = k + 1 === n ? 0 : k + 1;
+            perimeter += Math.hypot(pts[2 * m] - x, pts[2 * m + 1] - y);
+        }
+        const layerRow = Module.getLayers().find((l) =>
+            l.source === hit.slot.index && l.layer === hit.layer && l.datatype === hit.datatype);
+        const path = Array.from(hit.path, (step) => ({ cell: step.cell, placement: placementLabel(step) }));
+        return {
+            slot: hit.slot.id,
+            layer: hit.layer,
+            datatype: hit.datatype,
+            layerName: layerRow ? layerRow.name : "",
+            color: layerRow ? layerRow.frameColor : "",
+            fillColor: layerRow ? layerRow.fillColor : "",
+            cell: path[path.length - 1].cell,
+            path,
+            pathText: path.map((step) => step.placement ? `${step.cell} ${step.placement}` : step.cell).join(" > "),
+            bbox: { minX, minY, maxX, maxY },
+            width: maxX - minX,
+            height: maxY - minY,
+            area: hit.area,
+            perimeter,
+            vertexCount: n,
+            points: pts,
+            index,
+            count,
+            unit: hit.slot.inspector ? hit.slot.inspector.grid : 0.001
+        };
+    }
+
+    // Picks the `index`-th shape (wrapping) under a world point, outlines it
+    // and shows the card. Resolves to its ShapeInfo, or null when there is
+    // nothing there -- which clears the selection, the way clicking empty
+    // space does.
+    async function pickAt(x, y, index = 0) {
+        const generation = ++pickGeneration;
+        const Module = await modulePromise;
+        // The first click on a large layout waits for its index to be built;
+        // say so rather than leaving the click looking ignored.
+        const slow = setTimeout(() => {
+            if (generation === pickGeneration) showCopyToast("Reading the layout to find shapes...");
+        }, 250);
+        let hits;
+        try {
+            hits = await shapesAt(Module, x, y);
+        } finally {
+            clearTimeout(slow);
+        }
+        if (generation !== pickGeneration) return selection;
+        lastPick = { x, y, zoom: Module.getCamera().zoom };
+        if (hits.length === 0) {
+            applySelection(null);
+            return null;
+        }
+        const at = ((index % hits.length) + hits.length) % hits.length;
+        const info = describeHit(Module, hits[at], at, hits.length);
+        applySelection(info);
+        return info;
+    }
+
+    function applySelection(info) {
+        const changed = selection !== info;
+        selection = info;
+        modulePromise.then((Module) => {
+            if (selection !== info) return;
+            if (info) Module.setSelection(info.points, slotOf(info.slot).index);
+            else Module.clearSelection();
+        });
+        renderInspectCard();
+        if (changed) hostElement.dispatchEvent(new CustomEvent("gds-select", { detail: info }));
+    }
+
+    function clearShapeSelection() {
+        pickGeneration++;
+        lastPick = null;
+        if (selection) applySelection(null);
+    }
+
+    // The card's text, line by line: what Copy puts on the clipboard, and
+    // the rows the card shows.
+    function inspectLines(info) {
+        const d = unitDecimals(info.unit);
+        const um = (v) => fmtUm(v, d);
+        const name = info.layerName ? ` ${info.layerName}` : "";
+        const lines = [
+            ["Layer", `${info.layer}/${info.datatype}${name}`],
+            ["Cell", info.cell],
+            ["Path", info.pathText]
+        ];
+        if (comparing()) {
+            const slot = slotOf(info.slot);
+            lines.push(["Layout", `${slot.id.toUpperCase()}${slot.name ? ` (${slot.name})` : ""}`]);
+        }
+        lines.push(
+            ["Bounding box", `(${um(info.bbox.minX)}, ${um(info.bbox.minY)})–(${um(info.bbox.maxX)}, ` +
+                             `${um(info.bbox.maxY)}) µm`],
+            ["Size", `${um(info.width)} × ${um(info.height)} µm`],
+            ["Area", `${fmtUm(info.area, Math.min(9, 2 * d))} µm²`],
+            ["Perimeter", `${um(info.perimeter)} µm`],
+            ["Vertices", String(info.vertexCount)]
+        );
+        return lines;
+    }
+
+    function renderInspectCard() {
+        if (!inspectCardEl) return;
+        const info = selection;
+        inspectCardEl.classList.toggle("hidden", !info);
+        if (!info) return;
+        const lines = inspectLines(info);
+        els.inspectTitle.textContent = lines[0][1];
+        els.inspectSwatch.style.background = info.fillColor || "transparent";
+        els.inspectSwatch.style.borderColor = info.color || "currentColor";
+        const body = els.inspectTable.tBodies[0];
+        body.replaceChildren();
+        for (const [label, value] of lines.slice(1)) {
+            const tr = document.createElement("tr");
+            const th = document.createElement("th");
+            th.textContent = label;
+            const td = document.createElement("td");
+            if (label === "Layout") {
+                // The same A/B badge the panel marks each layout's rows with.
+                const chip = document.createElement("span");
+                chip.className = `slot-chip slot-chip-${info.slot}`;
+                chip.textContent = info.slot.toUpperCase();
+                td.append(chip, " ", slotOf(info.slot).name || "");
+            } else {
+                td.textContent = value;
+            }
+            tr.append(th, td);
+            body.append(tr);
+        }
+        // Already the top cell, alone: there is nothing to switch to.
+        const owner = slotOf(info.slot);
+        els.inspectTop.disabled = owner.root === info.cell ||
+            (owner.root === null && owner.topCells.length === 1 && owner.topCells[0] === info.cell);
+        els.inspectStatus.textContent = info.count > 1
+            ? `Shape ${info.index + 1} of ${info.count} here. Click again for the next one.`
+            : "";
+        placeInspectCard(info);
+    }
+
+    // Puts the card in whichever free corner of the canvas keeps it off the
+    // shape: bottom left first, then top left, then the middle of either
+    // edge. The right side is taken by the control panel and the readouts.
+    function placeInspectCard(info) {
+        const camera = resolvedModule ? resolvedModule.getCamera() : null;
+        const width = glCanvas.clientWidth, height = glCanvas.clientHeight;
+        const cardW = inspectCardEl.offsetWidth, cardH = inspectCardEl.offsetHeight;
+        const margin = 8;
+        const hierarchyOpen = hierarchyPanel && !hierarchyPanel.classList.contains("hidden");
+        const left = margin + (hierarchyOpen ? hierarchyPanel.offsetWidth : 0);
+        const bottom = height - cardH - 36;
+        const center = Math.max(left, (width - cardW) / 2);
+        const spots = [[left, bottom], [left, margin], [center, bottom], [center, margin]];
+        let shape = null;
+        if (camera) {
+            const toScreen = (x, y) => [width / 2 + (x - camera.panX) * camera.zoom,
+                                        height / 2 - (y - camera.panY) * camera.zoom];
+            const [x0, y1] = toScreen(info.bbox.minX, info.bbox.minY);
+            const [x1, y0] = toScreen(info.bbox.maxX, info.bbox.maxY);
+            shape = { x0, y0, x1, y1 };
+        }
+        const overlap = ([x, y]) => {
+            if (!shape) return 0;
+            const w = Math.min(x + cardW, shape.x1) - Math.max(x, shape.x0);
+            const h = Math.min(y + cardH, shape.y1) - Math.max(y, shape.y0);
+            return w > 0 && h > 0 ? w * h : 0;
+        };
+        let best = spots[0];
+        let bestOverlap = Infinity;
+        for (const spot of spots) {
+            const covered = overlap(spot);
+            if (covered < bestOverlap) {
+                best = spot;
+                bestOverlap = covered;
+            }
+            if (covered === 0) break;
+        }
+        inspectCardEl.style.left = `${Math.max(margin, best[0])}px`;
+        inspectCardEl.style.top = `${Math.max(margin, best[1])}px`;
+    }
+
+    function copySelection() {
+        if (!selection) return;
+        const text = inspectLines(selection).map(([label, value]) => `${label}: ${value}`).join("\n");
+        navigator.clipboard.writeText(text).then(
+            () => showCopyToast("Copied the shape's details"),
+            (err) => {
+                // Blocked in some sandboxed webviews, as for Copy coordinate.
+                // The card's text can still be selected and copied by hand.
+                fail("[GDS] clipboard write failed for the shape details:", err);
+                showCopyToast("Couldn't copy: select the card's text instead");
+            }
+        );
+        return text;
+    }
+
+    if (inspectCardEl) {
+        els.inspectClose?.addEventListener("click", clearShapeSelection);
+        els.inspectCopy?.addEventListener("click", copySelection);
+        els.inspectFrame?.addEventListener("click", () => {
+            if (!selection) return;
+            const { minX, minY, maxX, maxY } = selection.bbox;
+            modulePromise.then((Module) => Module.zoomToBox(minX, minY, maxX, maxY));
+        });
+        els.inspectTop?.addEventListener("click", () => {
+            if (!selection) return;
+            setTopCell(selection.cell, selection.slot).catch((err) => {
+                if (err && err.name !== "AbortError") fail("[GDS] top cell switch failed:", err);
+            });
+        });
+    }
+
+    // Clicks, told apart from drags by distance: renderer.cpp pans on every
+    // mouse move while a button is down, so a press that travelled further
+    // than CLICK_SLOP_PX was a pan and selects nothing. Pointer events rather
+    // than mouse events so a tap selects too; a second finger cancels it,
+    // since that is a pinch.
+    if (glCanvas) {
+        let press = null;
+        let pointersDown = 0;
+        glCanvas.addEventListener("pointerdown", (event) => {
+            pointersDown++;
+            press = null;
+            if (pointersDown > 1 || event.button !== 0 || currentMode !== "pan" || !resolvedModule) return;
+            press = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
+        }, { signal: disposeSignal });
+        glCanvas.addEventListener("pointermove", (event) => {
+            if (press && event.pointerId === press.id &&
+                Math.hypot(event.clientX - press.x, event.clientY - press.y) > CLICK_SLOP_PX) {
+                press.moved = true;
+            }
+        }, { signal: disposeSignal });
+        const release = (event) => {
+            pointersDown = Math.max(0, pointersDown - 1);
+            if (!press || event.pointerId !== press.id) return;
+            const clicked = event.type === "pointerup" && !press.moved &&
+                Math.hypot(event.clientX - press.x, event.clientY - press.y) <= CLICK_SLOP_PX;
+            press = null;
+            if (!clicked || currentMode !== "pan") return;
+            const rect = glCanvas.getBoundingClientRect();
+            const camera = resolvedModule.getCamera();
+            const x = camera.panX + (event.clientX - rect.left - glCanvas.clientWidth / 2) / camera.zoom;
+            const y = camera.panY + (glCanvas.clientHeight / 2 - (event.clientY - rect.top)) / camera.zoom;
+            // The same spot again steps down to the next shape there. Compared
+            // in screen pixels at an unchanged zoom, so a click that panned by a
+            // pixel or two on the way still counts as the same spot.
+            const again = selection && lastPick && lastPick.zoom === camera.zoom &&
+                Math.hypot(x - lastPick.x, y - lastPick.y) * camera.zoom <= CLICK_SLOP_PX;
+            const pick = again ? pickAt(lastPick.x, lastPick.y, selection.index + 1) : pickAt(x, y, 0);
+            pick.catch((err) => {
+                fail("[GDS] inspecting the clicked point failed:", err);
+                showCopyToast(`Couldn't inspect this layout: ${err.message || err}`);
+            });
+        };
+        window.addEventListener("pointerup", release, { signal: disposeSignal });
+        window.addEventListener("pointercancel", release, { signal: disposeSignal });
+    }
+
     // Capture phase, because every lil-gui controller stopPropagation()s keydown
     // in the bubble phase -- a plain window listener would never hear [ / ]
     // while focus sits anywhere inside the panel, which is the normal state
@@ -2813,7 +3274,7 @@ export function createViewer(mountTarget) {
             }
             // With nothing else left for it to take down, Escape goes back from
             // a cell shown as the top to the file's own top cells.
-            const selected = hierarchySelectedPath !== null;
+            const selected = hierarchySelectedPath !== null || selection !== null;
             modulePromise.then((Module) => {
                 const idle = currentMode === "pan" && Module.measurementCount() === 0 && !selected;
                 if (!Module.escapeMeasure()) setMode("pan");
@@ -2821,6 +3282,7 @@ export function createViewer(mountTarget) {
                 if (idle) resetTopCells();
             });
             hierarchyDeselect();
+            clearShapeSelection();
         }
     }, { capture: true, signal: disposeSignal });
 
@@ -2873,11 +3335,11 @@ export function createViewer(mountTarget) {
     // they act inside the viewer's own controls, or modify a mouse action.
     const hostOwnsKeys = hostCan("shortcuts");
     const BUILT_IN_SHORTCUTS = [
-        { keys: "H", label: "Show or hide the cell hierarchy" },
-        { keys: "/", label: "Find a cell or label" },
-        { keys: "M", label: "Switch between Pan and Measure" },
-        { keys: "[", label: "Previous marker" },
-        { keys: "]", label: "Next marker" }
+        { keys: "H", label: "Show or hide the cell hierarchy", action: "toggleHierarchy" },
+        { keys: "/", label: "Find a cell or label", action: "focusFind" },
+        { keys: "M", label: "Switch between Pan and Measure", action: "toggleMeasure" },
+        { keys: "[", label: "Previous marker", action: "previousMarker" },
+        { keys: "]", label: "Next marker", action: "nextMarker" }
     ];
     const FIXED_SHORTCUTS = [
         { keys: "Esc", label: "Close a menu, cancel a ruler being placed, then clear the rulers and the selection" },
@@ -2885,6 +3347,7 @@ export function createViewer(mountTarget) {
         { keys: "Enter", label: "In Find: go to the highlighted result" },
         { keys: "Alt", label: "While measuring: place a point without snapping" },
         { keys: "Shift", label: "While measuring: keep the ruler horizontal or vertical" },
+        { keys: "Click", label: "Select the shape under the pointer; click again for the one below it" },
         { keys: "Drag", label: "Pan the view" },
         { keys: "Scroll", label: "Zoom the view" }
     ];
@@ -2947,11 +3410,9 @@ export function createViewer(mountTarget) {
         if (hostOwnsKeys) {
             // The fixed rows straight away, the host's when they arrive.
             renderShortcuts([]);
-            Promise.resolve()
-                .then(() => host.shortcuts())
-                .then((rows) => {
-                    if (generation === shortcutsGeneration) renderShortcuts(rows);
-                }, (err) => fail("[GDS] the host's shortcuts() failed:", err));
+            askHostShortcuts().then((rows) => {
+                if (generation === shortcutsGeneration) renderShortcuts(rows);
+            });
         } else {
             renderShortcuts(BUILT_IN_SHORTCUTS);
         }
@@ -2959,6 +3420,59 @@ export function createViewer(mountTarget) {
         hideCanvasMenu();
         shortcutsOverlay.classList.remove("hidden");
         shortcutsDialog.focus();
+    }
+
+    // The host's rows, which also say what the tooltips that name a key
+    // should name (see applyKeyHints). Every asking refreshes those, since the
+    // user can rebind between two. Resolves to [] if the host's call fails.
+    function askHostShortcuts() {
+        return Promise.resolve()
+            .then(() => host.shortcuts())
+            .then((rows) => {
+                applyKeyHints(rows);
+                return rows;
+            }, (err) => {
+                fail("[GDS] the host's shortcuts() failed:", err);
+                return [];
+            });
+    }
+
+    // Tooltips that name a key, such as the hierarchy's "(H)", take that key
+    // from the shortcut rows rather than having it written in: a host that
+    // owns the keys may have bound the action to something else, or to
+    // nothing. A row says which action it is through its `action`; a control
+    // whose action no row names drops the hint rather than naming a key that
+    // does not do it. See data-key-action in viewer-shell.html.
+    function applyKeyHints(rows) {
+        const keyFor = new Map();
+        for (const row of Array.isArray(rows) ? rows : []) {
+            if (row && typeof row.action === "string" && typeof row.keys === "string" && !keyFor.has(row.action)) {
+                keyFor.set(row.action, row.keys);
+            }
+        }
+        for (const el of viewerRoot.querySelectorAll("[data-key-action]")) {
+            const key = keyFor.get(el.dataset.keyAction);
+            el.title = el.dataset.title + (key ? (el.dataset.keyHint || " ({key})").replace("{key}", key) : "");
+        }
+    }
+
+    // Until a host that owns the keys answers, no hint is better than the
+    // default host's, which may well be wrong.
+    if (hostOwnsKeys) {
+        applyKeyHints([]);
+        askHostShortcuts();
+    } else {
+        applyKeyHints(BUILT_IN_SHORTCUTS);
+    }
+
+    // For a host whose bindings change after mount: asks shortcuts() again,
+    // and redraws the dialog if it is up.
+    function refreshShortcuts() {
+        if (!hostOwnsKeys) return;
+        const generation = shortcutsGeneration;
+        askHostShortcuts().then((rows) => {
+            if (shortcutsOpen() && generation === shortcutsGeneration) renderShortcuts(rows);
+        });
     }
 
     function closeShortcuts() {
@@ -3796,6 +4310,10 @@ export function createViewer(mountTarget) {
                     "reload:", !!reload, "slot:", slot.id);
         if (name !== null) slot.name = name;
         slot.source = bytes;
+        // Whatever is selected in this layout, and the index it was found in,
+        // describe the file being replaced.
+        dropInspector(slot);
+        if (selection && selection.slot === slot.id) clearShapeSelection();
         // A reload (and a switch) keeps the chosen top; a different file starts
         // from every top cell again, unless the caller names one.
         if (topCell !== undefined) slot.topCell = topCell || null;
@@ -3885,6 +4403,8 @@ export function createViewer(mountTarget) {
     function unloadSlot(slotId = "b") {
         const slot = slotOf(slotId);
         stopWorkers(slot);
+        dropInspector(slot);
+        if (selection && selection.slot === slot.id) clearShapeSelection();
         settleLoad("reject", abortError("the slot was unloaded"), slot);
         slot.loaded = false;
         slot.name = null;
@@ -4043,10 +4563,19 @@ export function createViewer(mountTarget) {
         // between crossfades them. The Compare folder's slider is this.
         setBlend: setCompareBlend,
         getBlend: () => compareState.blend,
+        // ---- Selection ----
+        // The shape a click selected, the same click made programmatically
+        // (world µm; `index` steps down through the shapes under the point),
+        // and Escape's clearing of it. Each change is also a gds-select event.
+        getSelection: () => selection,
+        selectAt: (x, y, index = 0) => pickAt(x, y, index),
+        clearSelection: clearShapeSelection,
         // ---- Keyboard ----
         // For a host that binds the viewer's keys itself (see shortcuts() in
-        // the host interface): runs what the key would have run.
-        runAction
+        // the host interface): runs what the key would have run, and re-reads
+        // the bindings after the user changes them.
+        runAction,
+        refreshShortcuts
     };
 
     // Controls whose host service is missing have nothing behind them, so they

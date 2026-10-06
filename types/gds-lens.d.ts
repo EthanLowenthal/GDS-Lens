@@ -117,6 +117,62 @@ export interface ShortcutRow {
      * `+`, and alternatives on `" / "`.
      */
     keys: string;
+    /**
+     * The action this key runs. The viewer's tooltips that name a key, such
+     * as the hierarchy button's, take it from the row with the matching
+     * action, and leave the key out when no row has one.
+     */
+    action?: ViewerAction;
+}
+
+/** One step of a `ShapeInfo` path, from the drawn top cell down. */
+export interface ShapePathStep {
+    /** The cell's name. */
+    cell: string;
+    /**
+     * Which placement of this cell the shape is in, when its parent places it
+     * more than once: `"#2"` for the second of several references to it,
+     * `"[2,1]"` for the copy at column 2, row 1 of an array (from 0), `"[5]"`
+     * for a copy in a repetition that lists its offsets, or both. `null` for
+     * the top cell and for a cell placed once.
+     */
+    placement: string | null;
+}
+
+/**
+ * A shape picked by a click on the canvas or by `selectAt`. Coordinates and
+ * lengths are world µm, areas µm². Paths and boxes are given as the polygon
+ * they are drawn as.
+ */
+export interface ShapeInfo {
+    /** Which loaded layout the shape is in. */
+    slot: Slot;
+    layer: number;
+    datatype: number;
+    /** The layer's name from the `.lyp`, or `""`. */
+    layerName: string;
+    /** The layer's frame and fill colors, as `getLayers()` gives them. */
+    color: string;
+    fillColor: string;
+    /** The cell whose own geometry holds the shape. */
+    cell: string;
+    /** From the drawn top cell down to `cell`, through the placements the point is in. */
+    path: ShapePathStep[];
+    /** `path` as one line, such as `"TOP > ring_array > ring [2,1]"`. */
+    pathText: string;
+    bbox: { minX: number; minY: number; maxX: number; maxY: number };
+    width: number;
+    height: number;
+    area: number;
+    perimeter: number;
+    vertexCount: number;
+    /** The polygon's vertices in world space, x and y interleaved. */
+    points: number[];
+    /** Which of the shapes under the point this is (0 has the outline nearest the point), and how many there are. */
+    index: number;
+    count: number;
+    /** The layout's database unit in µm, the step its coordinates sit on. */
+    unit: number;
 }
 
 /** Options for `load()`. */
@@ -225,6 +281,29 @@ export interface ViewerSurface {
      * An action this viewer does not know is ignored.
      */
     runAction(action: ViewerAction): void;
+    /**
+     * Asks `ViewerHost.shortcuts` again, for a host whose bindings changed
+     * after the viewer mounted: the tooltips that name a key follow, and the
+     * Keyboard Shortcuts dialog redraws if it is open. A no-op for a host
+     * without `shortcuts`.
+     */
+    refreshShortcuts(): void;
+
+    /** The selected shape, or `null`. */
+    getSelection(): ShapeInfo | null;
+    /**
+     * Selects the shape under a world point (µm), as a click there in Pan mode
+     * does, and resolves to it. `index` picks the shape that many after the
+     * first in nearest-outline order (wrapping), which is what clicking the same spot again steps
+     * through. Resolves to `null`, and clears the selection, when there is
+     * nothing under the point on a drawn layer.
+     *
+     * The first pick in a layout reads the layout's bytes again to index its
+     * cells, which on a large file takes about as long as parsing it once.
+     */
+    selectAt(x: number, y: number, index?: number): Promise<ShapeInfo | null>;
+    /** Clears the selection, as Escape does. */
+    clearSelection(): void;
 }
 
 /**
@@ -277,7 +356,9 @@ export interface ViewerHost {
      * call `runAction`. The rows returned are listed at the top of the
      * Keyboard Shortcuts dialog, above the keys the viewer keeps (Esc, the
      * find box's Up, Down and Enter, Alt and Shift while measuring, drag and
-     * scroll). Called each time the dialog opens.
+     * scroll). Called at mount and each time the dialog opens, and again
+     * when you call `ViewerSurface.refreshShortcuts`. Give each row its
+     * `action` so the viewer's tooltips name your key rather than none.
      */
     shortcuts?(): ShortcutRow[] | Promise<ShortcutRow[]>;
     /**
@@ -321,6 +402,12 @@ export interface GdsLensEventMap extends HTMLElementEventMap {
     }>;
     /** A load failed, or `showError()` was called. `message` is what the viewer shows. */
     "gds-error": CustomEvent<{ message: string }>;
+    /**
+     * The selection changed: a click on the canvas, `selectAt`, Escape, or
+     * the layout it was in being replaced. `detail` is the new selection, or
+     * `null` when it was cleared.
+     */
+    "gds-select": CustomEvent<ShapeInfo | null>;
 }
 
 /**
@@ -397,6 +484,9 @@ export declare class GdsLens extends HTMLElement {
     getBlend(): Promise<number>;
     getTopCells(slot?: Slot): Promise<TopCellInfo>;
     setTopCell(name: string | null, slot?: Slot): Promise<void>;
+    getSelection(): Promise<ShapeInfo | null>;
+    selectAt(x: number, y: number, index?: number): Promise<ShapeInfo | null>;
+    clearSelection(): Promise<void>;
 
     /**
      * Gives up this element's viewer for good, releasing its WebAssembly

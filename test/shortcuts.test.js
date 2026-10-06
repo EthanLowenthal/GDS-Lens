@@ -15,13 +15,16 @@ import { chromium, defaultVariant, withPayload } from "./payload.js";
 const HOST_SCRIPT = `
 window.__calls = [];
 window.__context = [];
+// The hierarchy row says which action it is, so the viewer's tooltips can
+// name its key; the Measure row does not, and nothing else is bound.
+window.__rows = [
+    { label: "Toggle the hierarchy", keys: "Ctrl+K H", action: "toggleHierarchy" },
+    { label: "Measure", keys: "M" }
+];
 window.gdsLensHost = {
     shortcuts: () => {
         window.__calls.push("shortcuts");
-        return Promise.resolve([
-            { label: "Toggle the hierarchy", keys: "Ctrl+K H" },
-            { label: "Measure", keys: "M" }
-        ]);
+        return Promise.resolve(window.__rows);
     },
     customizeShortcuts: () => window.__calls.push("customizeShortcuts"),
     setKeyboardContext: (active) => window.__context.push(active),
@@ -87,7 +90,7 @@ test("the dialog lists the host's rows, then the fixed ones", opts, async () => 
         const rows = await dialogRows(page);
         assert.deepEqual(rows.slice(0, 2), [["Ctrl+K H", "Toggle the hierarchy"], ["M", "Measure"]]);
         const keys = rows.slice(2).map(([k]) => k);
-        assert.deepEqual(keys, ["Esc", "Up / Down", "Enter", "Alt", "Shift", "Drag", "Scroll"]);
+        assert.deepEqual(keys, ["Esc", "Up / Down", "Enter", "Alt", "Shift", "Click", "Drag", "Scroll"]);
         // The built-in H row is the host's to give, not the viewer's.
         assert.ok(!keys.includes("H"));
         const dialog = await page.evaluate(() => {
@@ -107,8 +110,10 @@ test("the dialog lists the host's rows, then the fixed ones", opts, async () => 
         assert.equal(await dialogOpen(page), false);
 
         // Asked again on every opening.
+        const asked = await page.evaluate(() => window.__calls.filter((c) => c === "shortcuts").length);
         await page.evaluate(() => window.viewer.runAction("showShortcuts"));
-        await page.waitForFunction(() => window.__calls.filter((c) => c === "shortcuts").length === 2);
+        await page.waitForFunction((before) => window.__calls.filter((c) => c === "shortcuts").length === before + 1,
+                                   asked);
     });
 });
 
@@ -171,5 +176,51 @@ test("the default host keeps the viewer's own keys and lists them", opts, async 
         // A click on the backdrop closes it.
         await page.mouse.click(5, 5);
         assert.equal(await dialogOpen(page), false);
+    });
+});
+
+// Every control whose tooltip names a key, as { id: title }.
+const keyHints = (page) => page.evaluate(() => Object.fromEntries(
+    [...document.querySelector("gds-lens").shadowRoot.querySelectorAll("[data-key-action]")]
+        .map((el) => [el.id, el.title])));
+
+test("tooltips name the host's keys, and none where it binds none", opts, async () => {
+    await withHostViewer(async (page) => {
+        await page.waitForFunction(() =>
+            document.querySelector("gds-lens").shadowRoot.getElementById("hierarchyShowBtn").title.includes("Ctrl+K H"));
+        assert.deepEqual(await keyHints(page), {
+            hierarchyHide: "Hide the hierarchy tree (Ctrl+K H)",
+            hierarchyFindToggle: "Find a cell by name, or a label by its text",
+            hierarchySearchInput: "Find a cell by name, or a label by its text",
+            hierarchyShowBtn: "Show the design's cell hierarchy (Ctrl+K H)"
+        });
+
+        // The user rebinds: the host says so, and the tooltips follow.
+        await page.evaluate(() => {
+            window.__rows = [
+                { label: "Toggle the hierarchy", keys: "F2", action: "toggleHierarchy" },
+                { label: "Find", keys: "Ctrl+F", action: "focusFind" }
+            ];
+            window.viewer.refreshShortcuts();
+        });
+        await page.waitForFunction(() =>
+            document.querySelector("gds-lens").shadowRoot.getElementById("hierarchyShowBtn").title.includes("F2"));
+        assert.deepEqual(await keyHints(page), {
+            hierarchyHide: "Hide the hierarchy tree (F2)",
+            hierarchyFindToggle: "Find a cell by name, or a label by its text (Ctrl+F)",
+            hierarchySearchInput: "Find a cell by name, or a label by its text (Ctrl+F focuses this box)",
+            hierarchyShowBtn: "Show the design's cell hierarchy (F2)"
+        });
+    });
+});
+
+test("the default host's tooltips name the viewer's own keys", opts, async () => {
+    await withDefaultViewer(async (page) => {
+        assert.deepEqual(await keyHints(page), {
+            hierarchyHide: "Hide the hierarchy tree (H)",
+            hierarchyFindToggle: "Find a cell by name, or a label by its text (/)",
+            hierarchySearchInput: "Find a cell by name, or a label by its text (/ focuses this box)",
+            hierarchyShowBtn: "Show the design's cell hierarchy (H)"
+        });
     });
 });

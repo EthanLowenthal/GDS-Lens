@@ -161,8 +161,15 @@ test("a placed cell's button shows it at its own origin, and Escape goes back", 
         });
         assert.strictEqual(rootHasButton, false);
 
-        // Nothing selected, no rulers, already panning: Escape goes back.
+        // A click on LEAF selects it, and the first Escape only clears that.
         await page.locator("gds-lens canvas").click();
+        await page.waitForFunction(async () =>
+            (await document.querySelector("gds-lens").getSelection())?.cell === "LEAF");
+        await page.keyboard.press("Escape");
+        await page.waitForFunction(async () =>
+            (await document.querySelector("gds-lens").getSelection()) === null);
+        assert.strictEqual((await topCells(page)).current, "LEAF");
+        // Nothing selected, no rulers, already panning: Escape goes back.
         await page.keyboard.press("Escape");
         await page.waitForFunction(async () =>
             (await document.querySelector("gds-lens").getTopCells()).current === null);

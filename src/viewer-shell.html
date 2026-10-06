@@ -1,5 +1,10 @@
 <!-- lil-gui mounts its panel here rather than at document.body, so the
      whole control surface lives inside the shadow root. -->
+<!-- A control whose tooltip names a key carries data-key-action (the action
+     the key runs), data-title (the tooltip without the key) and data-key-hint
+     (how the key is added to it, {key} standing for it). The title written
+     here is the default host's; viewer.js rewrites it from the shortcut rows,
+     so a host that rebinds a key shows its own (see applyKeyHints). -->
 <div id="guiHost"></div>
     <!-- Starts idle: a viewer that has not been asked for a layout yet says
          so, rather than showing a progress bar for a load nobody started. The
@@ -39,7 +44,8 @@
             <span id="hierarchyCount"></span>
             <button id="hierarchyHide" type="button" class="icon-only"
                 aria-label="Hide the hierarchy tree"
-                title="Hide the hierarchy tree (H)">✕</button>
+                title="Hide the hierarchy tree (H)" data-key-action="toggleHierarchy"
+                data-title="Hide the hierarchy tree" data-key-hint=" ({key})">✕</button>
         </div>
         <!-- Which cell is shown as the top, with the way back to the file's
              own top cells. Only shown while one is (see renderHierarchyCrumb
@@ -57,7 +63,8 @@
         <div id="hierarchyFind">
             <button id="hierarchyFindToggle" type="button"
                  aria-expanded="false" aria-controls="hierarchySearch"
-                 title="Find a cell by name, or a label by its text (/)">
+                 title="Find a cell by name, or a label by its text (/)" data-key-action="focusFind"
+                 data-title="Find a cell by name, or a label by its text" data-key-hint=" ({key})">
                 <span id="hierarchyFindTwisty">▸</span>
                 <span id="hierarchyFindLabel">Find</span>
                 <span id="hierarchySearchCount"></span>
@@ -65,7 +72,9 @@
             <div id="hierarchySearch" class="hidden">
                 <input id="hierarchySearchInput" type="text" placeholder="cell name"
                        spellcheck="false" autocomplete="off"
-                       title="Find a cell by name, or a label by its text (/ focuses this box)">
+                       title="Find a cell by name, or a label by its text (/ focuses this box)"
+                       data-key-action="focusFind" data-title="Find a cell by name, or a label by its text"
+                       data-key-hint=" ({key} focuses this box)">
                 <div id="hierarchyScope">
                     <button id="hierarchyScopeCells" type="button" aria-pressed="true"
                             title="Search the design's cell names">Cells</button>
@@ -79,7 +88,8 @@
     </div>
     <button id="hierarchyShowBtn" type="button" class="hidden"
             aria-expanded="false" aria-controls="hierarchyPanel"
-            title="Show the design's cell hierarchy (H)">Hierarchy</button>
+            title="Show the design's cell hierarchy (H)" data-key-action="toggleHierarchy"
+            data-title="Show the design's cell hierarchy" data-key-hint=" ({key})">Hierarchy</button>
 
     <div id="debugPanel" class="hidden">
         <div id="debugPanelHeader">
@@ -105,6 +115,26 @@
     </div>
 
     <div id="measureLabels"></div>
+
+    <!-- The shape a click on the canvas selected (see the click-to-inspect
+         block in viewer.js). Placed by placeInspectCard so it keeps off the
+         shape it describes. -->
+    <div id="inspectCard" class="hidden" role="region" aria-labelledby="inspectTitle">
+        <div id="inspectHeader">
+            <span id="inspectSwatch"></span>
+            <span id="inspectTitle"></span>
+            <button id="inspectClose" type="button" class="icon-only"
+                    aria-label="Clear the selection" title="Clear the selection (Esc)">✕</button>
+        </div>
+        <table id="inspectTable"><tbody></tbody></table>
+        <div id="inspectStatus"></div>
+        <div id="inspectActions">
+            <button id="inspectTop" type="button"
+                    title="Draw the cell that holds this shape as the top cell">Show as new top</button>
+            <button id="inspectFrame" type="button" title="Zoom the view to this shape">Frame</button>
+            <button id="inspectCopy" type="button" title="Copy these details as text">Copy</button>
+        </div>
+    </div>
 
     <div id="canvasMenu" class="hidden" role="menu">
         <button id="canvasMenuCopy" type="button" role="menuitem">

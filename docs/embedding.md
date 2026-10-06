@@ -50,7 +50,7 @@ can implement any of the following methods:
 | `onGotoResult({ok, x, y})` | `void` | A `goToPoint` call finished, reporting whether it landed inside. |
 | `isLightTheme()` | `boolean` | The viewer needs to know the theme. Defaults to the OS preference. |
 | `createWorker()` | `Worker` | The parse Worker is needed. Where the scripts cannot be fetched by URL, override this. |
-| `shortcuts()` | `Promise<{label, keys}[]>` | The Keyboard Shortcuts dialog opens. Implementing it takes over the rebindable keys; see [Keyboard shortcuts](#keyboard-shortcuts). |
+| `shortcuts()` | `Promise<{label, keys, action?}[]>` | At mount, each time the Keyboard Shortcuts dialog opens, and on `refreshShortcuts()`. Implementing it takes over the rebindable keys; see [Keyboard shortcuts](#keyboard-shortcuts). |
 | `customizeShortcuts()` | `void` | The user clicks Customize in the Keyboard Shortcuts dialog. Without it, the dialog has no Customize button. |
 | `setKeyboardContext(active)` | `void` | Once at mount, then whenever it changes: `true` while the page has focus and that focus is not in a text field. |
 | `connect(viewer)` | `void` | At mount, handing you the surface described in the following section. |
@@ -75,12 +75,17 @@ rather than answering it:
 | `getTopCells(slot?)` | The file's own top cells, and the cell drawn as the top (`null` when all of them are drawn). Returns the value directly, not a promise. |
 | `setTopCell(name, slot?)` | Draw one cell as the top, or `null` for every top cell. See [Choosing the top cell](#choosing-the-top-cell). |
 | `runAction(action)` | Do what one of the viewer's keys does: `"toggleHierarchy"`, `"focusFind"`, `"toggleMeasure"`, `"previousMarker"`, `"nextMarker"`, or `"showShortcuts"` to open the Keyboard Shortcuts dialog. Unknown actions are ignored. |
+| `refreshShortcuts()` | Ask `shortcuts()` again, after the user changed a binding. See [Keyboard shortcuts](#keyboard-shortcuts). |
+| `getSelection()` | The selected shape as a `ShapeInfo`, or `null`. Returns the value directly, not a promise. |
+| `selectAt(x, y, index?)` | Select the shape under a point in microns, as a click does. See [Selecting a shape](#selecting-a-shape). |
+| `clearSelection()` | Clear the selection, as `Esc` does. |
 | `element` | The `<gds-lens>` the viewer is mounted in. Bind anything of your own to this rather than to `window`, so it stays inside the component. |
 
 `load()` resolves once the layout is on screen and rejects when it fails (or
 when a newer load supersedes it, with an `AbortError`). The viewer also
 dispatches `gds-load` and `gds-error` on `element` for every load, however it
-was started; see [Events](../README.md#events).
+was started, and `gds-select` whenever the selected shape changes; see
+[Events](../README.md#events).
 
 ### Two layouts in one viewer
 
@@ -185,6 +190,67 @@ any load. Saved views and marker coordinates are in the coordinates of
 whatever top was drawn when they were made, so they do not line up after
 opening a placed cell, which sits at its own origin.
 
+### Selecting a shape
+
+In Pan mode, a click on the canvas selects the shape under the pointer whose
+outline is nearest it. A press counts as a click when the pointer moves no
+more than 4 pixels before it is released; a longer movement pans and selects
+nothing. Nearest outline first means a click inside a small shape selects it
+rather than a large shape that encloses it, such as a cell boundary, while a
+click on the large shape's own edge selects that. Ties go to the smaller
+shape, then to the layer drawn last. Shapes on hidden layers are skipped, and so is a layout
+crossfaded fully out. A click within 3 pixels of a shape's edge counts as on
+it, so a thin wire can be picked without zooming in.
+
+Clicking the same spot again, without zooming, selects the next shape under it,
+and wraps around after the last. Clicking empty space, `Esc`, or the card's ✕
+clears the selection. In Measure mode, clicks place rulers as before.
+
+The selected shape is outlined in the same dashed style as a selected hierarchy
+row, and a card describes it:
+
+- the layer, by number and by its `.lyp` name, with its color;
+- the cell whose own geometry holds the shape, and the path to it from the top
+  cell drawn, such as `TOP > ring_array > ring [2,1]`. A cell its parent places
+  more than once is marked with the placement the click was in: `#2` for the
+  second of several references to it, `[2,1]` for column 2, row 1 of an array;
+- its bounding box, width and height, area, perimeter and vertex count, in µm,
+  with as many decimals as the file's database unit has;
+- with two layouts loaded, which one it is from.
+
+The card's **Show as new top** button calls `setTopCell` for the shape's cell,
+**Frame** zooms to the shape, and **Copy** puts the card's text on the
+clipboard. Where the host blocks the clipboard, the card's text can be
+selected and copied instead.
+
+```js
+const element = document.querySelector("gds-lens");
+const shape = await element.selectAt(12.5, 40);   // world µm; null if nothing is there
+if (shape) console.log(shape.pathText, shape.area);
+await element.selectAt(12.5, 40, 1);             // the shape under that one
+element.addEventListener("gds-select", (event) => {
+    showInMyPanel(event.detail);                  // a ShapeInfo, or null when cleared
+});
+```
+
+A `ShapeInfo` carries the fields the card shows (`layer`, `datatype`,
+`layerName`, `cell`, `path`, `pathText`, `bbox`, `width`, `height`, `area`,
+`perimeter`, `vertexCount`, `slot`), the polygon's world-space vertices as
+`points`, and `index` and `count` for its place among the shapes under the
+point. See `types/gds-lens.d.ts`.
+
+The drawn geometry has no record of which cell each polygon came from, so the
+first click in a layout reads the layout's bytes again, in a Worker, and keeps
+the result as a hierarchy rather than flattened. That first click takes about
+as long as one parse of the file; every click after it is a lookup, a few
+milliseconds even on the largest layouts below. The Worker that read the file
+is then released, and the index moves to a second Worker that answers clicks,
+so the memory reading took is not held. That Worker holds about 8 bytes per
+vertex of each cell's own geometry, 8 bytes per polygon, and 48 bytes per
+placement record, where an array is one record however many copies it makes.
+A cell placed many times is held once. It is released when its layout is
+replaced or unloaded.
+
 ### Saved views on a page with several viewers
 
 Both view methods are handed the viewer asking, which is the same surface
@@ -217,8 +283,16 @@ markers. The Keyboard Shortcuts button in the Display folder lists them.
 A host that implements `shortcuts()` takes these five keys over. The viewer
 stops handling them, and the host binds whatever keys it likes and calls
 `runAction` for each. `shortcuts()` returns the rows to list for them, as
-`{ label, keys }` with `keys` as display text (`"H"`, `"Ctrl+K D"`), and is
-called each time the dialog opens, so a rebinding shows up the next time. The
+`{ label, keys, action }` with `keys` as display text (`"H"`, `"Ctrl+K D"`)
+and `action` the `runAction` name the key runs. It is called at mount and each
+time the dialog opens, so a rebinding shows up the next time. Call
+`refreshShortcuts()` on the viewer surface after the user changes a binding to
+ask again straight away.
+
+The viewer's tooltips that name a key, such as the hierarchy button's, take
+the key from the row with the matching `action`. A tooltip whose action no row
+names leaves the key out, so a row without `action` is listed in the dialog but
+named in no tooltip. The
 dialog lists the viewer's fixed keys after the host's rows: Esc, Up, Down and
 Enter in the find box, Alt and Shift while measuring, drag to pan and scroll to
 zoom. The viewer keeps handling those.
@@ -232,8 +306,8 @@ lives in a shadow root, so the host cannot work this out from
 ```js
 window.gdsLensHost = {
     shortcuts: () => [
-        { label: "Show or hide the hierarchy", keys: "Alt+H" },
-        { label: "Find a cell or label", keys: "Ctrl+F" }
+        { label: "Show or hide the hierarchy", keys: "Alt+H", action: "toggleHierarchy" },
+        { label: "Find a cell or label", keys: "Ctrl+F", action: "focusFind" }
     ],
     setKeyboardContext(active) { keysEnabled = active; },
     connect(viewer) {
@@ -402,3 +476,11 @@ what fits:
 
 Past that the module aborts, and the viewer turns the error into an explanation
 rather than an engine string.
+
+[Selecting a shape](#selecting-a-shape) runs in Workers of its own, each with
+its own 4 GB, so it does not lower these limits. Reading the file for it needs
+less memory than the parse does, and is released once read. What the Worker
+that answers clicks holds follows the file rather than the flattened design:
+about 650 MB for the 10 million flat rectangles, 950 MB for the 2.3 million
+curves, and 1.4 GB for the 20 million placements, which it keeps as placement
+records rather than copies.

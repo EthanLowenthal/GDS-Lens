@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include <gdstk/gdstk.hpp>
 
@@ -135,6 +136,27 @@ inline bool is_fatal(gdstk::ErrorCode error_code) {
 // design and shouldn't be rendered.
 inline bool is_metadata_cell(const gdstk::Cell* cell) {
     return cell->name && strncmp(cell->name, "$$$", 3) == 0;
+}
+
+// The cells a layout is drawn from when no top cell was chosen: every
+// non-metadata top cell, or -- if the hierarchy has no clean root (e.g. a
+// reference cycle) -- the last cell defined, mirroring common GDS tooling.
+// Shared by the parse and the inspect index (inspect.cpp), which have to agree
+// on what is drawn for a click to find what is on screen.
+inline std::vector<gdstk::Cell*> default_roots(const gdstk::Library& lib) {
+    gdstk::Array<gdstk::Cell*> top_cells = {};
+    gdstk::Array<gdstk::RawCell*> top_rawcells = {};
+    lib.top_level(top_cells, top_rawcells);
+    std::vector<gdstk::Cell*> roots;
+    for (uint64_t i = 0; i < top_cells.count; i++) {
+        if (!is_metadata_cell(top_cells[i])) roots.push_back(top_cells[i]);
+    }
+    if (roots.empty() && lib.cell_array.count > 0) {
+        roots.push_back(lib.cell_array[lib.cell_array.count - 1]);
+    }
+    top_cells.clear();
+    top_rawcells.clear();
+    return roots;
 }
 
 }  // namespace gds_common

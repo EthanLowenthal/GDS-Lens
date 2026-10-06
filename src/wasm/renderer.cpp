@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -58,6 +59,7 @@ struct nth<1, gdstk::Vec2> {
 }  // namespace mapbox
 
 #include "gds_common.hpp"
+#include "inspect.hpp"
 #include "kfactory_ports.hpp"
 #include "lyp_util.hpp"
 #include "shaders.hpp"
@@ -658,6 +660,14 @@ float g_snap_x = 0.0f, g_snap_y = 0.0f;
 // Flat, 4 floats (minX, minY, maxX, maxY) per box.
 std::vector<float> g_highlight_boxes;
 GLuint g_highlight_vbo = 0;
+
+// The shape a click selected, as world-space x/y pairs (see setSelection and
+// draw_selection), its bounding box (minX, minY, maxX, maxY), and the slot it
+// belongs to, so reloading that layout drops it. Empty when nothing is
+// selected.
+std::vector<float> g_selection_points;
+float g_selection_box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+int g_selection_slot = -1;
 
 // The outline's half-thickness, its dash and gap lengths, and the smallest box
 // it is drawn around -- all in pixels, so it keeps the same weight and dash
@@ -2764,6 +2774,157 @@ void draw_diff_highlight() {
     if (drew) glUseProgram(g_program);
 }
 
+// The pixel metrics every highlight outline is built from, converted to world
+// units at the current zoom, and the viewport the dashes are clipped to.
+//
+// Clipping to the view is what bounds the work: zoomed into one corner of a
+// die-sized cell, a side is millions of pixels long, and every dash but the
+// handful on screen would be built only to fall outside the viewport. Clipped,
+// the dashes along one side can't outnumber the canvas's own size in dashes --
+// and a selection's boxes that are off screen entirely (the other 39 copies of
+// a cell, while you look at one) cost four comparisons.
+//
+// The rect is computed here rather than taken from current_view_rect() because
+// that one pads by a *world* distance (it exists for the hatch patterns), which
+// at a high zoom is an arbitrarily large number of pixels -- and it's precisely
+// a pixel-sized viewport that bounds the dash count. Two dash periods of pad
+// keeps a dash straddling the edge from popping.
+struct HighlightPen {
+    float t, dash, period, min_world;
+    ViewRect view;
+};
+
+HighlightPen highlight_pen() {
+    HighlightPen pen;
+    pen.t = kHighlightRingPx / g_zoom;  // half-thickness
+    pen.dash = kHighlightDashPx / g_zoom;
+    pen.period = (kHighlightDashPx + kHighlightGapPx) / g_zoom;
+    pen.min_world = kHighlightMinPx / g_zoom;
+    float half_w = (float)g_canvas_width * 0.5f / g_zoom + 2.0f * pen.period;
+    float half_h = (float)g_canvas_height * 0.5f / g_zoom + 2.0f * pen.period;
+    pen.view = {g_pan_x - half_w, g_pan_x + half_w, g_pan_y - half_h, g_pan_y + half_h};
+    return pen;
+}
+
+void append_quad(std::vector<float>& verts, float x0, float y0, float x1, float y1) {
+    const float v[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+    verts.insert(verts.end(), v, v + 12);
+}
+
+// One axis-aligned side of a box, as dashes along [lo, hi] of one axis. The
+// dash grid is anchored at `lo` -- the side's true start, not the clipped one
+// -- so panning moves the dashes with the geometry instead of sliding them
+// along the edge.
+void append_dashed_side(std::vector<float>& verts, const HighlightPen& pen, bool horizontal, float lo, float hi,
+                        float a, float b) {
+    const ViewRect& view = pen.view;
+    // Wholly off-screen across its short axis: nothing to walk at all.
+    if (horizontal) {
+        if (b < view.min_y || a > view.max_y) return;
+    } else {
+        if (b < view.min_x || a > view.max_x) return;
+    }
+    float clip_lo = std::max(lo, horizontal ? view.min_x : view.min_y);
+    float clip_hi = std::min(hi, horizontal ? view.max_x : view.max_y);
+    if (clip_hi <= clip_lo) return;
+    // Dashes are laid on a fixed grid from `lo`; start at the last one that
+    // can still reach clip_lo.
+    double first = std::floor((double)(clip_lo - lo) / (double)pen.period);
+    for (double k = first;; k += 1.0) {
+        float start = lo + (float)(k * (double)pen.period);
+        if (start > clip_hi) break;
+        float end = std::min(start + pen.dash, hi);
+        if (end <= clip_lo) continue;
+        if (end <= start) continue;
+        if (horizontal) append_quad(verts, std::max(start, clip_lo), a, end, b);
+        else append_quad(verts, a, std::max(start, clip_lo), b, end);
+    }
+}
+
+void append_dashed_box(std::vector<float>& verts, const HighlightPen& pen, float min_x, float min_y, float max_x,
+                       float max_y) {
+    // Grow anything smaller than kHighlightMinPx on screen (a small cell seen
+    // from across the die, or a zero-area one) about its own center, so the
+    // outline is always drawn around a box thicker than the outline itself and
+    // long enough on each side to show as more than one dash.
+    float grow_x = (pen.min_world - (max_x - min_x)) * 0.5f;
+    if (grow_x > 0.0f) {
+        min_x -= grow_x;
+        max_x += grow_x;
+    }
+    float grow_y = (pen.min_world - (max_y - min_y)) * 0.5f;
+    if (grow_y > 0.0f) {
+        min_y -= grow_y;
+        max_y += grow_y;
+    }
+    // Outer/inner edges of the outline, straddling the box's boundary. The
+    // horizontal sides run the full outer width so the corners are solid; the
+    // vertical ones then only cover what's left between them.
+    const float t = pen.t;
+    float ox0 = min_x - t, ox1 = max_x + t, oy0 = min_y - t, oy1 = max_y + t;
+    float ix0 = min_x + t, ix1 = max_x - t, iy0 = min_y + t, iy1 = max_y - t;
+    append_dashed_side(verts, pen, true, ox0, ox1, oy0, iy0);   // bottom
+    append_dashed_side(verts, pen, true, ox0, ox1, iy1, oy1);   // top
+    append_dashed_side(verts, pen, false, iy0, iy1, ox0, ix0);  // left
+    append_dashed_side(verts, pen, false, iy0, iy1, ix1, ox1);  // right
+}
+
+// One edge of a polygon at any angle, dashed the same way: the dash grid
+// anchored at the edge's first vertex, and only the stretch inside the view
+// walked (Liang-Barsky against the padded viewport).
+void append_dashed_edge(std::vector<float>& verts, const HighlightPen& pen, float x0, float y0, float x1, float y1) {
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float len = std::sqrt(dx * dx + dy * dy);
+    if (!(len > 0.0f)) return;
+    float u0 = 0.0f, u1 = 1.0f;
+    const float p[4] = {-dx, dx, -dy, dy};
+    const float q[4] = {x0 - pen.view.min_x, pen.view.max_x - x0, y0 - pen.view.min_y, pen.view.max_y - y0};
+    for (int i = 0; i < 4; i++) {
+        if (p[i] == 0.0f) {
+            if (q[i] < 0.0f) return;
+            continue;
+        }
+        const float r = q[i] / p[i];
+        if (p[i] < 0.0f) u0 = std::max(u0, r);
+        else u1 = std::min(u1, r);
+    }
+    if (u1 <= u0) return;
+    const float ux = dx / len, uy = dy / len;
+    const float nx = -uy * pen.t, ny = ux * pen.t;
+    const float clip_lo = u0 * len, clip_hi = u1 * len;
+    double first = std::floor((double)clip_lo / (double)pen.period);
+    for (double k = first;; k += 1.0) {
+        float start = (float)(k * (double)pen.period);
+        if (start > clip_hi) break;
+        float end = std::min(start + pen.dash, clip_hi);
+        start = std::max(start, clip_lo);
+        if (end <= start) continue;
+        // Each dash runs a half-thickness past its ends, so the dashes that
+        // meet at a vertex close the corner rather than leaving a notch.
+        const float a = start - (start <= 0.0f ? pen.t : 0.0f);
+        const float b = end + (end >= len ? pen.t : 0.0f);
+        const float ax = x0 + ux * a, ay = y0 + uy * a, bx = x0 + ux * b, by = y0 + uy * b;
+        const float v[12] = {ax - nx, ay - ny, bx - nx, by - ny, bx + nx, by + ny,
+                             ax - nx, ay - ny, bx + nx, by + ny, ax + nx, ay + ny};
+        verts.insert(verts.end(), v, v + 12);
+    }
+}
+
+// Uploads one frame's worth of highlight quads and draws them in the highlight
+// colour. Shared by every outline the viewer draws on request.
+void draw_highlight_quads(const std::vector<float>& verts) {
+    if (verts.empty()) return;  // everything is off screen
+    if (!g_highlight_vbo) glGenBuffers(1, &g_highlight_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_highlight_vbo);
+    buffer_data_tracked(GL_ARRAY_BUFFER, g_highlight_vbo, (GLsizeiptr)(verts.size() * sizeof(float)),
+                        verts.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(g_loc_position);
+    glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glUniform4f(g_loc_color, g_highlight_color[0], g_highlight_color[1], g_highlight_color[2], 0.95f);
+    glUniform1f(g_loc_use_hatch, 0.0f);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(verts.size() / 2));
+}
+
 // Draws the selected cell's outlines: one dashed rectangle per box in
 // g_highlight_boxes, built as screen-thickness quads. Both properties are there
 // to keep them from reading as part of the layout -- a solid thin rectangle is
@@ -2780,103 +2941,41 @@ void draw_diff_highlight() {
 // what's built is bounded by the viewport rather than by the selection.
 void draw_cell_highlight() {
     if (g_highlight_boxes.empty()) return;
-
-    float t = kHighlightRingPx / g_zoom;  // half-thickness
-    float dash = kHighlightDashPx / g_zoom;
-    float period = (kHighlightDashPx + kHighlightGapPx) / g_zoom;
-    float min_world = kHighlightMinPx / g_zoom;
-
-    // Clipping to the view is what bounds the work: zoomed into one corner of a
-    // die-sized cell, a side is millions of pixels long, and every dash but the
-    // handful on screen would be built only to fall outside the viewport.
-    // Clipped, the dashes along one side can't outnumber the canvas's own size
-    // in dashes -- and a selection's boxes that are off screen entirely (the
-    // other 39 copies of a cell, while you look at one) cost four comparisons.
-    //
-    // The rect is computed here rather than taken from current_view_rect()
-    // because that one pads by a *world* distance (it exists for the hatch
-    // patterns), which at a high zoom is an arbitrarily large number of pixels
-    // -- and it's precisely a pixel-sized viewport that bounds the dash count.
-    // Two dash periods of pad keeps a dash straddling the edge from popping.
-    float half_w = (float)g_canvas_width * 0.5f / g_zoom + 2.0f * period;
-    float half_h = (float)g_canvas_height * 0.5f / g_zoom + 2.0f * period;
-    const ViewRect view = {g_pan_x - half_w, g_pan_x + half_w, g_pan_y - half_h, g_pan_y + half_h};
-
+    const HighlightPen pen = highlight_pen();
     std::vector<float> verts;
-    auto quad = [&verts](float x0, float y0, float x1, float y1) {
-        const float v[12] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
-        verts.insert(verts.end(), v, v + 12);
-    };
-
-    // One side of one box, as dashes along [lo, hi] of one axis. The dash grid
-    // is anchored at `lo` -- the side's true start, not the clipped one -- so
-    // panning moves the dashes with the geometry instead of sliding them along
-    // the edge.
-    auto dashed_side = [&](bool horizontal, float lo, float hi, float a, float b) {
-        // Wholly off-screen across its short axis: nothing to walk at all.
-        if (horizontal) {
-            if (b < view.min_y || a > view.max_y) return;
-        } else {
-            if (b < view.min_x || a > view.max_x) return;
-        }
-        float clip_lo = std::max(lo, horizontal ? view.min_x : view.min_y);
-        float clip_hi = std::min(hi, horizontal ? view.max_x : view.max_y);
-        if (clip_hi <= clip_lo) return;
-        // Dashes are laid on a fixed grid from `lo`; start at the last one that
-        // can still reach clip_lo.
-        double first = std::floor((double)(clip_lo - lo) / (double)period);
-        for (double k = first;; k += 1.0) {
-            float start = lo + (float)(k * (double)period);
-            if (start > clip_hi) break;
-            float end = std::min(start + dash, hi);
-            if (end <= clip_lo) continue;
-            if (end <= start) continue;
-            if (horizontal) quad(std::max(start, clip_lo), a, end, b);
-            else quad(a, std::max(start, clip_lo), b, end);
-        }
-    };
-
     for (size_t i = 0; i + 3 < g_highlight_boxes.size(); i += 4) {
         if (verts.size() >= kMaxHighlightVerts) break;
-        float min_x = g_highlight_boxes[i], min_y = g_highlight_boxes[i + 1];
-        float max_x = g_highlight_boxes[i + 2], max_y = g_highlight_boxes[i + 3];
-
-        // Grow anything smaller than kHighlightMinPx on screen (a small cell
-        // seen from across the die, or a zero-area one) about its own center, so
-        // the outline is always drawn around a box thicker than the outline
-        // itself and long enough on each side to show as more than one dash.
-        float grow_x = (min_world - (max_x - min_x)) * 0.5f;
-        if (grow_x > 0.0f) {
-            min_x -= grow_x;
-            max_x += grow_x;
-        }
-        float grow_y = (min_world - (max_y - min_y)) * 0.5f;
-        if (grow_y > 0.0f) {
-            min_y -= grow_y;
-            max_y += grow_y;
-        }
-
-        // Outer/inner edges of the outline, straddling the box's boundary. The
-        // horizontal sides run the full outer width so the corners are solid;
-        // the vertical ones then only cover what's left between them.
-        float ox0 = min_x - t, ox1 = max_x + t, oy0 = min_y - t, oy1 = max_y + t;
-        float ix0 = min_x + t, ix1 = max_x - t, iy0 = min_y + t, iy1 = max_y - t;
-        dashed_side(true, ox0, ox1, oy0, iy0);   // bottom
-        dashed_side(true, ox0, ox1, iy1, oy1);   // top
-        dashed_side(false, iy0, iy1, ox0, ix0);  // left
-        dashed_side(false, iy0, iy1, ix1, ox1);  // right
+        append_dashed_box(verts, pen, g_highlight_boxes[i], g_highlight_boxes[i + 1], g_highlight_boxes[i + 2],
+                          g_highlight_boxes[i + 3]);
     }
-    if (verts.empty()) return;  // every box is off screen
+    draw_highlight_quads(verts);
+}
 
-    if (!g_highlight_vbo) glGenBuffers(1, &g_highlight_vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, g_highlight_vbo);
-    buffer_data_tracked(GL_ARRAY_BUFFER, g_highlight_vbo, (GLsizeiptr)(verts.size() * sizeof(float)),
-                        verts.data(), GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(g_loc_position);
-    glVertexAttribPointer(g_loc_position, 2, GL_FLOAT, GL_FALSE, 0, 0);
-    glUniform4f(g_loc_color, g_highlight_color[0], g_highlight_color[1], g_highlight_color[2], 0.95f);
-    glUniform1f(g_loc_use_hatch, 0.0f);
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(verts.size() / 2));
+// The shape a click on the canvas selected (see setSelection), outlined in the
+// same dashed pen as the selected cell's boxes: both are the viewer pointing
+// at something you asked about. Drawn along the shape's own edges rather than
+// around its box, so a selected L or ring reads as that shape. One smaller
+// than kHighlightMinPx on screen gets the grown box instead, which is the only
+// way to see where it is from far out.
+void draw_selection() {
+    if (g_selection_points.size() < 4) return;
+    const HighlightPen pen = highlight_pen();
+    std::vector<float> verts;
+    const float w = g_selection_box[2] - g_selection_box[0];
+    const float h = g_selection_box[3] - g_selection_box[1];
+    if (w < pen.min_world && h < pen.min_world) {
+        append_dashed_box(verts, pen, g_selection_box[0], g_selection_box[1], g_selection_box[2],
+                          g_selection_box[3]);
+    } else if (bbox_intersects_view(g_selection_box[0], g_selection_box[2], g_selection_box[1],
+                                    g_selection_box[3], pen.view)) {
+        const size_t n = g_selection_points.size() / 2;
+        for (size_t k = 0; k < n && verts.size() < kMaxHighlightVerts; k++) {
+            const size_t m = k + 1 == n ? 0 : k + 1;
+            append_dashed_edge(verts, pen, g_selection_points[2 * k], g_selection_points[2 * k + 1],
+                               g_selection_points[2 * m], g_selection_points[2 * m + 1]);
+        }
+    }
+    draw_highlight_quads(verts);
 }
 
 // Defined just below draw_frame with the rest of the frame plumbing; declared
@@ -3213,6 +3312,7 @@ bool draw_frame(double time, void* /*userData*/) {
     // Over the geometry and the marker overlay (it's an answer to a question
     // about the layout, so it can't be buried by it), under the ruler.
     draw_cell_highlight();
+    draw_selection();
     draw_measure_line();
     draw_goto_flash(time);
     // The flash is the only thing here that changes without an input event, so
@@ -3416,6 +3516,11 @@ void clear_layers_for_slot(int slot) {
     // back; dropping them here is what stops a *different* file inheriting
     // rectangles drawn around nothing.
     g_highlight_boxes.clear();
+    // And the selected shape, when it came from the layout being replaced.
+    if (slot < 0 || g_selection_slot == slot) {
+        g_selection_points.clear();
+        g_selection_slot = -1;
+    }
     // Same reasoning for the Go to Coordinate crosshair: it marks a spot in the
     // file being replaced.
     g_goto_start_ms = -1.0;
@@ -5119,23 +5224,10 @@ val parseGdsToLayers(const std::string& path, val options) {
         return result;
     }
 
-    Array<Cell*> top_cells = {};
-    Array<RawCell*> top_rawcells = {};
-    lib.top_level(top_cells, top_rawcells);
-
-    // The cells we actually render at top level (each an instance-count root):
-    // every non-metadata top cell, or -- if the hierarchy has no clean root
-    // (e.g. a reference cycle) -- the last cell defined, mirroring common GDS
-    // tooling. base_counts seeds compute_instance_count with 1 per root.
-    std::vector<Cell*> roots;
-    for (uint64_t i = 0; i < top_cells.count; i++) {
-        if (!gds_common::is_metadata_cell(top_cells[i])) roots.push_back(top_cells[i]);
-    }
-    if (roots.empty() && lib.cell_array.count > 0) {
-        roots.push_back(lib.cell_array[lib.cell_array.count - 1]);
-    }
-    top_cells.clear();
-    top_rawcells.clear();
+    // The cells we actually render at top level (each an instance-count root;
+    // see gds_common::default_roots). base_counts seeds compute_instance_count
+    // with 1 per root.
+    std::vector<Cell*> roots = gds_common::default_roots(lib);
 
     // The file's own top cells, by name, whichever one is drawn: the list the
     // viewer's Top cell control offers. Reported by every shard (it is a few
@@ -5427,6 +5519,182 @@ val parseGdsToLayers(const std::string& path, val options) {
     result.set("labelsCapped", labels.capped);
     return result;
 }
+
+// ---- Click to inspect (see inspect.hpp) ----
+// The inspect index lives in a Worker of its own, built from the same bytes
+// the slot was parsed from: inspectLoad reads the file and keeps it as a
+// hierarchy, inspectAt asks it what is under a point. One per module, which is
+// one per Worker; the main thread never builds one.
+//
+// Reading the file takes far more memory than the index it leaves behind
+// (gdstk's library is the whole file as objects), and a wasm heap never
+// shrinks, so a Worker that read the file would hold that peak for as long as
+// it answered clicks. So with `snapshot` set, inspectLoad hands the built
+// index back as flat arrays instead of keeping it, and the viewer passes them
+// to a fresh Worker's inspectRestore: the one that stays up holds the index
+// and nothing else.
+std::unique_ptr<inspect::Index> g_inspect;
+
+template <typename T>
+val typed_array(const char* type, const std::vector<T>& data) {
+    val array = val::global(type).new_(data.size());
+    array.call<void>("set", typed_memory_view(data.size(), data.data()));
+    return array;
+}
+
+val snapshot_to_val(inspect::Snapshot&& snap) {
+    val out = val::object();
+    out.set("grid", snap.grid);
+    out.set("root", snap.root);
+    val names = val::array();
+    for (const std::string& name : snap.names) names.call<void>("push", name);
+    out.set("names", names);
+    out.set("roots", typed_array("Uint32Array", snap.roots));
+    out.set("counts", typed_array("Float64Array", snap.counts));
+    // Each array is copied out and its wasm-side copy dropped before the
+    // next, so the two never both hold the whole index.
+    out.set("xy", typed_array("Int32Array", snap.xy));
+    std::vector<int32_t>().swap(snap.xy);
+    out.set("starts", typed_array("Uint32Array", snap.starts));
+    std::vector<uint32_t>().swap(snap.starts);
+    out.set("tagIndex", typed_array("Uint32Array", snap.tag_index));
+    std::vector<uint32_t>().swap(snap.tag_index);
+    out.set("tags", typed_array("Float64Array", snap.tags));
+    // Placements cross as their own bytes: the struct is plain data.
+    {
+        val bytes = val::global("Uint8Array").new_(snap.placements.size() * sizeof(inspect::Placement));
+        bytes.call<void>("set", typed_memory_view(snap.placements.size() * sizeof(inspect::Placement),
+                                                  reinterpret_cast<const uint8_t*>(snap.placements.data())));
+        out.set("placements", bytes);
+    }
+    std::vector<inspect::Placement>().swap(snap.placements);
+    out.set("reps", typed_array("Float64Array", snap.reps));
+    out.set("boxes", typed_array("Float64Array", snap.boxes));
+    return out;
+}
+
+val inspectLoad(const std::string& path, val options) {
+    val result = val::object();
+    std::string root_name;
+    bool release_file = false;
+    if (!options.isUndefined() && !options.isNull()) {
+        val root_opt = options["root"];
+        if (root_opt.isString()) root_name = root_opt.as<std::string>();
+        val release_opt = options["releaseFile"];
+        if (!release_opt.isUndefined()) release_file = release_opt.as<bool>();
+    }
+    g_inspect.reset();
+
+    ErrorCode error_code = ErrorCode::NoError;
+    gds_common::FileFormat format = gds_common::FileFormat::Gds;
+    Library lib = gds_common::read_layout(path.c_str(), 1e-6, 1e-2, &format, &error_code, NULL);
+    if (release_file) std::remove(path.c_str());
+    if (gds_common::is_fatal(error_code)) {
+        lib.free_all();
+        result.set("ok", false);
+        result.set("error", std::string(gds_common::error_string(error_code, format)));
+        return result;
+    }
+    g_inspect = std::make_unique<inspect::Index>();
+    g_inspect->build(lib, root_name);
+    lib.free_all();
+
+    result.set("ok", true);
+    result.set("root", g_inspect->root().empty() ? val::null() : val(g_inspect->root()));
+    result.set("grid", g_inspect->grid());
+    result.set("vertices", (double)g_inspect->vertex_count());
+    result.set("polygons", (double)g_inspect->polygon_count());
+    result.set("placements", (double)g_inspect->placement_count());
+    val snapshot_opt = options.isUndefined() || options.isNull() ? val::undefined() : options["snapshot"];
+    if (!snapshot_opt.isUndefined() && snapshot_opt.as<bool>()) {
+        result.set("snapshot", snapshot_to_val(g_inspect->take()));
+        g_inspect.reset();
+    }
+    return result;
+}
+
+// The other half of inspectLoad's `snapshot`: an index rebuilt from the
+// arrays a reading Worker handed back.
+void inspectRestore(val snap) {
+    inspect::Snapshot in;
+    in.grid = snap["grid"].as<double>();
+    in.root = snap["root"].as<std::string>();
+    val names = snap["names"];
+    const unsigned count = names["length"].as<unsigned>();
+    in.names.reserve(count);
+    for (unsigned i = 0; i < count; i++) in.names.push_back(names[i].as<std::string>());
+    in.roots = convertJSArrayToNumberVector<uint32_t>(snap["roots"]);
+    in.counts = convertJSArrayToNumberVector<double>(snap["counts"]);
+    in.xy = convertJSArrayToNumberVector<int32_t>(snap["xy"]);
+    in.starts = convertJSArrayToNumberVector<uint32_t>(snap["starts"]);
+    in.tag_index = convertJSArrayToNumberVector<uint32_t>(snap["tagIndex"]);
+    in.tags = convertJSArrayToNumberVector<double>(snap["tags"]);
+    // Copied straight into the vector's storage, as the bytes they left as.
+    val placement_bytes = snap["placements"];
+    in.placements.resize(placement_bytes["length"].as<size_t>() / sizeof(inspect::Placement));
+    val(typed_memory_view(in.placements.size() * sizeof(inspect::Placement),
+                          reinterpret_cast<uint8_t*>(in.placements.data())))
+        .call<void>("set", placement_bytes);
+    in.reps = convertJSArrayToNumberVector<double>(snap["reps"]);
+    in.boxes = convertJSArrayToNumberVector<double>(snap["boxes"]);
+    g_inspect = std::make_unique<inspect::Index>();
+    g_inspect->restore(std::move(in));
+}
+
+// `ranks` is flat (tag, rank) pairs: the layers drawn right now and where each
+// sits in the draw order, so hidden layers are never hit and the answer comes
+// back topmost first (see getLayerStack, which the main thread builds it from).
+val inspectAt(double x, double y, double tolerance, val ranks, unsigned limit) {
+    val result = val::object();
+    val hits_js = val::array();
+    result.set("hits", hits_js);
+    result.set("total", 0);
+    result.set("truncated", false);
+    if (!g_inspect) return result;
+
+    std::unordered_map<Tag, double> rank_of;
+    std::vector<double> flat = convertJSArrayToNumberVector<double>(ranks);
+    for (size_t i = 0; i + 1 < flat.size(); i += 2) rank_of[(Tag)(uint64_t)flat[i]] = flat[i + 1];
+
+    inspect::QueryResult found = g_inspect->query(x, y, tolerance, rank_of, limit);
+    for (const inspect::Hit& hit : found.hits) {
+        val h = val::object();
+        h.set("layer", get_layer(hit.tag));
+        h.set("datatype", get_type(hit.tag));
+        h.set("area", hit.area);
+        h.set("edgeDistance", hit.edge_distance);
+        val points = val::global("Float64Array").new_(hit.points.size());
+        points.call<void>("set", typed_memory_view(hit.points.size(), hit.points.data()));
+        h.set("points", points);
+        val path = val::array();
+        for (const inspect::PathStep& step : hit.path) {
+            val s = val::object();
+            s.set("cell", step.cell);
+            s.set("sibling", (double)step.sibling);
+            s.set("siblings", (double)step.siblings);
+            s.set("copy", (double)step.copy);
+            s.set("copies", (double)step.copies);
+            s.set("column", (double)step.column);
+            s.set("row", (double)step.row);
+            path.call<void>("push", s);
+        }
+        h.set("path", path);
+        val placement = val::object();
+        placement.set("a", hit.placement.a);
+        placement.set("b", hit.placement.b);
+        placement.set("c", hit.placement.c);
+        placement.set("d", hit.placement.d);
+        placement.set("tx", hit.placement.tx);
+        placement.set("ty", hit.placement.ty);
+        h.set("placement", placement);
+        hits_js.call<void>("push", h);
+    }
+    result.set("total", (double)found.total);
+    result.set("truncated", found.truncated);
+    return result;
+}
+
+void inspectRelease() { g_inspect.reset(); }
 
 // The GL-upload half of a load: takes the plain per-layer
 // vertex data produced by parseGdsToLayers() (either called directly, or
@@ -6306,6 +6574,56 @@ void clearCellHighlight() {
     request_redraw();
 }
 
+// The shape a click selected, outlined until cleared: world-space x/y pairs
+// as inspectAt returned them, and the slot the shape belongs to. The outline
+// is drawn over the layers every frame, including the reprojected ones a drag
+// over a large layout draws from the layer cache (see draw_frame), so it stays
+// on the shape while the view moves.
+void setSelection(val points, int slot) {
+    std::vector<float> flat = convertJSArrayToNumberVector<float>(points);
+    g_selection_points.clear();
+    float min_x = HUGE_VALF, min_y = HUGE_VALF, max_x = -HUGE_VALF, max_y = -HUGE_VALF;
+    for (size_t i = 0; i + 1 < flat.size(); i += 2) {
+        if (!std::isfinite(flat[i]) || !std::isfinite(flat[i + 1])) continue;
+        g_selection_points.push_back(flat[i]);
+        g_selection_points.push_back(flat[i + 1]);
+        min_x = std::min(min_x, flat[i]);
+        max_x = std::max(max_x, flat[i]);
+        min_y = std::min(min_y, flat[i + 1]);
+        max_y = std::max(max_y, flat[i + 1]);
+    }
+    g_selection_box[0] = min_x;
+    g_selection_box[1] = min_y;
+    g_selection_box[2] = max_x;
+    g_selection_box[3] = max_y;
+    g_selection_slot = g_selection_points.empty() ? -1 : slot;
+    request_redraw();
+}
+
+void clearSelection() {
+    if (g_selection_points.empty()) return;
+    g_selection_points.clear();
+    g_selection_slot = -1;
+    request_redraw();
+}
+
+// The layers being drawn right now, bottom first: the order draw_layers walks
+// them in, which is what "on top" means for a click. Hidden layers and a slot
+// crossfaded fully out are left out, since neither shows anything to click.
+val getLayerStack() {
+    val result = val::array();
+    int index = 0;
+    for (const LayerBuffer& layer : g_layers) {
+        if (!layer.visible || g_slot_alpha[layer.source] <= 0.0f) continue;
+        val entry = val::object();
+        entry.set("source", layer.source);
+        entry.set("layer", layer.layer);
+        entry.set("datatype", layer.datatype);
+        result.set(index++, entry);
+    }
+    return result;
+}
+
 // CPU-side marker state summary for headless smoke tests (no GL context
 // needed) -- see test/marker-wasm.test.js.
 val getMarkerStats() {
@@ -6528,6 +6846,14 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("flashPoint", &flashPoint);
     function("setCellHighlight", &setCellHighlight);
     function("clearCellHighlight", &clearCellHighlight);
+    function("setSelection", &setSelection);
+    function("clearSelection", &clearSelection);
+    function("getLayerStack", &getLayerStack);
+    // Click to inspect, run in a Worker of its own (see inspect.hpp).
+    function("inspectLoad", &inspectLoad);
+    function("inspectAt", &inspectAt);
+    function("inspectRestore", &inspectRestore);
+    function("inspectRelease", &inspectRelease);
     function("getMarkerStats", &getMarkerStats);
     function("setPorts", &setPorts);
     function("setShowPorts", &setShowPorts);
