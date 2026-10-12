@@ -33,4 +33,11 @@ constexpr float kTextCapHeightPx = 11.0f;
 void append_text_vertices(const std::string& text, float world_x, float world_y, uint8_t anchor,
                           std::vector<float>& out);
 
+// The box a label of `length` characters is drawn in, as pixel offsets from
+// its origin with y up: box[0..3] = left, bottom, right, top. It spans the
+// glyph grid's full height, descenders to ascenders, and the drawn width
+// text_width_px gives. Click-to-inspect tests clicks against this (see
+// inspect.cpp), so a label is picked where it is drawn.
+void text_box_px(size_t length, uint8_t anchor, float box[4]);
+
 }  // namespace stroke_font

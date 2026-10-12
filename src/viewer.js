@@ -580,8 +580,13 @@ export function createViewer(mountTarget) {
     // Draw the layout's own labels (GDSII/OASIS TEXT elements) at a fixed
     // on-screen size, in each label's layer color -- off by default because a
     // full chip's worth of text buries the geometry it sits on.
+    // A label is only selectable while it is drawn, so turning text off lets
+    // go of a selected one.
     const textController = displayFolder.add(actions, "showText").name("Text")
-        .onChange((show) => setDisplay("showText", show));
+        .onChange((show) => {
+            if (!show && selection?.kind === "label") clearShapeSelection();
+            return setDisplay("showText", show);
+        });
     textController.domElement.title = "Show layout text labels, drawn in their layer's color";
     // The ports gdsfactory / kfactory wrote into the file (see kfactory_ports.hpp):
     // a bar across each port's width, an arrow the way it faces, and its name
@@ -2771,7 +2776,9 @@ export function createViewer(mountTarget) {
     // In Pan mode a click (a press and release that did not drag) selects the
     // shape under the pointer whose outline is nearest it, outlines it, and
     // describes it in the card. Clicking the same spot again steps to the next
-    // shape there, and empty space or Escape clears it.
+    // shape there, and empty space or Escape clears it. While the Text toggle
+    // is on, the layout's text labels are picked the same way, where their
+    // text is drawn.
     //
     // The renderer cannot say what is under a point: its geometry is flattened
     // into per-layer GPU buffers with no record of which cell drew what. So
@@ -2837,10 +2844,10 @@ export function createViewer(mountTarget) {
                         reject(new Error(message.error || "the layout could not be indexed"));
                         return;
                     }
-                    resolve((x, y, tolerance, ranks) => new Promise((done) => {
+                    resolve((x, y, tolerance, ranks, labelPx) => new Promise((done) => {
                         const id = nextId++;
                         pending.set(id, done);
-                        inspector.worker.postMessage({ type: "inspectAt", id, x, y, tolerance, ranks,
+                        inspector.worker.postMessage({ type: "inspectAt", id, x, y, tolerance, ranks, labelPx,
                                                        limit: MAX_PICK_HITS });
                     }));
                 } else if (message.type === "inspectHits") {
@@ -2857,11 +2864,11 @@ export function createViewer(mountTarget) {
                     return;
                 }
                 trace("[GDS] inspect index for slot", slot.id, "built:", message.polygons, "polygons,",
-                      message.placements, "placements");
+                      message.placements, "placements,", message.labels, "labels");
                 inspector.grid = message.grid;
                 const snapshot = message.snapshot;
-                const transfer = ["roots", "counts", "xy", "starts", "tagIndex", "tags", "placements", "reps", "boxes"]
-                    .map((name) => snapshot[name].buffer);
+                const transfer = ["roots", "counts", "xy", "starts", "tagIndex", "tags", "placements", "labels",
+                                  "text", "reps", "boxes"].map((name) => snapshot[name].buffer);
                 try {
                     start(answer, reject).postMessage({ type: "inspectRestore", snapshot, debug: traceToConsole },
                                                       transfer);
@@ -2901,14 +2908,16 @@ export function createViewer(mountTarget) {
 
     // Every shape under a world point across the loaded layouts, the one
     // whose outline is nearest the point first (see Index::query in
-    // inspect.cpp for why), then the smaller, then the renderer's draw order:
-    // later layers are drawn over earlier ones.
-    // Layers that are not drawn -- hidden, or in a layout crossfaded fully
-    // out -- are skipped.
+    // inspect.cpp for why), then a label before a shape, then the smaller,
+    // then the renderer's draw order: later layers are drawn over earlier
+    // ones. Layers that are not drawn -- hidden, or in a layout crossfaded
+    // fully out -- are skipped, and labels are only looked for while the
+    // Text toggle draws them, at the zoom they are drawn at.
     async function shapesAt(Module, x, y) {
         const stack = Module.getLayerStack();
         const zoom = Module.getCamera().zoom;
         const tolerance = PICK_TOLERANCE_PX / zoom;
+        const labelPx = actions.showText ? 1 / zoom : 0;
         const asks = slots.filter((slot) => slot.loaded && slot.source).map(async (slot) => {
             const ranks = [];
             stack.forEach((entry, rank) => {
@@ -2916,7 +2925,7 @@ export function createViewer(mountTarget) {
             });
             if (ranks.length === 0) return [];
             const query = await inspectorFor(slot);
-            const answer = await query(x, y, tolerance, ranks);
+            const answer = await query(x, y, tolerance, ranks, labelPx);
             const byTag = new Map();
             for (let i = 0; i < ranks.length; i += 2) byTag.set(ranks[i], ranks[i + 1]);
             return answer.hits.map((hit) => ({
@@ -2924,7 +2933,9 @@ export function createViewer(mountTarget) {
             }));
         });
         const hits = (await Promise.all(asks)).flat();
-        hits.sort((a, b) => (a.edgeDistance - b.edgeDistance) || (a.area - b.area) || (b.rank - a.rank));
+        const isLabel = (hit) => (hit.kind === "label" ? 1 : 0);
+        hits.sort((a, b) => (a.edgeDistance - b.edgeDistance) || (isLabel(b) - isLabel(a)) ||
+                            (a.area - b.area) || (b.rank - a.rank));
         return hits;
     }
 
@@ -2951,8 +2962,51 @@ export function createViewer(mountTarget) {
         return parts.length > 0 ? parts.join(" ") : null;
     }
 
+    // The box a selected label's text is drawn in, as pixel offsets from its
+    // anchor (y up), for the outline and the card's placement. Kept off the
+    // ShapeInfo, which describes the label rather than how it is drawn.
+    const labelBoxes = new WeakMap();
+
     // A query hit as the ShapeInfo the card, getSelection and gds-select share.
     function describeHit(Module, hit, index, count) {
+        const layerRow = Module.getLayers().find((l) =>
+            l.source === hit.slot.index && l.layer === hit.layer && l.datatype === hit.datatype);
+        const path = Array.from(hit.path, (step) => ({ cell: step.cell, placement: placementLabel(step) }));
+        const common = {
+            slot: hit.slot.id,
+            layer: hit.layer,
+            datatype: hit.datatype,
+            layerName: layerRow ? layerRow.name : "",
+            color: layerRow ? layerRow.frameColor : "",
+            fillColor: layerRow ? layerRow.fillColor : "",
+            cell: path[path.length - 1].cell,
+            path,
+            pathText: path.map((step) => step.placement ? `${step.cell} ${step.placement}` : step.cell).join(" > ")
+        };
+        const unit = hit.slot.inspector ? hit.slot.inspector.grid : 0.001;
+        if (hit.kind === "label") {
+            const x = hit.points[0], y = hit.points[1];
+            const info = {
+                kind: "label",
+                ...common,
+                text: hit.text,
+                anchor: { x, y },
+                rotation: hit.rotation,
+                magnification: hit.magnification,
+                bbox: { minX: x, minY: y, maxX: x, maxY: y },
+                width: 0,
+                height: 0,
+                area: 0,
+                perimeter: 0,
+                vertexCount: 1,
+                points: [x, y],
+                index,
+                count,
+                unit
+            };
+            labelBoxes.set(info, Array.from(hit.box));
+            return info;
+        }
         const pts = Array.from(hit.points);
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
         let perimeter = 0;
@@ -2966,19 +3020,9 @@ export function createViewer(mountTarget) {
             const m = k + 1 === n ? 0 : k + 1;
             perimeter += Math.hypot(pts[2 * m] - x, pts[2 * m + 1] - y);
         }
-        const layerRow = Module.getLayers().find((l) =>
-            l.source === hit.slot.index && l.layer === hit.layer && l.datatype === hit.datatype);
-        const path = Array.from(hit.path, (step) => ({ cell: step.cell, placement: placementLabel(step) }));
         return {
-            slot: hit.slot.id,
-            layer: hit.layer,
-            datatype: hit.datatype,
-            layerName: layerRow ? layerRow.name : "",
-            color: layerRow ? layerRow.frameColor : "",
-            fillColor: layerRow ? layerRow.fillColor : "",
-            cell: path[path.length - 1].cell,
-            path,
-            pathText: path.map((step) => step.placement ? `${step.cell} ${step.placement}` : step.cell).join(" > "),
+            kind: "polygon",
+            ...common,
             bbox: { minX, minY, maxX, maxY },
             width: maxX - minX,
             height: maxY - minY,
@@ -2988,7 +3032,7 @@ export function createViewer(mountTarget) {
             points: pts,
             index,
             count,
-            unit: hit.slot.inspector ? hit.slot.inspector.grid : 0.001
+            unit
         };
     }
 
@@ -3027,8 +3071,13 @@ export function createViewer(mountTarget) {
         selection = info;
         modulePromise.then((Module) => {
             if (selection !== info) return;
-            if (info) Module.setSelection(info.points, slotOf(info.slot).index);
-            else Module.clearSelection();
+            if (!info) {
+                Module.clearSelection();
+            } else if (info.kind === "label") {
+                Module.setLabelSelection(info.anchor.x, info.anchor.y, labelBoxes.get(info), slotOf(info.slot).index);
+            } else {
+                Module.setSelection(info.points, slotOf(info.slot).index);
+            }
         });
         renderInspectCard();
         if (changed) hostElement.dispatchEvent(new CustomEvent("gds-select", { detail: info }));
@@ -3046,14 +3095,18 @@ export function createViewer(mountTarget) {
         const d = unitDecimals(info.unit);
         const um = (v) => fmtUm(v, d);
         const name = info.layerName ? ` ${info.layerName}` : "";
-        const lines = [
-            ["Layer", `${info.layer}/${info.datatype}${name}`],
-            ["Cell", info.cell],
-            ["Path", info.pathText]
-        ];
+        const lines = [["Layer", `${info.layer}/${info.datatype}${name}`]];
+        if (info.kind === "label") lines.push(["Text", info.text]);
+        lines.push(["Cell", info.cell], ["Path", info.pathText]);
         if (comparing()) {
             const slot = slotOf(info.slot);
             lines.push(["Layout", `${slot.id.toUpperCase()}${slot.name ? ` (${slot.name})` : ""}`]);
+        }
+        if (info.kind === "label") {
+            lines.push(["Anchor", `(${um(info.anchor.x)}, ${um(info.anchor.y)}) µm`]);
+            if (info.rotation !== 0) lines.push(["Rotation", `${Number(info.rotation.toFixed(6))}°`]);
+            if (info.magnification !== 1) lines.push(["Magnification", String(Number(info.magnification.toFixed(6)))]);
+            return lines;
         }
         lines.push(
             ["Bounding box", `(${um(info.bbox.minX)}, ${um(info.bbox.minY)})–(${um(info.bbox.maxX)}, ` +
@@ -3090,6 +3143,8 @@ export function createViewer(mountTarget) {
                 td.append(chip, " ", slotOf(info.slot).name || "");
             } else {
                 td.textContent = value;
+                // A label's text as it is: its spaces kept, wrapped when long.
+                if (label === "Text") td.className = "inspect-text";
             }
             tr.append(th, td);
             body.append(tr);
@@ -3098,8 +3153,11 @@ export function createViewer(mountTarget) {
         const owner = slotOf(info.slot);
         els.inspectTop.disabled = owner.root === info.cell ||
             (owner.root === null && owner.topCells.length === 1 && owner.topCells[0] === info.cell);
+        const isLabel = info.kind === "label";
+        els.inspectTop.title = `Draw the cell that holds this ${isLabel ? "label" : "shape"} as the top cell`;
+        els.inspectFrame.title = isLabel ? "Center the view on this label" : "Zoom the view to this shape";
         els.inspectStatus.textContent = info.count > 1
-            ? `Shape ${info.index + 1} of ${info.count} here. Click again for the next one.`
+            ? `${isLabel ? "Label" : "Shape"} ${info.index + 1} of ${info.count} here. Click again for the next one.`
             : "";
         placeInspectCard(info);
     }
@@ -3124,6 +3182,9 @@ export function createViewer(mountTarget) {
             const [x0, y1] = toScreen(info.bbox.minX, info.bbox.minY);
             const [x1, y0] = toScreen(info.bbox.maxX, info.bbox.maxY);
             shape = { x0, y0, x1, y1 };
+            // A label covers its drawn text, whose size is in pixels.
+            const box = labelBoxes.get(info);
+            if (box) shape = { x0: x0 + box[0], y0: y0 - box[3], x1: x1 + box[2], y1: y1 - box[1] };
         }
         const overlap = ([x, y]) => {
             if (!shape) return 0;
@@ -3148,12 +3209,13 @@ export function createViewer(mountTarget) {
     function copySelection() {
         if (!selection) return;
         const text = inspectLines(selection).map(([label, value]) => `${label}: ${value}`).join("\n");
+        const what = selection.kind === "label" ? "label" : "shape";
         navigator.clipboard.writeText(text).then(
-            () => showCopyToast("Copied the shape's details"),
+            () => showCopyToast(`Copied the ${what}'s details`),
             (err) => {
                 // Blocked in some sandboxed webviews, as for Copy coordinate.
                 // The card's text can still be selected and copied by hand.
-                fail("[GDS] clipboard write failed for the shape details:", err);
+                fail(`[GDS] clipboard write failed for the ${what} details:`, err);
                 showCopyToast("Couldn't copy: select the card's text instead");
             }
         );
@@ -3165,6 +3227,13 @@ export function createViewer(mountTarget) {
         els.inspectCopy?.addEventListener("click", copySelection);
         els.inspectFrame?.addEventListener("click", () => {
             if (!selection) return;
+            // A label has no size in the layout to zoom to, so it is centered
+            // at the current zoom, as a label search's hit is.
+            if (selection.kind === "label") {
+                const { x, y } = selection.anchor;
+                modulePromise.then((Module) => Module.goToPoint(x, y));
+                return;
+            }
             const { minX, minY, maxX, maxY } = selection.bbox;
             modulePromise.then((Module) => Module.zoomToBox(minX, minY, maxX, maxY));
         });

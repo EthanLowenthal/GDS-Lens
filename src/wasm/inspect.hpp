@@ -1,5 +1,5 @@
-// Click-to-inspect: which shapes lie under a point, and where each one came
-// from in the cell hierarchy.
+// Click-to-inspect: which shapes and text labels lie under a point, and where
+// each one came from in the cell hierarchy.
 //
 // The renderer cannot answer that from what it keeps. Its static geometry is
 // flattened into one world-space buffer per layer with no record of which cell
@@ -14,12 +14,16 @@
 // What that costs is the hierarchy's own size rather than the flattened one:
 // 8 bytes per vertex of each cell's own geometry (int32 database units), 8
 // bytes per polygon, and 48 bytes per placement record, where an array
-// reference is one record however many copies it makes. Each cell's spatial
-// grid is built on its first query, about 4 to 8 bytes per item. A cell placed
-// a million times costs its geometry once, which is the case flattening is
-// worst at. Every cell's vertices, polygons and placements sit in one shared
-// array each, so the whole index moves between Workers as a few buffers (see
-// Snapshot).
+// reference is one record however many copies it makes. A text label costs
+// 32 bytes plus its text. Each cell's spatial grid is built on its first
+// query, about 4 to 8 bytes per item. A cell placed a million times costs its
+// geometry once, which is the case flattening is worst at. Every cell's
+// vertices, polygons, placements and labels sit in one shared array each, so
+// the whole index moves between Workers as a few buffers (see Snapshot).
+//
+// Labels are drawn upright at a fixed size on screen (see stroke_font.hpp),
+// whatever the placements above them do, so a label is hit where its drawn
+// text box is at the zoom the query names, not at any size in the layout.
 //
 // No GL, no DOM and no embind here: renderer.cpp wraps this for the module's
 // exports, and the tests drive it headlessly in Node.
@@ -62,6 +66,9 @@ struct PathStep {
 
 struct Hit {
     gdstk::Tag tag = 0;
+    // A text label rather than a polygon. Then `points` is its anchor alone,
+    // `area` is 0, and the label fields below are set.
+    bool label = false;
     std::vector<PathStep> path;
     // The owning cell's frame mapped into world space: what the walk
     // composed on its way down.
@@ -76,6 +83,18 @@ struct Hit {
     // Where the layer sits in the draw order the caller passed (higher is
     // drawn later, so on top); -1 when it passed none for this tag.
     double rank = -1.0;
+
+    // For a label: its text, the gdstk Anchor it is drawn from, and the box
+    // it is drawn in as pixel offsets from the anchor (stroke_font's
+    // text_box_px). `edge_distance` is then the distance to that box at the
+    // queried zoom, 0 inside it. The rotation (degrees counterclockwise) and
+    // magnification are the label's own composed with the placements above
+    // it; the label is drawn upright and unscaled whatever they are.
+    std::string text;
+    uint8_t anchor = 5;
+    float box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    double rotation = 0.0;
+    double magnification = 1.0;
 };
 
 // One reference, without the per-copy expansion an array would need.
@@ -92,6 +111,20 @@ struct Placement {
 };
 static_assert(sizeof(Placement) == 48, "Placement crosses between Workers as raw bytes");
 
+// One text label in its cell's frame. Its text is `length` bytes at `text` in
+// the index's shared text.
+struct LabelRecord {
+    int32_t x, y;
+    uint32_t text;
+    uint32_t length;
+    uint32_t tag;
+    float rotation;
+    float magnification;
+    uint8_t anchor;
+    uint8_t unused[3];
+};
+static_assert(sizeof(LabelRecord) == 32, "LabelRecord crosses between Workers as raw bytes");
+
 constexpr uint32_t kNoRep = 0xFFFFFFFFu;
 
 // A built index as a handful of flat arrays, which is how it moves from the
@@ -103,18 +136,20 @@ struct Snapshot {
     std::string root;
     std::vector<std::string> names;
     std::vector<uint32_t> roots;
-    // Per node: vertices, polygons, placements, repetitions.
+    // Per node: vertices, polygons, placements, repetitions, labels.
     std::vector<double> counts;
     std::vector<int32_t> xy;
     std::vector<uint32_t> starts;
     std::vector<uint32_t> tag_index;
     std::vector<double> tags;
     std::vector<Placement> placements;
+    std::vector<LabelRecord> labels;
+    std::string text;
     // Per repetition: type, columns, rows, v1.x, v1.y, v2.x, v2.y (spacing in
     // v1 for a rectangular one), n, then n listed offsets (pairs for Explicit,
     // single coordinates for ExplicitX/Y).
     std::vector<double> reps;
-    // 8 per node: own box, then subtree box.
+    // 10 per node: own box, subtree box, then own and subtree label reach.
     std::vector<double> boxes;
 };
 
@@ -141,10 +176,12 @@ class Index {
     // The shapes on the given layers within `tolerance` of (x, y), all in world
     // µm. `ranks` maps each tag to its position in the draw order; shapes on a
     // tag absent from it are skipped, which is how hidden layers are left out.
-    // Sorted topmost first: by rank, then smallest area first within a layer.
-    // At most `limit` are returned with their geometry.
+    // With `label_px` (world µm per screen pixel) above 0, labels are found
+    // too: those whose drawn text box at that zoom is within `tolerance` of
+    // the point. Sorted nearest edge first (see the definition), and at most
+    // `limit` are returned with their geometry.
     QueryResult query(double x, double y, double tolerance, const std::unordered_map<gdstk::Tag, double>& ranks,
-                      size_t limit);
+                      size_t limit, double label_px = 0.0);
 
     // Moves the index out into a Snapshot, leaving this one empty.
     Snapshot take();
@@ -158,6 +195,7 @@ class Index {
     uint64_t vertex_count() const;
     uint64_t polygon_count() const;
     uint64_t placement_count() const;
+    uint64_t label_count() const;
 
    private:
     struct Box {
@@ -180,7 +218,8 @@ class Index {
     };
 
     // Uniform grid over a cell's items in its own frame: polygons are items
-    // [0, polygon count), placements follow. Items too big for a few bins sit
+    // [0, polygon count), placements follow, then labels (by their anchors).
+    // Items too big for a few bins sit
     // in `big` and are checked on every query.
     struct Grid {
         double x0 = 0.0, y0 = 0.0, bin_w = 1.0, bin_h = 1.0;
@@ -199,6 +238,14 @@ class Index {
         // first vertex is xy_begin + starts_[poly_begin + i].
         size_t poly_begin = 0, polygons = 0;
         size_t place_begin = 0, placements = 0;
+        size_t label_begin = 0, labels = 0;
+        // How far, in screen pixels, the drawn text box of any of its own
+        // labels reaches from the label's anchor, and the same over the cells
+        // it places; 0 with none. A query widens its search by this much at
+        // its zoom, since a label drawn from an anchor outside the cell's box
+        // can still cover the point.
+        float reach = 0.0f;
+        float subtree_reach = 0.0f;
         std::vector<gdstk::Repetition> reps;
         // How many of this cell's references place each child.
         std::unordered_map<uint32_t, uint32_t> sibling_counts;
@@ -210,6 +257,9 @@ class Index {
 
     struct Walk {
         double x, y, tolerance;
+        // World µm per screen pixel, 0 when labels are not wanted, and the
+        // tolerance in pixels.
+        double label_px = 0.0, tolerance_px = 0.0;
         const std::unordered_map<gdstk::Tag, double>* ranks;
         std::vector<PathStep> path;
         std::vector<Hit> hits;
@@ -220,6 +270,7 @@ class Index {
     uint32_t node_for(gdstk::Cell* cell, std::vector<gdstk::Cell*>& pending);
     void convert(gdstk::Cell* cell, uint32_t index, std::vector<gdstk::Cell*>& pending);
     void append_polygon(Node& node, const gdstk::Polygon* poly, double dx, double dy);
+    void append_label(Node& node, const gdstk::Label* label, double dx, double dy);
     // Polygon i of a node, as a range of vertex indices into xy_.
     size_t poly_first(const Node& node, size_t i) const { return node.xy_begin + starts_[node.poly_begin + i]; }
     size_t poly_end(const Node& node, size_t i) const {
@@ -231,7 +282,11 @@ class Index {
     void build_grid(Node& node);
     void visit(uint32_t index, const Xform& to_world, Walk& walk);
     void visit_placement(Node& node, const Placement& p, const Xform& to_world, double lx, double ly,
-                         double ltol, Walk& walk);
+                         double ltol, double scale, Walk& walk);
+    // How far around a point (x, y in its frame) a node's subtree has to be
+    // searched, in that frame: the tolerance, or its labels' reach.
+    double reach_of(const Node& node, double ltol, double scale, const Walk& walk) const;
+    void label_hit(const Node& node, uint32_t i, const Xform& to_world, Walk& walk) const;
     void descend(Node& parent, const Placement& p, const Xform& to_world, double ox, double oy, int64_t copy,
                  int64_t copies, int64_t column, int64_t row, Walk& walk);
     bool polygon_hit(const Node& node, uint32_t i, double x, double y, double tol) const;
@@ -241,6 +296,8 @@ class Index {
     std::vector<uint32_t> starts_;
     std::vector<uint32_t> tag_index_;
     std::vector<Placement> placements_;
+    std::vector<LabelRecord> labels_;
+    std::string text_;
     std::vector<uint32_t> roots_;
     std::unordered_map<gdstk::Cell*, uint32_t> index_of_;
     std::vector<gdstk::Tag> tags_;

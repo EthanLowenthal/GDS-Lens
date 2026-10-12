@@ -110,7 +110,8 @@ function moduleArgs() {
 // the viewer terminates it because the layout it describes was replaced.
 let inspectModule = null;
 
-const SNAPSHOT_ARRAYS = ["roots", "counts", "xy", "starts", "tagIndex", "tags", "placements", "reps", "boxes"];
+const SNAPSHOT_ARRAYS = ["roots", "counts", "xy", "starts", "tagIndex", "tags", "placements", "labels", "text",
+    "reps", "boxes"];
 
 function startInspect(message) {
     debugToConsole = !!message.debug;
@@ -120,7 +121,7 @@ function startInspect(message) {
         if (message.root) options.root = message.root;
         const result = Module.inspectLoad("/input.layout", options);
         console.log("[GDS worker] inspect index:", result.ok ? `${result.polygons} polygons, ` +
-                    `${result.placements} placements` : result.error);
+                    `${result.placements} placements, ${result.labels} labels` : result.error);
         const transferList = result.ok ? SNAPSHOT_ARRAYS.map((name) => result.snapshot[name].buffer) : [];
         postMessage({ type: "inspectSnapshot", ...result }, transferList);
     }).catch((err) => {
@@ -146,7 +147,8 @@ function answerInspect(message) {
         postMessage({ type: "inspectHits", id: message.id, hits: [], total: 0, truncated: false });
         return;
     }
-    const result = inspectModule.inspectAt(message.x, message.y, message.tolerance, message.ranks, message.limit);
+    const result = inspectModule.inspectAt(message.x, message.y, message.tolerance, message.ranks, message.limit,
+                                           message.labelPx || 0);
     const transferList = result.hits.map((hit) => hit.points.buffer);
     postMessage({ type: "inspectHits", id: message.id, hits: result.hits, total: result.total,
                   truncated: result.truncated }, transferList);

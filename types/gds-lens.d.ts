@@ -140,11 +140,19 @@ export interface ShapePathStep {
 }
 
 /**
- * A shape picked by a click on the canvas or by `selectAt`. Coordinates and
- * lengths are world µm, areas µm². Paths and boxes are given as the polygon
- * they are drawn as.
+ * A shape picked by a click on the canvas or by `selectAt`: a polygon, or,
+ * while the Text display toggle draws them, a text label (a GDSII or OASIS
+ * TEXT element). `kind` tells them apart. Coordinates and lengths are world
+ * µm, areas µm². Paths and boxes are given as the polygon they are drawn as.
+ *
+ * A label is drawn upright at a fixed size on screen, so it has no size in
+ * the layout. For a label, `bbox` is a box with no size at its anchor,
+ * `width`, `height`, `area` and `perimeter` are `0`, `vertexCount` is `1`,
+ * and `points` is the anchor as one x, y pair.
  */
 export interface ShapeInfo {
+    /** `"polygon"` for a shape, `"label"` for a text label. */
+    kind: "polygon" | "label";
     /** Which loaded layout the shape is in. */
     slot: Slot;
     layer: number;
@@ -166,13 +174,28 @@ export interface ShapeInfo {
     area: number;
     perimeter: number;
     vertexCount: number;
-    /** The polygon's vertices in world space, x and y interleaved. */
+    /** The polygon's vertices in world space, x and y interleaved. For a label, its anchor. */
     points: number[];
-    /** Which of the shapes under the point this is (0 has the outline nearest the point), and how many there are. */
+    /**
+     * Which of the shapes and labels under the point this is (0 is the
+     * nearest), and how many there are.
+     */
     index: number;
     count: number;
     /** The layout's database unit in µm, the step its coordinates sit on. */
     unit: number;
+    /** A label's text, exactly as the layout stores it. Present when `kind` is `"label"`. */
+    text?: string;
+    /** The point a label is placed at, in world µm. Present when `kind` is `"label"`. */
+    anchor?: { x: number; y: number };
+    /**
+     * A label's rotation in degrees counterclockwise and its magnification:
+     * its own values combined with the placements above it, `0` and `1` when
+     * neither turns or scales it. The viewer draws the text upright and
+     * unscaled either way. Present when `kind` is `"label"`.
+     */
+    rotation?: number;
+    magnification?: number;
 }
 
 /** Options for `load()`. */
@@ -289,14 +312,16 @@ export interface ViewerSurface {
      */
     refreshShortcuts(): void;
 
-    /** The selected shape, or `null`. */
+    /** The selected shape or label, or `null`. */
     getSelection(): ShapeInfo | null;
     /**
      * Selects the shape under a world point (µm), as a click there in Pan mode
-     * does, and resolves to it. `index` picks the shape that many after the
-     * first in nearest-outline order (wrapping), which is what clicking the same spot again steps
-     * through. Resolves to `null`, and clears the selection, when there is
-     * nothing under the point on a drawn layer.
+     * does, and resolves to it. While the Text toggle is on, a label whose
+     * drawn text covers the point is picked too. `index` picks the one that
+     * many after the first in nearest-outline order (wrapping), which is what
+     * clicking the same spot again steps through. Resolves to `null`, and
+     * clears the selection, when there is nothing under the point on a drawn
+     * layer.
      *
      * The first pick in a layout reads the layout's bytes again to index its
      * cells, which on a large file takes about as long as parsing it once.

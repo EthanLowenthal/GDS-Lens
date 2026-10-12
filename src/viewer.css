@@ -203,6 +203,8 @@
                            white-space: nowrap; vertical-align: baseline; }
         #inspectTable td { padding: 2px 8px 2px 0; width: 100%; word-break: break-word; vertical-align: baseline; }
         #inspectTable .slot-chip { margin-left: 0; }
+        /* A label's text exactly as the layout has it, runs of spaces included. */
+        #inspectTable td.inspect-text { white-space: pre-wrap; }
         #inspectStatus { padding: 0 8px 4px; color: var(--fg-faint); }
         #inspectStatus:empty { display: none; }
         #inspectActions { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); }

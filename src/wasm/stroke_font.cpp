@@ -165,28 +165,23 @@ const std::vector<std::vector<float>>& glyph_segments() {
     return table;
 }
 
-// Width of `text` as drawn, in pixels: full advances between characters plus
+// Width of `length` characters as drawn, in pixels: full advances between characters plus
 // one glyph's drawn width for the last one (the trailing side bearing isn't
 // part of the visible box, and including it would bias every centered label
 // half a space to the left).
-float text_width_px(const std::string& text) {
-    if (text.empty()) return 0.0f;
-    return ((float)(text.size() - 1) * kGlyphAdvanceUnits + kGlyphWidthUnits) * kTextUnitPx;
+float text_width_px(size_t length) {
+    if (length == 0) return 0.0f;
+    return ((float)(length - 1) * kGlyphAdvanceUnits + kGlyphWidthUnits) * kTextUnitPx;
 }
 
-}  // namespace
-
-void append_text_vertices(const std::string& text, float world_x, float world_y, uint8_t anchor,
-                          std::vector<float>& out) {
-    const std::vector<std::vector<float>>& glyphs = glyph_segments();
-
-    float origin_x = 0.0f;
+// Where the glyph grid's (0, 0) sits relative to the label's origin, in
+// pixels, for the anchor's horizontal and vertical edges.
+void grid_origin_px(size_t length, uint8_t anchor, float& origin_x, float& origin_y) {
     switch (anchor & 3) {
-        case 0: origin_x = 0.0f; break;                          // W (left)
-        case 1: origin_x = -text_width_px(text) * 0.5f; break;    // center
-        default: origin_x = -text_width_px(text); break;          // E (right)
+        case 0: origin_x = 0.0f; break;                            // W (left)
+        case 1: origin_x = -text_width_px(length) * 0.5f; break;    // center
+        default: origin_x = -text_width_px(length); break;          // E (right)
     }
-    float origin_y = 0.0f;
     switch ((anchor >> 2) & 3) {
         case 0: origin_y = -kTextCapHeightPx; break;         // N (top edge at origin)
         case 1: origin_y = -kTextCapHeightPx * 0.5f; break;  // middle
@@ -195,6 +190,16 @@ void append_text_vertices(const std::string& text, float world_x, float world_y,
     // Grid y is measured from y=0, not the baseline -- shift so that the
     // baseline lands on origin_y.
     origin_y -= kGlyphBaselineUnits * kTextUnitPx;
+}
+
+}  // namespace
+
+void append_text_vertices(const std::string& text, float world_x, float world_y, uint8_t anchor,
+                          std::vector<float>& out) {
+    const std::vector<std::vector<float>>& glyphs = glyph_segments();
+
+    float origin_x = 0.0f, origin_y = 0.0f;
+    grid_origin_px(text.size(), anchor, origin_x, origin_y);
 
     for (size_t i = 0; i < text.size(); i++) {
         unsigned char c = (unsigned char)text[i];
@@ -212,6 +217,16 @@ void append_text_vertices(const std::string& text, float world_x, float world_y,
             out.push_back(origin_y + segments[s + 3] * kTextUnitPx);
         }
     }
+}
+
+void text_box_px(size_t length, uint8_t anchor, float box[4]) {
+    float origin_x = 0.0f, origin_y = 0.0f;
+    grid_origin_px(length, anchor, origin_x, origin_y);
+    // The grid runs 0..9 units tall: descenders at 0, ascenders at 9.
+    box[0] = origin_x;
+    box[1] = origin_y;
+    box[2] = origin_x + text_width_px(length);
+    box[3] = origin_y + (kGlyphBaselineUnits + kGlyphCapUnits) * kTextUnitPx;
 }
 
 }  // namespace stroke_font

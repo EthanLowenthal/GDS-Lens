@@ -286,3 +286,158 @@ test("comparing, the card says which layout the shape is from", { skip }, async 
         await waitForNoCard(page);
     });
 });
+
+// ---- Labels ----
+// Text labels are picked only while the Display folder's Text toggle draws
+// them, and where their text is drawn: upright, at a fixed size on screen,
+// from their anchor. "PAD  A" is drawn from its bottom left at (25, 40), over
+// the 3/0 box.
+
+// Flips the Display folder's Text checkbox to `on`.
+const setText = (page, on) => page.evaluate((wanted) => {
+    const root = document.querySelector("gds-lens").shadowRoot;
+    const row = [...root.querySelectorAll(".lil-controller")]
+        .find((r) => r.querySelector(".lil-name")?.textContent === "Text");
+    const box = row.querySelector("input[type=checkbox]");
+    if (box.checked !== wanted) box.click();
+}, on);
+
+// Clicks `dx` pixels right of and `dy` pixels above a world point.
+async function clickNear(page, x, y, dx, dy) {
+    const [px, py] = await toPage(page, x, y);
+    await page.mouse.click(px + dx, py - dy);
+}
+
+const waitForLabelCard = (page, text) => page.waitForFunction((wanted) => {
+    const root = document.querySelector("gds-lens").shadowRoot;
+    if (root.getElementById("inspectCard").classList.contains("hidden")) return false;
+    const row = [...root.querySelectorAll("#inspectTable tr")]
+        .find((tr) => tr.querySelector("th").textContent === "Text");
+    return row && row.querySelector("td").textContent === wanted;
+}, text, { timeout: 30_000 });
+
+test("with Text off, clicking a label's text selects the shape under it", { skip }, async () => {
+    await withViewer(async (page) => {
+        await clickNear(page, 25, 40, 10, 5);
+        await waitForCard(page, "3/0", "2500 µm²");
+        assert.strictEqual((await selected(page)).count, 1);
+    });
+});
+
+test("with Text on, clicking a label's text selects the label", { skip }, async () => {
+    await withViewer(async (page) => {
+        await setText(page, true);
+        await clickNear(page, 25, 40, 10, 5);
+        await waitForLabelCard(page, "PAD  A");
+        const shown = await card(page);
+        assert.strictEqual(shown.title, "6/0");
+        // The text exactly, both spaces kept, and no polygon rows.
+        assert.deepStrictEqual(shown.rows, {
+            Text: "PAD  A",
+            Cell: "TOP",
+            Path: "TOP",
+            Anchor: "(25, 40) µm"
+        });
+        assert.match(shown.status, /Label 1 of 2 here/);
+        const info = await page.evaluate(() => document.querySelector("gds-lens").getSelection());
+        assert.strictEqual(info.kind, "label");
+        assert.strictEqual(info.text, "PAD  A");
+        assert.deepStrictEqual(info.anchor, { x: 25, y: 40 });
+        assert.deepStrictEqual([info.rotation, info.magnification], [0, 1]);
+        assert.deepStrictEqual([info.area, info.perimeter, info.vertexCount, info.width, info.height], [0, 0, 1, 0, 0]);
+        assert.deepStrictEqual(info.points, [25, 40]);
+        assert.deepStrictEqual(await page.evaluate(() => window.selectEvents), ["6/0"]);
+
+        // The same spot again steps to the shape under the text.
+        await clickNear(page, 25, 40, 10, 5);
+        await waitForCard(page, "3/0", "2500 µm²");
+        assert.match((await card(page)).status, /Shape 2 of 2 here/);
+        assert.strictEqual((await selected(page)).index, 1);
+
+        // A label's own rotation and magnification are shown when set.
+        await clickNear(page, 45, 5, 4, 0);
+        await waitForLabelCard(page, "ROT");
+        const rot = await card(page);
+        assert.strictEqual(rot.rows.Rotation, "30°");
+        assert.strictEqual(rot.rows.Magnification, "2");
+
+        // Turning text off lets go of a selected label.
+        await setText(page, false);
+        await waitForNoCard(page);
+        assert.strictEqual(await selected(page), null);
+    });
+});
+
+test("a label on a hidden layer is passed over", { skip }, async () => {
+    await withViewer(async (page) => {
+        await setText(page, true);
+        await page.evaluate(() => document.querySelector("gds-lens").setLayerVisible(6, 0, false));
+        await clickNear(page, 25, 40, 10, 5);
+        await waitForCard(page, "3/0", "2500 µm²");
+        assert.strictEqual((await selected(page)).count, 1);
+    });
+});
+
+test("a label's card copies, frames, and shows its cell as the top", { skip }, async () => {
+    await withViewer(async (page) => {
+        await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+        await setText(page, true);
+        await clickNear(page, 25, 40, 10, 5);
+        await waitForLabelCard(page, "PAD  A");
+        await page.locator("gds-lens #inspectCopy").click();
+        assert.strictEqual(await page.evaluate(() => navigator.clipboard.readText()), [
+            "Layer: 6/0",
+            "Text: PAD  A",
+            "Cell: TOP",
+            "Path: TOP",
+            "Anchor: (25, 40) µm"
+        ].join("\n"));
+
+        // The label in the array copy at column 2, row 1, clicked on its anchor.
+        await clickAt(page, 21, 105.5);
+        await waitForLabelCard(page, "ring");
+        assert.strictEqual((await card(page)).rows.Path, "TOP > ARR > RING [2,1]");
+        const zoom = (await page.evaluate(() => document.querySelector("gds-lens").getCamera())).zoom;
+        await page.locator("gds-lens #inspectFrame").click();
+        await page.waitForFunction(async () => {
+            const camera = await document.querySelector("gds-lens").getCamera();
+            return Math.abs(camera.panX - 21) < 0.01 && Math.abs(camera.panY - 105.5) < 0.01;
+        });
+        // Centered at the zoom it was picked at.
+        assert.strictEqual((await page.evaluate(() => document.querySelector("gds-lens").getCamera())).zoom, zoom);
+
+        await page.locator("gds-lens #inspectTop").click();
+        await page.waitForFunction(async () =>
+            (await document.querySelector("gds-lens").getTopCells()).current === "RING");
+        await waitForIdle(page);
+        assert.strictEqual(await card(page), null);
+        // RING drawn alone: its label is at its own (1, 0.5), with RING as the path.
+        await clickAt(page, 1, 0.5);
+        await waitForLabelCard(page, "ring");
+        assert.strictEqual((await card(page)).rows.Path, "RING");
+    });
+});
+
+test("comparing, a label's card says which layout it is from", { skip }, async () => {
+    await withViewer(async (page) => {
+        await page.evaluate(() => document.querySelector("gds-lens").load("inspect.gds", { slot: "b" }));
+        await waitForIdle(page);
+        await setText(page, true);
+        await clickNear(page, 25, 40, 10, 5);
+        await waitForLabelCard(page, "PAD  A");
+        assert.match((await card(page)).rows.Layout, /^B/);
+        // Both layouts' labels tie, and come before both layouts' 3/0 boxes.
+        const stack = await page.evaluate(async () => {
+            const element = document.querySelector("gds-lens");
+            const camera = await element.getCamera();
+            const x = 25 + 10 / camera.zoom, y = 40 + 5 / camera.zoom;
+            const out = [];
+            for (let i = 0; i < 4; i++) {
+                const info = await element.selectAt(x, y, i);
+                out.push(`${info.slot} ${info.kind}`);
+            }
+            return out;
+        });
+        assert.deepStrictEqual(stack, ["b label", "a label", "b polygon", "a polygon"]);
+    });
+});

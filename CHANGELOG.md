@@ -9,6 +9,25 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-12
+
+### Added
+
+- Click to inspect selects text labels. With the Display folder's Text toggle
+  on, a click on a label's drawn text, or on its anchor, selects the label and
+  outlines its text. Labels on hidden layers are skipped, and with Text off a
+  click on a label's text selects the shape under it. A label is ordered among
+  the shapes by its distance from the click to its drawn text, and comes first
+  when it ties with a shape, so clicking the same spot again steps through
+  shapes and labels together. The card shows the label's text with its spaces
+  kept, its layer, cell and path, its anchor in µm, its rotation and
+  magnification when they are not 0 and 1, and in a comparison which layout it
+  is from. **Frame** centers the view on the anchor. `ShapeInfo` gains `kind`
+  (`"polygon"` or `"label"`), and a label's carries `text`, `anchor`,
+  `rotation` and `magnification`. A label reports an area and perimeter of 0,
+  1 vertex, and its anchor as `bbox` and `points`, so use `kind` to tell a
+  label from a polygon.
+
 ## [1.6.0] - 2026-10-05
 
 ### Added
@@ -744,7 +763,8 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.3.0...v1.4.0

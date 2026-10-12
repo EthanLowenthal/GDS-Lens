@@ -71,6 +71,24 @@ if (picked) {
     const area: number = picked.area + picked.bbox.maxX + picked.points.length;
     void where;
     void area;
+    // Code written against 1.6.0, before labels, still compiles.
+    const a: number = picked.area;
+    const perimeter: number = picked.perimeter;
+    const vertices: number = picked.vertexCount;
+    void a;
+    void perimeter;
+    void vertices;
+    // A label's own fields, present when kind is "label".
+    if (picked.kind === "label") {
+        const text: string | undefined = picked.text;
+        const at: number | undefined = picked.anchor?.x;
+        const turn: number | undefined = picked.rotation;
+        const scale: number | undefined = picked.magnification;
+        void text;
+        void at;
+        void turn;
+        void scale;
+    }
 }
 await element.selectAt(15, 15, 1);
 const current: ShapeInfo | null = await element.getSelection();

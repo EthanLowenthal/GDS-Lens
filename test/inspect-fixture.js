@@ -3,14 +3,22 @@
 // hidden in a binary file. Database unit 1 nm, user unit 1 µm.
 //
 //   RING  a 2 x 1 µm box on 1/0 at its origin
+//         label "ring" on 6/0 at (1, 0.5), centered on it
 //   ARR   RING arrayed 3 columns x 2 rows, 10 µm and 5 µm apart
 //   TOP   a 50 x 50 µm box on 3/0 at the origin
 //         two boxes on 4/0 over it: (10,10)-(20,20) and (12,12)-(18,18)
-//         RING at (30, 30) rotated 90 degrees    -> (29,30)-(30,32)
-//         RING at (40, 40) mirrored about x      -> (40,39)-(42,40)
-//         RING at (60, 60) magnified 2x          -> (60,60)-(64,62)
+//         RING at (30, 30) rotated 90 degrees    -> (29,30)-(30,32), label at (29.5, 31)
+//         RING at (40, 40) mirrored about x      -> (40,39)-(42,40), label at (41, 39.5)
+//         RING at (60, 60) magnified 2x          -> (60,60)-(64,62), label at (62, 61)
 //         ARR at (0, 100)                        -> RING copies at (10i, 100 + 5j)
 //         a 1 µm wide path on 5/0 from (70, 0) to (80, 0)
+//         label "PAD  A" on 6/0 at (25, 40), from its bottom left (two spaces)
+//         label "EDGE" on 6/0 at (50, 20), from the middle of its left side,
+//           on the 3/0 box's right edge
+//         label "ROT" on 7/0 at (45, 5), rotated 30 degrees and magnified 2x
+//
+// Labels are drawn upright at a fixed size on screen (11 px cap height), so
+// how far their text reaches in µm depends on the zoom.
 //
 // RING is placed nine times in all, one more than the fewest the renderer will
 // instance, so pinning the instancing threshold to 0 draws it instanced.
@@ -20,6 +28,7 @@ const BGNSTR = 0x0502, STRNAME = 0x0606, ENDSTR = 0x0700, ENDLIB = 0x0400;
 const BOUNDARY = 0x0800, PATH = 0x0900, SREF = 0x0A00, AREF = 0x0B00;
 const LAYER = 0x0D02, DATATYPE = 0x0E02, WIDTH = 0x0F03, XY = 0x1003, ENDEL = 0x1100;
 const SNAME = 0x1206, COLROW = 0x1302, STRANS = 0x1A01, MAG = 0x1B05, ANGLE = 0x1C05;
+const TEXT = 0x0C00, TEXTTYPE = 0x1602, PRESENTATION = 0x1701, STRING = 0x1906;
 
 const NM = 1000;
 
@@ -78,6 +87,20 @@ export function sref(name, x, y, { angle = 0, mirror = false, mag = 1 } = {}) {
     return out;
 }
 
+// A TEXT element. `anchor` is the PRESENTATION bits: vertical edge (0 top,
+// 1 middle, 2 bottom) times 4 plus horizontal (0 left, 1 center, 2 right).
+export function text(layer, texttype, x, y, string, { anchor = 5, angle = 0, mag = 1 } = {}) {
+    const out = [record(TEXT), record(LAYER, int2(layer)), record(TEXTTYPE, int2(texttype)),
+                 record(PRESENTATION, int2(anchor))];
+    if (angle || mag !== 1) {
+        out.push(record(STRANS, int2(0)));
+        if (mag !== 1) out.push(record(MAG, real8(mag)));
+        if (angle) out.push(record(ANGLE, real8(angle)));
+    }
+    out.push(record(XY, int4(x, y)), record(STRING, ascii(string)), record(ENDEL));
+    return out;
+}
+
 export function structure(name, elements) {
     const stamp = int2(2026, 1, 1, 0, 0, 0, 2026, 1, 1, 0, 0, 0);
     return [record(BGNSTR, stamp), record(STRNAME, ascii(name)), ...elements.flat(), record(ENDSTR)];
@@ -103,7 +126,7 @@ export function library(structures) {
 
 export function inspectFixture() {
     return library([
-        structure("RING", [box(1, 0, 0, 0, 2, 1)]),
+        structure("RING", [box(1, 0, 0, 0, 2, 1), text(6, 0, 1, 0.5, "ring")]),
         structure("ARR", [aref("RING", 0, 0, 3, 2, 10, 5)]),
         structure("TOP", [
             box(3, 0, 0, 0, 50, 50),
@@ -114,7 +137,10 @@ export function inspectFixture() {
             sref("RING", 60, 60, { mag: 2 }),
             sref("ARR", 0, 100),
             [record(PATH), record(LAYER, int2(5)), record(DATATYPE, int2(0)),
-             record(WIDTH, int4(1)), record(XY, int4(70, 0, 80, 0)), record(ENDEL)]
+             record(WIDTH, int4(1)), record(XY, int4(70, 0, 80, 0)), record(ENDEL)],
+            text(6, 0, 25, 40, "PAD  A", { anchor: 8 }),
+            text(6, 0, 50, 20, "EDGE", { anchor: 4 }),
+            text(7, 0, 45, 5, "ROT", { angle: 30, mag: 2 })
         ])
     ]);
 }

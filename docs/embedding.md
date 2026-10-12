@@ -206,6 +206,40 @@ Clicking the same spot again, without zooming, selects the next shape under it,
 and wraps around after the last. Clicking empty space, `Esc`, or the card's ✕
 clears the selection. In Measure mode, clicks place rulers as before.
 
+#### Text labels
+
+While the Display folder's **Text** toggle is on, a click also selects the
+layout's text labels (GDSII and OASIS TEXT elements). A label is selectable
+only where it is drawn: Text is on, its layer is visible, and in a comparison
+its layout is not crossfaded fully out. With Text off, a click on a label's
+text selects the shape under it.
+
+Labels are drawn upright at a fixed size on screen, so a label is hit on the
+box its text is drawn in at the current zoom, and within 3 pixels of that box.
+A click on the label's anchor point also hits it. A label is ordered among the
+shapes by its distance from the click to that box, which is 0 for a click on
+its text. When a label and a shape are the same distance away, the label comes
+first. Clicking the same spot again steps through the shapes and labels there
+together. Turning Text off clears a selected label.
+
+The selected label's text box is outlined in the same dashed style. Its card
+shows:
+
+- the layer, by number and by its `.lyp` name, with its color;
+- the text, exactly as the layout stores it, spaces included;
+- the cell that holds the label and the path to it from the top cell drawn,
+  marked with the placement the click was in, as for a shape;
+- with two layouts loaded, which one it is from;
+- the anchor point in µm, with as many decimals as the file's database unit
+  has;
+- the rotation in degrees and the magnification, when they are not 0 and 1.
+  Both combine the label's own values with the placements above it. The viewer
+  draws the text upright and at the same size whatever they are.
+
+**Show as new top** shows the label's cell as the top, **Frame** centers the
+view on the anchor at the current zoom, as a label search does, and **Copy**
+puts the card's text on the clipboard.
+
 The selected shape is outlined in the same dashed style as a selected hierarchy
 row, and a card describes it:
 
@@ -236,8 +270,32 @@ element.addEventListener("gds-select", (event) => {
 A `ShapeInfo` carries the fields the card shows (`layer`, `datatype`,
 `layerName`, `cell`, `path`, `pathText`, `bbox`, `width`, `height`, `area`,
 `perimeter`, `vertexCount`, `slot`), the polygon's world-space vertices as
-`points`, and `index` and `count` for its place among the shapes under the
-point. See `types/gds-lens.d.ts`.
+`points`, and `index` and `count` for its place among the shapes and labels
+under the point. See `types/gds-lens.d.ts`.
+
+`kind` says what was picked. It is `"polygon"` for a shape and `"label"` for a
+text label. Every field a polygon has, a label has too, with the same type, so
+code that only knows about shapes keeps working. A label's `ShapeInfo` differs
+from a polygon's in these fields:
+
+| Field | For a label |
+|---|---|
+| `text` | The label's text, exactly as the layout stores it. Only on labels. |
+| `anchor` | `{ x, y }`, the point the label is placed at, in world µm. Only on labels. |
+| `rotation` | Degrees counterclockwise, the label's own rotation combined with the placements above it. `0` when nothing turns it. Only on labels. |
+| `magnification` | The label's own magnification combined with the placements above it. `1` when nothing scales it. Only on labels. |
+| `bbox` | The anchor as a box with no size. |
+| `width`, `height`, `area`, `perimeter` | `0`. |
+| `vertexCount` | `1`, the anchor. |
+| `points` | The anchor, as one x, y pair. |
+
+```js
+element.addEventListener("gds-select", (event) => {
+    const info = event.detail;
+    if (info?.kind === "label") console.log(info.text, info.anchor);
+    else if (info) console.log(info.area);
+});
+```
 
 The drawn geometry has no record of which cell each polygon came from, so the
 first click in a layout reads the layout's bytes again, in a Worker, and keeps
@@ -246,8 +304,9 @@ as long as one parse of the file; every click after it is a lookup, a few
 milliseconds even on the largest layouts below. The Worker that read the file
 is then released, and the index moves to a second Worker that answers clicks,
 so the memory reading took is not held. That Worker holds about 8 bytes per
-vertex of each cell's own geometry, 8 bytes per polygon, and 48 bytes per
-placement record, where an array is one record however many copies it makes.
+vertex of each cell's own geometry, 8 bytes per polygon, 48 bytes per
+placement record, where an array is one record however many copies it makes,
+and 32 bytes per text label plus its text.
 A cell placed many times is held once. It is released when its layout is
 replaced or unloaded.
 

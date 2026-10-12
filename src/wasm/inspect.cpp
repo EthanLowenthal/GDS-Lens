@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 #include "gds_common.hpp"
+#include "stroke_font.hpp"
 
 using namespace gdstk;
 
@@ -116,6 +118,33 @@ void Index::append_polygon(Node& node, const Polygon* poly, double dx, double dy
     tag_index_.push_back(tag_slot(poly->tag));
 }
 
+// Quantized like a polygon's vertices. The text is kept byte for byte, as the
+// renderer draws it.
+void Index::append_label(Node& node, const Label* label, double dx, double dy) {
+    LabelRecord r = {};
+    const double qx = std::round((label->origin.x + dx) / grid_);
+    const double qy = std::round((label->origin.y + dy) / grid_);
+    r.x = (int32_t)std::max((double)INT32_MIN, std::min((double)INT32_MAX, qx));
+    r.y = (int32_t)std::max((double)INT32_MIN, std::min((double)INT32_MAX, qy));
+    const char* text = label->text ? label->text : "";
+    const size_t length = std::strlen(text);
+    r.text = (uint32_t)text_.size();
+    r.length = (uint32_t)length;
+    text_.append(text, length);
+    r.tag = tag_slot(label->tag);
+    r.rotation = (float)(label->rotation * 180.0 / M_PI);
+    r.magnification = (float)label->magnification;
+    r.anchor = (uint8_t)label->anchor;
+    labels_.push_back(r);
+    node.labels++;
+    node.own.add(r.x * grid_, r.y * grid_);
+    float box[4];
+    stroke_font::text_box_px(length, r.anchor, box);
+    for (int cx : {0, 2}) {
+        for (int cy : {1, 3}) node.reach = std::max(node.reach, std::hypot(box[cx], box[cy]));
+    }
+}
+
 // A cell's own shapes as the renderer draws them -- repetitions expanded,
 // paths turned into their outlines (see collect_instanced in renderer.cpp,
 // which asks gdstk for the same thing) -- and its placements, each kept as one
@@ -131,6 +160,7 @@ void Index::convert(Cell* cell, uint32_t index, std::vector<Cell*>& pending) {
     node.xy_begin = xy_.size() / 2;
     node.poly_begin = starts_.size();
     node.place_begin = placements_.size();
+    node.label_begin = labels_.size();
 
     auto take = [this, &node](Polygon* poly) {
         if (poly->repetition.type == RepetitionType::None) {
@@ -169,11 +199,20 @@ void Index::convert(Cell* cell, uint32_t index, std::vector<Cell*>& pending) {
     cell->robustpath_array.clear();
     outlines.clear();
 
-    // Text is not a shape anyone clicks to select here; the renderer keeps
-    // its own copy for drawing.
+    // Labels with their repetitions expanded, as the renderer draws them (see
+    // collect_instanced in renderer.cpp).
     for (uint64_t i = 0; i < cell->label_array.count; i++) {
-        cell->label_array[i]->clear();
-        free_allocation(cell->label_array[i]);
+        Label* label = cell->label_array[i];
+        if (label->repetition.type == RepetitionType::None) {
+            append_label(node, label, 0.0, 0.0);
+        } else {
+            Array<Vec2> offsets = {};
+            label->repetition.get_offsets(offsets);
+            for (uint64_t k = 0; k < offsets.count; k++) append_label(node, label, offsets[k].x, offsets[k].y);
+            offsets.clear();
+        }
+        label->clear();
+        free_allocation(label);
     }
     cell->label_array.clear();
 
@@ -223,7 +262,7 @@ void Index::build(Library& lib, const std::string& root_name) {
     // counted (their size is only known once they are built) and grow as
     // needed.
     {
-        uint64_t points = 0, polygons = 0, references = 0;
+        uint64_t points = 0, polygons = 0, references = 0, labels = 0, chars = 0;
         for (uint64_t c = 0; c < lib.cell_array.count; c++) {
             const Cell* cell = lib.cell_array[c];
             for (uint64_t i = 0; i < cell->polygon_array.count; i++) {
@@ -232,12 +271,20 @@ void Index::build(Library& lib, const std::string& root_name) {
                 points += poly->point_array.count * copies;
                 polygons += copies;
             }
+            for (uint64_t i = 0; i < cell->label_array.count; i++) {
+                const Label* label = cell->label_array[i];
+                const uint64_t copies = std::max<uint64_t>(1, label->repetition.get_count());
+                labels += copies;
+                chars += (label->text ? std::strlen(label->text) : 0) * copies;
+            }
             references += cell->reference_array.count;
         }
         xy_.reserve(2 * points);
         starts_.reserve(polygons);
         tag_index_.reserve(polygons);
         placements_.reserve(references);
+        labels_.reserve(labels);
+        text_.reserve(chars);
     }
 
     // Breadth-first over what the drawn tops reach; node i is pending[i].
@@ -257,12 +304,15 @@ const Index::Box& Index::subtree_box(uint32_t index, std::vector<uint8_t>& state
     if (state[index] == 1) return node.own;
     state[index] = 1;
     Box box = node.own;
+    float reach = node.reach;
     for (size_t k = 0; k < node.placements; k++) {
         const Placement& p = placements_[node.place_begin + k];
         subtree_box(p.child, state);
         box.add(placement_box(node, p));
+        reach = std::max(reach, nodes_[p.child].subtree_reach);
     }
     node.subtree = box;
+    node.subtree_reach = reach;
     state[index] = 2;
     return node.subtree;
 }
@@ -317,14 +367,22 @@ Index::Box Index::placement_box(const Node& parent, const Placement& p) const {
 void Index::build_grid(Node& node) {
     node.grid_built = true;
     const size_t polygons = node.polygons;
-    const size_t count = polygons + node.placements;
+    const size_t shapes = polygons + node.placements;
+    const size_t count = shapes + node.labels;
     if (count <= kLinearItems) return;
 
     // Each item's box is worked out again on every pass rather than kept: on
     // a cell of millions of items a box apiece would cost more than the grid.
-    auto box_of = [this, &node, polygons](size_t i) {
-        if (i >= polygons) return placement_box(node, placements_[node.place_begin + i - polygons]);
+    // A label is binned by its anchor alone; its drawn text has no size in
+    // the layout.
+    auto box_of = [this, &node, polygons, shapes](size_t i) {
         Box b;
+        if (i >= shapes) {
+            const LabelRecord& r = labels_[node.label_begin + i - shapes];
+            b.add(r.x * grid_, r.y * grid_);
+            return b;
+        }
+        if (i >= polygons) return placement_box(node, placements_[node.place_begin + i - polygons]);
         for (size_t k = poly_first(node, i), end = poly_end(node, i); k < end; k++) {
             b.add(xy_[2 * k] * grid_, xy_[2 * k + 1] * grid_);
         }
@@ -337,20 +395,23 @@ void Index::build_grid(Node& node) {
     // typical item: bins finer than the shapes in them only multiply entries.
     // The typical size is the median of an even sample of items, which is as
     // good as the median of all of them for this and costs a fixed amount.
+    // Labels are left out of it: as points they would only drag it to 0.
     constexpr size_t kSizeSample = 4096;
-    const size_t step = std::max<size_t>(1, count / kSizeSample);
+    const size_t step = std::max<size_t>(1, shapes / kSizeSample);
     std::vector<double> widths, heights;
-    for (size_t i = 0; i < count; i += step) {
+    for (size_t i = 0; i < shapes; i += step) {
         const Box b = box_of(i);
         if (!b.valid()) continue;
         widths.push_back(b.max_x - b.min_x);
         heights.push_back(b.max_y - b.min_y);
     }
-    if (widths.empty()) return;
-    std::nth_element(widths.begin(), widths.begin() + widths.size() / 2, widths.end());
-    std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end());
-    const double median_w = widths[widths.size() / 2];
-    const double median_h = heights[heights.size() / 2];
+    double median_w = 0.0, median_h = 0.0;
+    if (!widths.empty()) {
+        std::nth_element(widths.begin(), widths.begin() + widths.size() / 2, widths.end());
+        std::nth_element(heights.begin(), heights.begin() + heights.size() / 2, heights.end());
+        median_w = widths[widths.size() / 2];
+        median_h = heights[heights.size() / 2];
+    }
 
     const double w = std::max(extent.max_x - extent.min_x, grid_);
     const double h = std::max(extent.max_y - extent.min_y, grid_);
@@ -459,11 +520,13 @@ void Index::descend(Node& parent, const Placement& p, const Xform& to_world, dou
 // Enters only the copies of a placement whose box can hold the point: worked
 // out from the array's lattice for the two regular kinds, so a 4000 x 4000
 // array costs the handful of copies near the point and not 16 million box
-// tests. lx/ly/ltol are in the parent's frame.
+// tests. lx/ly/ltol are in the parent's frame, and `scale` is how much the
+// parent's frame is magnified in the world.
 void Index::visit_placement(Node& node, const Placement& p, const Xform& to_world, double lx, double ly,
-                            double ltol, Walk& walk) {
+                            double ltol, double scale, Walk& walk) {
     const Box& child = nodes_[p.child].subtree;
     if (!child.valid()) return;
+    ltol = reach_of(nodes_[p.child], ltol, scale, walk);
     Box reach;
     const Xform linear = placement_xform(p, 0.0, 0.0);
     const double xs[2] = {child.min_x, child.max_x};
@@ -559,6 +622,51 @@ void Index::visit_placement(Node& node, const Placement& p, const Xform& to_worl
     }
 }
 
+double Index::reach_of(const Node& node, double ltol, double scale, const Walk& walk) const {
+    if (walk.label_px <= 0.0 || node.subtree_reach <= 0.0f) return ltol;
+    return std::max(ltol, ((double)node.subtree_reach + walk.tolerance_px) * walk.label_px / scale);
+}
+
+// A label is hit where it is drawn: upright, at a fixed size on screen, from
+// its anchor in the world. So the test is in screen pixels, against the box
+// stroke_font draws its text in, and its distance is how far the point is
+// from that box (0 inside it), turned back into µm at the queried zoom.
+void Index::label_hit(const Node& node, uint32_t i, const Xform& to_world, Walk& walk) const {
+    const LabelRecord& r = labels_[node.label_begin + i];
+    auto rank = walk.ranks->find(tags_[r.tag]);
+    if (rank == walk.ranks->end()) return;
+    const Vec2 at = to_world.apply(r.x * grid_, r.y * grid_);
+    float box[4];
+    stroke_font::text_box_px(r.length, r.anchor, box);
+    const double px = (walk.x - at.x) / walk.label_px, py = (walk.y - at.y) / walk.label_px;
+    const double dx = std::max({box[0] - px, 0.0, px - box[2]});
+    const double dy = std::max({box[1] - py, 0.0, py - box[3]});
+    const double distance = std::hypot(dx, dy);
+    if (distance > walk.tolerance_px) return;
+    Hit hit;
+    hit.label = true;
+    hit.tag = rank->first;
+    hit.rank = rank->second;
+    hit.path = walk.path;
+    hit.placement = to_world;
+    hit.points = {at.x, at.y};
+    hit.edge_distance = distance * walk.label_px;
+    hit.text.assign(text_, r.text, r.length);
+    hit.anchor = r.anchor;
+    std::copy(box, box + 4, hit.box);
+    // The direction the text runs, carried through the placements.
+    const double theta = (double)r.rotation * M_PI / 180.0;
+    const double ux = std::cos(theta), uy = std::sin(theta);
+    double degrees =
+        std::atan2(to_world.c * ux + to_world.d * uy, to_world.a * ux + to_world.b * uy) * 180.0 / M_PI;
+    // Rounded past the noise a 90 degree placement's cos/sin leaves behind.
+    degrees = std::round(degrees * 1e9) / 1e9;
+    if (degrees < 0.0) degrees += 360.0;
+    hit.rotation = degrees >= 360.0 ? 0.0 : degrees;
+    hit.magnification = (double)r.magnification * std::sqrt(std::fabs(to_world.det()));
+    walk.hits.push_back(std::move(hit));
+}
+
 void Index::visit(uint32_t index, const Xform& to_world, Walk& walk) {
     if (walk.truncated) return;
     if (++walk.visits > kMaxVisits) {
@@ -568,18 +676,27 @@ void Index::visit(uint32_t index, const Xform& to_world, Walk& walk) {
     Node& node = nodes_[index];
     const double det = to_world.det();
     if (det == 0.0 || !std::isfinite(det)) return;
-    // The point and the tolerance carried into this cell's frame.
+    // The point and the tolerance carried into this cell's frame, and how far
+    // around it a label's drawn text can reach from its anchor.
     const double rx = walk.x - to_world.tx, ry = walk.y - to_world.ty;
     const double lx = (to_world.d * rx - to_world.b * ry) / det;
     const double ly = (-to_world.c * rx + to_world.a * ry) / det;
-    const double ltol = walk.tolerance / std::sqrt(std::fabs(det));
-    if (!node.subtree.contains(lx, ly, ltol)) return;
+    const double scale = std::sqrt(std::fabs(det));
+    const double ltol = walk.tolerance / scale;
+    const double lreach = reach_of(node, ltol, scale, walk);
+    if (!node.subtree.contains(lx, ly, lreach)) return;
     if (!node.grid_built) build_grid(node);
 
     const size_t polygons = node.polygons;
+    const size_t shapes = polygons + node.placements;
     auto consider = [&](uint32_t item) {
+        if (item >= shapes) {
+            if (walk.label_px > 0.0) label_hit(node, item - (uint32_t)shapes, to_world, walk);
+            return;
+        }
         if (item >= polygons) {
-            visit_placement(node, placements_[node.place_begin + item - polygons], to_world, lx, ly, ltol, walk);
+            visit_placement(node, placements_[node.place_begin + item - polygons], to_world, lx, ly, ltol, scale,
+                            walk);
             return;
         }
         auto rank = walk.ranks->find(tags_[tag_index_[node.poly_begin + item]]);
@@ -620,23 +737,30 @@ void Index::visit(uint32_t index, const Xform& to_world, Walk& walk) {
 
     const Grid& g = node.grid;
     if (g.nx == 0) {
-        const size_t count = polygons + node.placements;
+        const size_t count = walk.label_px > 0.0 ? shapes + node.labels : shapes;
         for (size_t i = 0; i < count && !walk.truncated; i++) consider((uint32_t)i);
         return;
     }
     // Every bin the tolerance square touches, plus the big items, each once.
+    // Labels and placements are looked for further out, as far as a label's
+    // drawn text reaches at this zoom; polygons only within the tolerance.
     std::vector<uint32_t> candidates(g.big.begin(), g.big.end());
-    const int x0 = (int)clamp_index(std::floor((lx - ltol - g.x0) / g.bin_w), 0, g.nx - 1);
-    const int x1 = (int)clamp_index(std::floor((lx + ltol - g.x0) / g.bin_w), 0, g.nx - 1);
-    const int y0 = (int)clamp_index(std::floor((ly - ltol - g.y0) / g.bin_h), 0, g.ny - 1);
-    const int y1 = (int)clamp_index(std::floor((ly + ltol - g.y0) / g.bin_h), 0, g.ny - 1);
-    for (int y = y0; y <= y1; y++) {
-        for (int x = x0; x <= x1; x++) {
-            const size_t bin = (size_t)y * g.nx + x;
-            candidates.insert(candidates.end(), g.items.begin() + g.bin_start[bin],
-                              g.items.begin() + g.bin_start[bin + 1]);
+    auto gather = [&](double pad, uint32_t first_item) {
+        const int x0 = (int)clamp_index(std::floor((lx - pad - g.x0) / g.bin_w), 0, g.nx - 1);
+        const int x1 = (int)clamp_index(std::floor((lx + pad - g.x0) / g.bin_w), 0, g.nx - 1);
+        const int y0 = (int)clamp_index(std::floor((ly - pad - g.y0) / g.bin_h), 0, g.ny - 1);
+        const int y1 = (int)clamp_index(std::floor((ly + pad - g.y0) / g.bin_h), 0, g.ny - 1);
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                const size_t bin = (size_t)y * g.nx + x;
+                for (uint32_t k = g.bin_start[bin]; k < g.bin_start[bin + 1]; k++) {
+                    if (g.items[k] >= first_item) candidates.push_back(g.items[k]);
+                }
+            }
         }
-    }
+    };
+    gather(ltol, 0);
+    if (lreach > ltol) gather(lreach, (uint32_t)polygons);
     std::sort(candidates.begin(), candidates.end());
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
     for (uint32_t item : candidates) {
@@ -646,12 +770,16 @@ void Index::visit(uint32_t index, const Xform& to_world, Walk& walk) {
 }
 
 QueryResult Index::query(double x, double y, double tolerance, const std::unordered_map<Tag, double>& ranks,
-                         size_t limit) {
+                         size_t limit, double label_px) {
     Walk walk;
     walk.x = x;
     walk.y = y;
     walk.tolerance = std::max(0.0, tolerance);
     walk.ranks = &ranks;
+    if (label_px > 0.0 && std::isfinite(label_px)) {
+        walk.label_px = label_px;
+        walk.tolerance_px = walk.tolerance / label_px;
+    }
     for (uint32_t root : roots_) {
         PathStep top;
         top.cell = nodes_[root].name;
@@ -662,11 +790,14 @@ QueryResult Index::query(double x, double y, double tolerance, const std::unorde
     // user is pointing at is the outline closest to the pointer: the small
     // shape they clicked inside rather than a large one enclosing it (a cell
     // boundary, a floorplan box), whose edges are far away. Clicking on the
-    // large shape's own edge still selects it. Ties go to the smaller shape,
-    // then to the layer drawn last. Sorted here as well as in the viewer
-    // because `limit` keeps only the front of this order.
+    // large shape's own edge still selects it. A label's distance is to its
+    // drawn text box, so a click on the text is at 0 and comes first. Ties go
+    // to a label over a shape, then to the smaller shape, then to the layer
+    // drawn last. Sorted here as well as in the viewer because `limit` keeps
+    // only the front of this order.
     std::stable_sort(walk.hits.begin(), walk.hits.end(), [](const Hit& a, const Hit& b) {
         if (a.edge_distance != b.edge_distance) return a.edge_distance < b.edge_distance;
+        if (a.label != b.label) return a.label;
         if (a.area != b.area) return a.area < b.area;
         return a.rank > b.rank;
     });
@@ -688,13 +819,16 @@ Snapshot Index::take() {
     out.starts = std::move(starts_);
     out.tag_index = std::move(tag_index_);
     out.placements = std::move(placements_);
+    out.labels = std::move(labels_);
+    out.text = std::move(text_);
     out.names.reserve(nodes_.size());
-    out.counts.reserve(nodes_.size() * 4);
-    out.boxes.reserve(nodes_.size() * 8);
+    out.counts.reserve(nodes_.size() * 5);
+    out.boxes.reserve(nodes_.size() * 10);
     for (Node& node : nodes_) {
         out.names.push_back(std::move(node.name));
         out.counts.insert(out.counts.end(), {(double)node.vertices, (double)node.polygons,
-                                             (double)node.placements, (double)node.reps.size()});
+                                             (double)node.placements, (double)node.reps.size(),
+                                             (double)node.labels});
         for (Repetition& r : node.reps) {
             const bool lattice = r.type == RepetitionType::Rectangular || r.type == RepetitionType::Regular;
             const Vec2 v1 = r.type == RepetitionType::Rectangular ? r.spacing
@@ -718,7 +852,7 @@ Snapshot Index::take() {
         node.reps.clear();
         out.boxes.insert(out.boxes.end(), {node.own.min_x, node.own.min_y, node.own.max_x, node.own.max_y,
                                            node.subtree.min_x, node.subtree.min_y, node.subtree.max_x,
-                                           node.subtree.max_y});
+                                           node.subtree.max_y, (double)node.reach, (double)node.subtree_reach});
     }
     nodes_.clear();
     nodes_.shrink_to_fit();
@@ -737,25 +871,30 @@ void Index::restore(Snapshot&& in) {
     starts_ = std::move(in.starts);
     tag_index_ = std::move(in.tag_index);
     placements_ = std::move(in.placements);
+    labels_ = std::move(in.labels);
+    text_ = std::move(in.text);
     const size_t count = in.names.size();
     nodes_.resize(count);
-    size_t xy = 0, poly = 0, place = 0, rep = 0;
+    size_t xy = 0, poly = 0, place = 0, label = 0, rep = 0;
     for (size_t i = 0; i < count; i++) {
         Node& node = nodes_[i];
         node.name = std::move(in.names[i]);
         node.xy_begin = xy;
-        node.vertices = (size_t)in.counts[4 * i];
+        node.vertices = (size_t)in.counts[5 * i];
         node.poly_begin = poly;
-        node.polygons = (size_t)in.counts[4 * i + 1];
+        node.polygons = (size_t)in.counts[5 * i + 1];
         node.place_begin = place;
-        node.placements = (size_t)in.counts[4 * i + 2];
+        node.placements = (size_t)in.counts[5 * i + 2];
+        node.label_begin = label;
+        node.labels = (size_t)in.counts[5 * i + 4];
         xy += node.vertices;
         poly += node.polygons;
         place += node.placements;
+        label += node.labels;
         for (size_t k = 0; k < node.placements; k++) {
             node.sibling_counts[placements_[node.place_begin + k].child]++;
         }
-        const size_t reps = (size_t)in.counts[4 * i + 3];
+        const size_t reps = (size_t)in.counts[5 * i + 3];
         for (size_t k = 0; k < reps; k++) {
             const double* f = in.reps.data() + rep;
             Repetition r = {};
@@ -781,9 +920,11 @@ void Index::restore(Snapshot&& in) {
             rep += 8 + (r.type == RepetitionType::Explicit ? 2 * n : n);
             node.reps.push_back(r);
         }
-        const double* b = in.boxes.data() + 8 * i;
+        const double* b = in.boxes.data() + 10 * i;
         node.own = Box{b[0], b[1], b[2], b[3]};
         node.subtree = Box{b[4], b[5], b[6], b[7]};
+        node.reach = (float)b[8];
+        node.subtree_reach = (float)b[9];
     }
     in = Snapshot();
 }
@@ -791,5 +932,6 @@ void Index::restore(Snapshot&& in) {
 uint64_t Index::vertex_count() const { return xy_.size() / 2; }
 uint64_t Index::polygon_count() const { return tag_index_.size(); }
 uint64_t Index::placement_count() const { return placements_.size(); }
+uint64_t Index::label_count() const { return labels_.size(); }
 
 }  // namespace inspect

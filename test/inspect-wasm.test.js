@@ -8,12 +8,12 @@ import test from "node:test";
 import assert from "node:assert";
 import { loadModule, skip } from "./wasm-build.js";
 import { packTag } from "../src/parse-split.js";
-import { inspectFixture, library, structure, box, aref } from "./inspect-fixture.js";
+import { inspectFixture, library, structure, box, aref, text } from "./inspect-fixture.js";
 
 const bytes = inspectFixture();
 
 // Every layer drawn, in an order of the test's choosing: later is on top.
-const DRAW_ORDER = ["3/0", "4/0", "1/0", "5/0"];
+const DRAW_ORDER = ["3/0", "4/0", "1/0", "5/0", "6/0", "7/0"];
 function ranks(order = DRAW_ORDER) {
     return order.flatMap((tag, rank) => {
         const [layer, datatype] = tag.split("/").map(Number);
@@ -29,8 +29,13 @@ async function indexed(options = {}) {
     return { Module, result };
 }
 
-const at = (Module, x, y, { order, tolerance = 0.001 } = {}) =>
-    Module.inspectAt(x, y, tolerance, ranks(order), 64);
+// `labelPx` is world µm per screen pixel, as the viewer passes it while text
+// is drawn; 0 leaves labels out, as it does while text is not.
+const at = (Module, x, y, { order, tolerance = 0.001, labelPx = 0 } = {}) =>
+    Module.inspectAt(x, y, tolerance, ranks(order), 64, labelPx);
+
+// At 100 px/µm, with the viewer's 3 px tolerance.
+const ZOOMED = { labelPx: 0.01, tolerance: 0.03 };
 
 const tag = (hit) => `${hit.layer}/${hit.datatype}`;
 const pathText = (hit) => hit.path.map((step) => step.cell).join(" > ");
@@ -53,6 +58,8 @@ test("inspect: reads the hierarchy, not the flattened copies", { skip }, async (
     // placed nine times but held once.
     assert.strictEqual(result.polygons, 5);
     assert.strictEqual(result.placements, 5);
+    // TOP's three labels and RING's one.
+    assert.strictEqual(result.labels, 4);
 });
 
 test("inspect: overlapping shapes come back nearest edge first", { skip }, async () => {
@@ -161,7 +168,7 @@ test("inspect: instanced and flattened draws give the same answers", { skip }, a
         const loaded = Module.inspectLoad("/input.layout", {});
         assert.ok(loaded.ok);
         answers.push([[29.5, 31], [41, 39.5], [21, 105.5], [62, 61]].map(([x, y]) => {
-            const hit = Module.inspectAt(x, y, 0.001, ranks(), 64).hits[0];
+            const hit = Module.inspectAt(x, y, 0.001, ranks(), 64, 0).hits[0];
             return { tag: tag(hit), path: pathText(hit), bbox: bbox(hit), area: hit.area };
         }));
     }
@@ -169,34 +176,41 @@ test("inspect: instanced and flattened draws give the same answers", { skip }, a
 });
 
 // Big enough to need the per-cell grid and the array arithmetic: a cell of
-// 40,000 own boxes, and a 2000 x 2000 array of a small cell. A query that
-// scanned either would show in the timing long before it failed the answer.
+// 40,000 own boxes, and a 2000 x 2000 array of a small labelled cell. A query
+// that scanned either would show in the timing long before it failed the
+// answer.
 test("inspect: large cells and arrays are searched, not scanned", { skip }, async () => {
     const boxes = [];
     for (let i = 0; i < 200; i++) {
         for (let j = 0; j < 200; j++) boxes.push(box(2, 0, 3 * i, 3 * j, 3 * i + 1, 3 * j + 1));
     }
     const big = library([
-        structure("DOT", [box(1, 0, 0, 0, 0.5, 0.5)]),
+        structure("DOT", [box(1, 0, 0, 0, 0.5, 0.5), text(6, 0, 0.25, 0.25, "d")]),
         structure("TOP", [...boxes, aref("DOT", 0, 1000, 2000, 2000, 1, 1)])
     ]);
     const Module = await loadModule();
     Module.FS.writeFile("/input.layout", big);
     assert.ok(Module.inspectLoad("/input.layout", {}).ok);
-    const order = ["1/0", "2/0"];
+    const order = ["1/0", "2/0", "6/0"];
     // First query builds TOP's grid; time the ones after it.
     at(Module, 0.5, 0.5, { order });
     const start = performance.now();
     const own = at(Module, 300.5, 450.5, { order });
     const copy = at(Module, 1234.25, 1000 + 1777.25, { order });
+    // The label in that copy, at 20 px per µm: its text reaches into the
+    // copies around it, which are entered as well, and no further.
+    const label = at(Module, 1234.25, 1000 + 1777.25, { order, labelPx: 0.05, tolerance: 0.15 });
     const elapsed = performance.now() - start;
+    assert.strictEqual(label.hits[0].kind, "label");
+    assert.strictEqual(label.hits[0].text, "d");
+    assert.deepStrictEqual([label.hits[0].path[1].column, label.hits[0].path[1].row], [1234, 1777]);
     assert.deepStrictEqual(bbox(own.hits[0]), [300, 450, 301, 451]);
     assert.strictEqual(own.total, 1);
     assert.deepStrictEqual(bbox(copy.hits[0]), [1234, 2777, 1234.5, 2777.5]);
     const step = copy.hits[0].path[1];
     assert.deepStrictEqual([step.column, step.row, step.copies], [1234, 1777, 4_000_000]);
     assert.strictEqual(copy.truncated, false);
-    assert.ok(elapsed < 50, `two queries took ${elapsed.toFixed(1)} ms`);
+    assert.ok(elapsed < 50, `three queries took ${elapsed.toFixed(1)} ms`);
 });
 
 // The viewer reads the file in one Worker and answers clicks from another,
@@ -205,8 +219,9 @@ test("inspect: large cells and arrays are searched, not scanned", { skip }, asyn
 test("inspect: an index handed to another module answers the same", { skip }, async () => {
     const points = [[15, 15], [29.5, 31], [41, 39.5], [21, 105.5], [62, 61], [75, 0.25], [25, 105.5]];
     const summary = (Module) => points.map(([x, y]) => {
-        const found = at(Module, x, y);
-        return found.hits.map((hit) => ({ tag: tag(hit), path: hit.path, bbox: bbox(hit), area: hit.area }));
+        const found = at(Module, x, y, ZOOMED);
+        return found.hits.map((hit) => ({ kind: hit.kind, tag: tag(hit), path: hit.path, bbox: bbox(hit),
+                                          area: hit.area, text: hit.text, rotation: hit.rotation }));
     });
     const { Module: reader } = await indexed();
     const expected = summary(reader);
@@ -221,4 +236,109 @@ test("inspect: an index handed to another module answers the same", { skip }, as
     const answering = await loadModule();
     answering.inspectRestore(loaded.snapshot);
     assert.deepStrictEqual(summary(answering), expected);
+    // Labels made the trip too, and their reach beyond a cell's box with them.
+    assert.ok(expected.flat().some((hit) => hit.kind === "label"));
+    const far = (Module) => at(Module, 22.6, 105.5, { labelPx: 0.1, tolerance: 0.3 }).hits.map((hit) => hit.text);
+    assert.deepStrictEqual(far(answering), ["ring"]);
+});
+
+// ---- Labels ----
+// Labels are found only when the query names a zoom (labelPx), and then where
+// their text is drawn at that zoom: upright, 11 px cap height, from their
+// anchor. "PAD  A" is drawn from its bottom left, so at 100 px/µm its text
+// runs about 0.53 µm right of (25, 40) and 0.11 µm up.
+
+const labels = (found) => found.hits.filter((hit) => hit.kind === "label");
+
+test("inspect: a label is hit on its drawn text, before the shape under it", { skip }, async () => {
+    const { Module } = await indexed();
+    const found = at(Module, 25.2, 40.05, ZOOMED);
+    assert.deepStrictEqual(found.hits.map((hit) => hit.kind), ["label", "polygon"]);
+    const label = found.hits[0];
+    assert.strictEqual(label.text, "PAD  A");
+    assert.strictEqual(tag(label), "6/0");
+    assert.strictEqual(pathText(label), "TOP");
+    assert.deepStrictEqual(Array.from(label.points), [25, 40]);
+    assert.strictEqual(label.edgeDistance, 0);
+    assert.strictEqual(label.area, 0);
+    assert.deepStrictEqual([label.rotation, label.magnification], [0, 1]);
+    // Its box in pixels from the anchor: six characters wide, from the
+    // descender line to the ascenders.
+    const [x0, y0, x1, y1] = label.box;
+    assert.strictEqual(x0, 0);
+    assert.ok(Math.abs(x1 - 34 * 11 / 7) < 1e-4, `width ${x1}`);
+    assert.ok(Math.abs(y0 + 2 * 11 / 7) < 1e-4 && Math.abs(y1 - 11) < 1e-4, `height ${y0}..${y1}`);
+    assert.strictEqual(tag(found.hits[1]), "3/0");
+
+    // Zoomed out ten times further, the same text covers ten times the µm.
+    assert.strictEqual(labels(at(Module, 28, 40.5, { labelPx: 0.1, tolerance: 0.3 }))[0].text, "PAD  A");
+    assert.strictEqual(labels(at(Module, 28, 40.5, ZOOMED)).length, 0);
+    // Clicking the anchor hits it, and so does a click within the tolerance.
+    assert.strictEqual(labels(at(Module, 25, 40, ZOOMED))[0].text, "PAD  A");
+    assert.strictEqual(labels(at(Module, 24.98, 40, ZOOMED))[0].text, "PAD  A");
+    assert.strictEqual(labels(at(Module, 24.96, 40, ZOOMED)).length, 0);
+});
+
+test("inspect: labels are left out without a zoom, and on hidden layers", { skip }, async () => {
+    const { Module } = await indexed();
+    assert.deepStrictEqual(at(Module, 25.2, 40.05).hits.map(tag), ["3/0"]);
+    const hidden = at(Module, 25.2, 40.05, { ...ZOOMED, order: ["3/0", "4/0", "1/0", "5/0", "7/0"] });
+    assert.deepStrictEqual(hidden.hits.map(tag), ["3/0"]);
+});
+
+test("inspect: a label tied with a shape's edge comes first", { skip }, async () => {
+    const { Module } = await indexed();
+    // (50, 20) is EDGE's anchor, on the left side of its text, and on the
+    // 3/0 box's right edge: both at distance 0.
+    const found = at(Module, 50, 20, ZOOMED);
+    assert.deepStrictEqual(found.hits.map((hit) => [hit.kind, hit.edgeDistance]), [["label", 0], ["polygon", 0]]);
+    assert.strictEqual(found.hits[0].text, "EDGE");
+    // Nearer one shape's edge than the label's text, the shape comes first.
+    const offText = at(Module, 49.99, 20.1, { labelPx: 0.01, tolerance: 0.05 });
+    assert.deepStrictEqual(offText.hits.map((hit) => hit.kind), ["polygon", "label"]);
+});
+
+test("inspect: labels in placed cells report their path, anchor and turn", { skip }, async () => {
+    const { Module } = await indexed();
+    const copy = at(Module, 21, 105.5, ZOOMED);
+    assert.deepStrictEqual(copy.hits.map((hit) => hit.kind), ["label", "polygon"]);
+    const label = copy.hits[0];
+    assert.strictEqual(label.text, "ring");
+    assert.strictEqual(pathText(label), "TOP > ARR > RING");
+    assert.deepStrictEqual([label.path[2].column, label.path[2].row, label.path[2].copies], [2, 1, 6]);
+    assert.deepStrictEqual(Array.from(label.points), [21, 105.5]);
+
+    const rotated = labels(at(Module, 29.5, 31, ZOOMED))[0];
+    assert.strictEqual(pathText(rotated), "TOP > RING");
+    assert.strictEqual(rotated.path[1].sibling, 0);
+    assert.deepStrictEqual(Array.from(rotated.points).map((v) => Math.round(v * 1000) / 1000), [29.5, 31]);
+    assert.deepStrictEqual([rotated.rotation, rotated.magnification], [90, 1]);
+
+    const mirrored = labels(at(Module, 41, 39.5, ZOOMED))[0];
+    assert.strictEqual(mirrored.path[1].sibling, 1);
+    assert.deepStrictEqual(Array.from(mirrored.points), [41, 39.5]);
+
+    const magnified = labels(at(Module, 62, 61, ZOOMED))[0];
+    assert.strictEqual(magnified.path[1].sibling, 2);
+    assert.deepStrictEqual(Array.from(magnified.points), [62, 61]);
+    assert.deepStrictEqual([magnified.rotation, magnified.magnification], [0, 2]);
+
+    // The label's own rotation and magnification.
+    const own = labels(at(Module, 45, 5, ZOOMED))[0];
+    assert.strictEqual(own.text, "ROT");
+    assert.strictEqual(tag(own), "7/0");
+    assert.ok(Math.abs(own.rotation - 30) < 1e-4, `rotation ${own.rotation}`);
+    assert.strictEqual(own.magnification, 2);
+});
+
+test("inspect: a label's text reaches past its cell's box", { skip }, async () => {
+    const { Module } = await indexed();
+    // 1.6 µm right of the ring label in copy [2,1], 0.6 µm past the copy's
+    // box: at 0.1 µm per pixel, still within the text's half width of 17 px.
+    const found = at(Module, 22.6, 105.5, { labelPx: 0.1, tolerance: 0.3 });
+    assert.deepStrictEqual(found.hits.map((hit) => [hit.kind, hit.text]), [["label", "ring"]]);
+    assert.strictEqual(found.hits[0].path[2].column, 2);
+    assert.ok(Math.abs(found.hits[0].edgeDistance) < 1e-9);
+    // Closer in, the text is smaller and that point misses it.
+    assert.strictEqual(at(Module, 22.6, 105.5, ZOOMED).total, 0);
 });

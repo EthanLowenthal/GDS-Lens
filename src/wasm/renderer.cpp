@@ -668,6 +668,16 @@ GLuint g_highlight_vbo = 0;
 std::vector<float> g_selection_points;
 float g_selection_box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 int g_selection_slot = -1;
+// When the selection is a text label rather than a shape: g_selection_points
+// then holds its anchor alone, and this is the box its text is drawn in, as
+// pixel offsets from the anchor (see stroke_font::text_box_px). The outline
+// goes around that box at whatever the zoom is, as the text itself does.
+bool g_selection_label = false;
+float g_selection_label_box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+// How far outside a selected label's text the outline runs, in pixels, so the
+// dashes sit clear of the glyphs.
+constexpr float kSelectionLabelPadPx = 3.0f;
 
 // The outline's half-thickness, its dash and gap lengths, and the smallest box
 // it is drawn around -- all in pixels, so it keeps the same weight and dash
@@ -2958,9 +2968,21 @@ void draw_cell_highlight() {
 // than kHighlightMinPx on screen gets the grown box instead, which is the only
 // way to see where it is from far out.
 void draw_selection() {
-    if (g_selection_points.size() < 4) return;
+    if (g_selection_points.empty()) return;
     const HighlightPen pen = highlight_pen();
     std::vector<float> verts;
+    if (g_selection_label) {
+        // Rebuilt from the anchor every frame, so it follows the text through
+        // a zoom: the text keeps its size on screen and so does this.
+        const float px = 1.0f / g_zoom, pad = kSelectionLabelPadPx;
+        const float x = g_selection_points[0], y = g_selection_points[1];
+        append_dashed_box(verts, pen, x + (g_selection_label_box[0] - pad) * px,
+                          y + (g_selection_label_box[1] - pad) * px, x + (g_selection_label_box[2] + pad) * px,
+                          y + (g_selection_label_box[3] + pad) * px);
+        draw_highlight_quads(verts);
+        return;
+    }
+    if (g_selection_points.size() < 4) return;
     const float w = g_selection_box[2] - g_selection_box[0];
     const float h = g_selection_box[3] - g_selection_box[1];
     if (w < pen.min_world && h < pen.min_world) {
@@ -5568,6 +5590,20 @@ val snapshot_to_val(inspect::Snapshot&& snap) {
         out.set("placements", bytes);
     }
     std::vector<inspect::Placement>().swap(snap.placements);
+    {
+        val bytes = val::global("Uint8Array").new_(snap.labels.size() * sizeof(inspect::LabelRecord));
+        bytes.call<void>("set", typed_memory_view(snap.labels.size() * sizeof(inspect::LabelRecord),
+                                                  reinterpret_cast<const uint8_t*>(snap.labels.data())));
+        out.set("labels", bytes);
+    }
+    std::vector<inspect::LabelRecord>().swap(snap.labels);
+    {
+        val bytes = val::global("Uint8Array").new_(snap.text.size());
+        bytes.call<void>("set",
+                         typed_memory_view(snap.text.size(), reinterpret_cast<const uint8_t*>(snap.text.data())));
+        out.set("text", bytes);
+    }
+    std::string().swap(snap.text);
     out.set("reps", typed_array("Float64Array", snap.reps));
     out.set("boxes", typed_array("Float64Array", snap.boxes));
     return out;
@@ -5605,6 +5641,7 @@ val inspectLoad(const std::string& path, val options) {
     result.set("vertices", (double)g_inspect->vertex_count());
     result.set("polygons", (double)g_inspect->polygon_count());
     result.set("placements", (double)g_inspect->placement_count());
+    result.set("labels", (double)g_inspect->label_count());
     val snapshot_opt = options.isUndefined() || options.isNull() ? val::undefined() : options["snapshot"];
     if (!snapshot_opt.isUndefined() && snapshot_opt.as<bool>()) {
         result.set("snapshot", snapshot_to_val(g_inspect->take()));
@@ -5635,6 +5672,14 @@ void inspectRestore(val snap) {
     val(typed_memory_view(in.placements.size() * sizeof(inspect::Placement),
                           reinterpret_cast<uint8_t*>(in.placements.data())))
         .call<void>("set", placement_bytes);
+    val label_bytes = snap["labels"];
+    in.labels.resize(label_bytes["length"].as<size_t>() / sizeof(inspect::LabelRecord));
+    val(typed_memory_view(in.labels.size() * sizeof(inspect::LabelRecord),
+                          reinterpret_cast<uint8_t*>(in.labels.data())))
+        .call<void>("set", label_bytes);
+    val text_bytes = snap["text"];
+    in.text.resize(text_bytes["length"].as<size_t>());
+    val(typed_memory_view(in.text.size(), reinterpret_cast<uint8_t*>(in.text.data()))).call<void>("set", text_bytes);
     in.reps = convertJSArrayToNumberVector<double>(snap["reps"]);
     in.boxes = convertJSArrayToNumberVector<double>(snap["boxes"]);
     g_inspect = std::make_unique<inspect::Index>();
@@ -5644,7 +5689,9 @@ void inspectRestore(val snap) {
 // `ranks` is flat (tag, rank) pairs: the layers drawn right now and where each
 // sits in the draw order, so hidden layers are never hit and the answer comes
 // back topmost first (see getLayerStack, which the main thread builds it from).
-val inspectAt(double x, double y, double tolerance, val ranks, unsigned limit) {
+// `label_px` is world µm per screen pixel while labels are drawn, and 0 while
+// they are not, which leaves them out.
+val inspectAt(double x, double y, double tolerance, val ranks, unsigned limit, double label_px) {
     val result = val::object();
     val hits_js = val::array();
     result.set("hits", hits_js);
@@ -5656,9 +5703,10 @@ val inspectAt(double x, double y, double tolerance, val ranks, unsigned limit) {
     std::vector<double> flat = convertJSArrayToNumberVector<double>(ranks);
     for (size_t i = 0; i + 1 < flat.size(); i += 2) rank_of[(Tag)(uint64_t)flat[i]] = flat[i + 1];
 
-    inspect::QueryResult found = g_inspect->query(x, y, tolerance, rank_of, limit);
+    inspect::QueryResult found = g_inspect->query(x, y, tolerance, rank_of, limit, label_px);
     for (const inspect::Hit& hit : found.hits) {
         val h = val::object();
+        h.set("kind", std::string(hit.label ? "label" : "polygon"));
         h.set("layer", get_layer(hit.tag));
         h.set("datatype", get_type(hit.tag));
         h.set("area", hit.area);
@@ -5687,6 +5735,16 @@ val inspectAt(double x, double y, double tolerance, val ranks, unsigned limit) {
         placement.set("tx", hit.placement.tx);
         placement.set("ty", hit.placement.ty);
         h.set("placement", placement);
+        if (hit.label) {
+            // Crosses as findLabels' text does, so the card and a label
+            // search show the same string.
+            h.set("text", hit.text);
+            val box = val::array();
+            for (int k = 0; k < 4; k++) box.call<void>("push", (double)hit.box[k]);
+            h.set("box", box);
+            h.set("rotation", hit.rotation);
+            h.set("magnification", hit.magnification);
+        }
         hits_js.call<void>("push", h);
     }
     result.set("total", (double)found.total);
@@ -6597,6 +6655,25 @@ void setSelection(val points, int slot) {
     g_selection_box[2] = max_x;
     g_selection_box[3] = max_y;
     g_selection_slot = g_selection_points.empty() ? -1 : slot;
+    g_selection_label = false;
+    request_redraw();
+}
+
+// A text label as the selection: its anchor in world µm, and `box`, the box
+// its text is drawn in as pixel offsets from the anchor, as inspectAt
+// returned it.
+void setLabelSelection(double x, double y, val box, int slot) {
+    std::vector<float> flat = convertJSArrayToNumberVector<float>(box);
+    g_selection_points.clear();
+    g_selection_label = false;
+    g_selection_slot = -1;
+    if (flat.size() == 4 && std::isfinite(x) && std::isfinite(y) && std::isfinite(flat[0]) &&
+        std::isfinite(flat[1]) && std::isfinite(flat[2]) && std::isfinite(flat[3])) {
+        g_selection_points = {(float)x, (float)y};
+        std::copy(flat.begin(), flat.end(), g_selection_label_box);
+        g_selection_label = true;
+        g_selection_slot = slot;
+    }
     request_redraw();
 }
 
@@ -6604,6 +6681,7 @@ void clearSelection() {
     if (g_selection_points.empty()) return;
     g_selection_points.clear();
     g_selection_slot = -1;
+    g_selection_label = false;
     request_redraw();
 }
 
@@ -6847,6 +6925,7 @@ EMSCRIPTEN_BINDINGS(gdstk_renderer_module) {
     function("setCellHighlight", &setCellHighlight);
     function("clearCellHighlight", &clearCellHighlight);
     function("setSelection", &setSelection);
+    function("setLabelSelection", &setLabelSelection);
     function("clearSelection", &clearSelection);
     function("getLayerStack", &getLayerStack);
     // Click to inspect, run in a Worker of its own (see inspect.hpp).
