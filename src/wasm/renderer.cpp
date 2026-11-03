@@ -60,6 +60,7 @@ struct nth<1, gdstk::Vec2> {
 
 #include "gds_common.hpp"
 #include "inspect.hpp"
+#include "property_json.hpp"
 #include "kfactory_ports.hpp"
 #include "lyp_util.hpp"
 #include "shaders.hpp"
@@ -4268,7 +4269,30 @@ struct HierChild {
     bool have_first = false;
     std::vector<double> placements;
     bool capped = false;
+    // The references' property lists, each distinct one once with how many
+    // copies carry it (see property_json.hpp). A reference with none counts
+    // under the empty string. Past kMaxPropertyGroups distinct lists the rest
+    // are only counted, in `ungrouped`.
+    std::vector<std::pair<std::string, double>> property_groups;
+    double ungrouped = 0;
 };
+
+constexpr size_t kMaxPropertyGroups = 200;
+
+void add_property_group(HierChild& child, const Property* properties, double copies) {
+    std::string encoded = property_json::encode(properties);
+    for (auto& group : child.property_groups) {
+        if (group.first == encoded) {
+            group.second += copies;
+            return;
+        }
+    }
+    if (child.property_groups.size() >= kMaxPropertyGroups) {
+        child.ungrouped += copies;
+        return;
+    }
+    child.property_groups.emplace_back(std::move(encoded), copies);
+}
 
 // Placement transforms go over as a Float64Array rather than a plain array of
 // objects: it's one bulk copy instead of thousands of JS property writes, and
@@ -4304,6 +4328,17 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots, const kfactor
     // metadata at all -- "no ports" and "not a gdsfactory file" differ.
     out.set("portCount", (double)ports.port_count);
     out.set("kfactory", ports.present);
+    // The library record itself: what the details view shows for the file.
+    // `properties` is a JSON string (see property_json.hpp), absent when none.
+    {
+        val library = val::object();
+        library.set("name", std::string(lib.name ? lib.name : ""));
+        library.set("unit", lib.unit);
+        library.set("precision", lib.precision);
+        std::string properties = property_json::encode(lib.properties);
+        if (!properties.empty()) library.set("properties", properties);
+        out.set("library", library);
+    }
 
     if (lib.cell_array.count > kMaxHierarchyCells) {
         out.set("omitted", true);
@@ -4359,6 +4394,7 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots, const kfactor
             HierChild& child = found->second;
             uint64_t places = rep_count > 0 ? rep_count : 1;
             child.count += (double)places;
+            add_property_group(child, ref->properties, (double)places);
             child.box.add(placed_box(ref, boxes[ref->cell]));
             if (!child.have_first) {
                 // A repetition's first copy is always its (0,0) offset (see
@@ -4420,6 +4456,22 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots, const kfactor
             entry.set("placements", (child.placements.empty() || one_placement)
                                         ? val::null()
                                         : to_float64_array(child.placements));
+            // Only when some reference has properties, so the ordinary row
+            // carries nothing extra.
+            const bool any_properties =
+                child.ungrouped > 0 || child.property_groups.size() > 1 ||
+                (child.property_groups.size() == 1 && !child.property_groups[0].first.empty());
+            if (any_properties) {
+                val groups = val::array();
+                for (const auto& group : child.property_groups) {
+                    val g = val::object();
+                    g.set("properties", group.first);
+                    g.set("count", group.second);
+                    groups.call<void>("push", g);
+                }
+                entry.set("propertyGroups", groups);
+                if (child.ungrouped > 0) entry.set("ungroupedCount", child.ungrouped);
+            }
             refs.call<void>("push", entry);
         }
 
@@ -4432,6 +4484,10 @@ val build_hierarchy(Library& lib, const std::vector<Cell*>& roots, const kfactor
         cell_entry.set("labels", (double)cell->label_array.count);
         cell_entry.set("bbox", hier_box_to_val(boxes[cell]));
         cell_entry.set("refs", refs);
+        {
+            std::string properties = property_json::encode(cell->properties);
+            if (!properties.empty()) cell_entry.set("properties", properties);
+        }
         // The cell's own ports in its own frame, when kfactory declared any:
         // what the panel lists for a top cell, and what a host can read to
         // know where a component connects. Absent (not empty) otherwise, so
@@ -5606,6 +5662,13 @@ val snapshot_to_val(inspect::Snapshot&& snap) {
     std::string().swap(snap.text);
     out.set("reps", typed_array("Float64Array", snap.reps));
     out.set("boxes", typed_array("Float64Array", snap.boxes));
+    out.set("nodeProperties", typed_array("Uint32Array", snap.node_properties));
+    out.set("polygonProperties", typed_array("Uint32Array", snap.polygon_properties));
+    out.set("labelProperties", typed_array("Uint32Array", snap.label_properties));
+    out.set("placementProperties", typed_array("Uint32Array", snap.placement_properties));
+    // The table the ids point into. The answering Worker never reads it (a
+    // hit carries ids), so the viewer keeps it and resolves them itself.
+    out.set("propertyLists", snap.property_lists);
     return out;
 }
 
@@ -5682,6 +5745,10 @@ void inspectRestore(val snap) {
     val(typed_memory_view(in.text.size(), reinterpret_cast<uint8_t*>(in.text.data()))).call<void>("set", text_bytes);
     in.reps = convertJSArrayToNumberVector<double>(snap["reps"]);
     in.boxes = convertJSArrayToNumberVector<double>(snap["boxes"]);
+    in.node_properties = convertJSArrayToNumberVector<uint32_t>(snap["nodeProperties"]);
+    in.polygon_properties = convertJSArrayToNumberVector<uint32_t>(snap["polygonProperties"]);
+    in.label_properties = convertJSArrayToNumberVector<uint32_t>(snap["labelProperties"]);
+    in.placement_properties = convertJSArrayToNumberVector<uint32_t>(snap["placementProperties"]);
     g_inspect = std::make_unique<inspect::Index>();
     g_inspect->restore(std::move(in));
 }
@@ -5724,9 +5791,13 @@ val inspectAt(double x, double y, double tolerance, val ranks, unsigned limit, d
             s.set("copies", (double)step.copies);
             s.set("column", (double)step.column);
             s.set("row", (double)step.row);
+            // Ids into the snapshot's propertyLists, 0 for none.
+            s.set("cellProperties", step.cell_properties);
+            s.set("referenceProperties", step.reference_properties);
             path.call<void>("push", s);
         }
         h.set("path", path);
+        h.set("properties", hit.properties);
         val placement = val::object();
         placement.set("a", hit.placement.a);
         placement.set("b", hit.placement.b);

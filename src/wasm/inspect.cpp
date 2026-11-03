@@ -99,9 +99,24 @@ uint32_t Index::node_for(Cell* cell, std::vector<Cell*>& pending) {
 // produced sits on already (path outlines aside, which a writer would round
 // the same way). Clamped rather than wrapped, for an OASIS file whose varints
 // run past what 32 bits hold.
-void Index::append_polygon(Node& node, const Polygon* poly, double dx, double dy) {
+uint32_t Index::find_properties(const std::vector<uint32_t>& pairs, size_t index) {
+    // Pairs are appended in index order, so they are sorted by it.
+    size_t lo = 0, hi = pairs.size() / 2;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (pairs[2 * mid] < index) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < pairs.size() / 2 && pairs[2 * lo] == index ? pairs[2 * lo + 1] : 0;
+}
+
+void Index::append_polygon(Node& node, const Polygon* poly, double dx, double dy, uint32_t properties) {
     const uint64_t count = poly->point_array.count;
     if (count == 0) return;
+    if (properties) {
+        polygon_properties_.push_back((uint32_t)starts_.size());
+        polygon_properties_.push_back(properties);
+    }
     starts_.push_back((uint32_t)node.vertices);
     for (uint64_t k = 0; k < count; k++) {
         const Vec2& p = poly->point_array[k];
@@ -120,7 +135,11 @@ void Index::append_polygon(Node& node, const Polygon* poly, double dx, double dy
 
 // Quantized like a polygon's vertices. The text is kept byte for byte, as the
 // renderer draws it.
-void Index::append_label(Node& node, const Label* label, double dx, double dy) {
+void Index::append_label(Node& node, const Label* label, double dx, double dy, uint32_t properties) {
+    if (properties) {
+        label_properties_.push_back((uint32_t)labels_.size());
+        label_properties_.push_back(properties);
+    }
     LabelRecord r = {};
     const double qx = std::round((label->origin.x + dx) / grid_);
     const double qy = std::round((label->origin.y + dy) / grid_);
@@ -155,6 +174,7 @@ void Index::convert(Cell* cell, uint32_t index, std::vector<Cell*>& pending) {
     // nodes_, which would leave a reference into it dangling.
     Node node;
     node.name = cell->name ? cell->name : "";
+    node.properties = property_table_.intern(cell->properties);
     // Cells are converted one at a time, so each one's runs in the shared
     // arrays are contiguous.
     node.xy_begin = xy_.size() / 2;
@@ -162,27 +182,35 @@ void Index::convert(Cell* cell, uint32_t index, std::vector<Cell*>& pending) {
     node.place_begin = placements_.size();
     node.label_begin = labels_.size();
 
-    auto take = [this, &node](Polygon* poly) {
+    // `properties` is the list the shape came with: its own for a polygon, the
+    // path's for a path's outline (gdstk's outlines do not copy it).
+    auto take = [this, &node](Polygon* poly, uint32_t properties) {
         if (poly->repetition.type == RepetitionType::None) {
-            append_polygon(node, poly, 0.0, 0.0);
+            append_polygon(node, poly, 0.0, 0.0, properties);
         } else {
             Array<Vec2> offsets = {};
             poly->repetition.get_offsets(offsets);
-            for (uint64_t k = 0; k < offsets.count; k++) append_polygon(node, poly, offsets[k].x, offsets[k].y);
+            for (uint64_t k = 0; k < offsets.count; k++) {
+                append_polygon(node, poly, offsets[k].x, offsets[k].y, properties);
+            }
             offsets.clear();
         }
         poly->clear();
         free_allocation(poly);
     };
 
-    for (uint64_t i = 0; i < cell->polygon_array.count; i++) take(cell->polygon_array[i]);
+    for (uint64_t i = 0; i < cell->polygon_array.count; i++) {
+        Polygon* poly = cell->polygon_array[i];
+        take(poly, property_table_.intern(poly->properties));
+    }
     cell->polygon_array.clear();
 
     Array<Polygon*> outlines = {};
     for (uint64_t i = 0; i < cell->flexpath_array.count; i++) {
         FlexPath* path = cell->flexpath_array[i];
+        const uint32_t properties = property_table_.intern(path->properties);
         path->to_polygons(false, 0, outlines);
-        for (uint64_t k = 0; k < outlines.count; k++) take(outlines[k]);
+        for (uint64_t k = 0; k < outlines.count; k++) take(outlines[k], properties);
         outlines.count = 0;
         path->clear();
         free_allocation(path);
@@ -190,8 +218,9 @@ void Index::convert(Cell* cell, uint32_t index, std::vector<Cell*>& pending) {
     cell->flexpath_array.clear();
     for (uint64_t i = 0; i < cell->robustpath_array.count; i++) {
         RobustPath* path = cell->robustpath_array[i];
+        const uint32_t properties = property_table_.intern(path->properties);
         path->to_polygons(false, 0, outlines);
-        for (uint64_t k = 0; k < outlines.count; k++) take(outlines[k]);
+        for (uint64_t k = 0; k < outlines.count; k++) take(outlines[k], properties);
         outlines.count = 0;
         path->clear();
         free_allocation(path);
@@ -203,12 +232,15 @@ void Index::convert(Cell* cell, uint32_t index, std::vector<Cell*>& pending) {
     // collect_instanced in renderer.cpp).
     for (uint64_t i = 0; i < cell->label_array.count; i++) {
         Label* label = cell->label_array[i];
+        const uint32_t properties = property_table_.intern(label->properties);
         if (label->repetition.type == RepetitionType::None) {
-            append_label(node, label, 0.0, 0.0);
+            append_label(node, label, 0.0, 0.0, properties);
         } else {
             Array<Vec2> offsets = {};
             label->repetition.get_offsets(offsets);
-            for (uint64_t k = 0; k < offsets.count; k++) append_label(node, label, offsets[k].x, offsets[k].y);
+            for (uint64_t k = 0; k < offsets.count; k++) {
+                append_label(node, label, offsets[k].x, offsets[k].y, properties);
+            }
             offsets.clear();
         }
         label->clear();
@@ -233,6 +265,11 @@ void Index::convert(Cell* cell, uint32_t index, std::vector<Cell*>& pending) {
                 rep.copy_from(ref->repetition);
                 p.rep = (uint32_t)node.reps.size();
                 node.reps.push_back(rep);
+            }
+            const uint32_t properties = property_table_.intern(ref->properties);
+            if (properties) {
+                placement_properties_.push_back((uint32_t)placements_.size());
+                placement_properties_.push_back(properties);
             }
             placements_.push_back(p);
             node.placements++;
@@ -512,6 +549,8 @@ void Index::descend(Node& parent, const Placement& p, const Xform& to_world, dou
     step.copies = copies;
     step.column = column;
     step.row = row;
+    step.cell_properties = nodes_[p.child].properties;
+    step.reference_properties = find_properties(placement_properties_, (size_t)(&p - placements_.data()));
     walk.path.push_back(std::move(step));
     visit(p.child, compose(to_world, placement_xform(p, ox, oy)), walk);
     walk.path.pop_back();
@@ -664,6 +703,7 @@ void Index::label_hit(const Node& node, uint32_t i, const Xform& to_world, Walk&
     if (degrees < 0.0) degrees += 360.0;
     hit.rotation = degrees >= 360.0 ? 0.0 : degrees;
     hit.magnification = (double)r.magnification * std::sqrt(std::fabs(to_world.det()));
+    hit.properties = find_properties(label_properties_, node.label_begin + i);
     walk.hits.push_back(std::move(hit));
 }
 
@@ -707,6 +747,7 @@ void Index::visit(uint32_t index, const Xform& to_world, Walk& walk) {
         hit.rank = rank->second;
         hit.path = walk.path;
         hit.placement = to_world;
+        hit.properties = find_properties(polygon_properties_, node.poly_begin + item);
         const size_t first = poly_first(node, item), end = poly_end(node, item);
         hit.points.reserve((end - first) * 2);
         double twice_area = 0.0;
@@ -783,6 +824,7 @@ QueryResult Index::query(double x, double y, double tolerance, const std::unorde
     for (uint32_t root : roots_) {
         PathStep top;
         top.cell = nodes_[root].name;
+        top.cell_properties = nodes_[root].properties;
         walk.path.assign(1, top);
         visit(root, Xform{}, walk);
     }
@@ -821,11 +863,18 @@ Snapshot Index::take() {
     out.placements = std::move(placements_);
     out.labels = std::move(labels_);
     out.text = std::move(text_);
+    out.polygon_properties = std::move(polygon_properties_);
+    out.label_properties = std::move(label_properties_);
+    out.placement_properties = std::move(placement_properties_);
+    out.property_lists = property_table_.json();
+    property_table_.clear();
+    out.node_properties.reserve(nodes_.size());
     out.names.reserve(nodes_.size());
     out.counts.reserve(nodes_.size() * 5);
     out.boxes.reserve(nodes_.size() * 10);
     for (Node& node : nodes_) {
         out.names.push_back(std::move(node.name));
+        out.node_properties.push_back(node.properties);
         out.counts.insert(out.counts.end(), {(double)node.vertices, (double)node.polygons,
                                              (double)node.placements, (double)node.reps.size(),
                                              (double)node.labels});
@@ -873,12 +922,16 @@ void Index::restore(Snapshot&& in) {
     placements_ = std::move(in.placements);
     labels_ = std::move(in.labels);
     text_ = std::move(in.text);
+    polygon_properties_ = std::move(in.polygon_properties);
+    label_properties_ = std::move(in.label_properties);
+    placement_properties_ = std::move(in.placement_properties);
     const size_t count = in.names.size();
     nodes_.resize(count);
     size_t xy = 0, poly = 0, place = 0, label = 0, rep = 0;
     for (size_t i = 0; i < count; i++) {
         Node& node = nodes_[i];
         node.name = std::move(in.names[i]);
+        node.properties = i < in.node_properties.size() ? in.node_properties[i] : 0;
         node.xy_begin = xy;
         node.vertices = (size_t)in.counts[5 * i];
         node.poly_begin = poly;

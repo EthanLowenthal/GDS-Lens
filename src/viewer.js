@@ -137,6 +137,35 @@ function copyText(text) {
     });
 }
 
+// ---- Layout properties ----
+// The engine hands property lists over as JSON (see property_json.hpp): a
+// GDSII property is {attr, value}, an OASIS one {name, values}, and either
+// has binary: true when its bytes were not text.
+
+function parsePropertyJson(text) {
+    if (!text) return null;
+    try {
+        const list = JSON.parse(text);
+        return Array.isArray(list) && list.length > 0 ? list : null;
+    } catch {
+        return null;
+    }
+}
+
+// A property as one key and one value string.
+function propertyPair(entry) {
+    if (entry.attr !== undefined) {
+        return { key: String(entry.attr), value: entry.value ?? "", binary: !!entry.binary };
+    }
+    const values = (entry.values || []).map((v) => (v === null ? "null" : String(v)));
+    return { key: entry.name || "(unnamed)", value: values.join(", "), binary: !!entry.binary };
+}
+
+// A value squeezed onto one line, for a cell that cannot wrap.
+function oneLine(text) {
+    return text.replace(/\r\n|\r|\n/g, " \u21b5 ").replace(/\t/g, " ");
+}
+
 // Builds a viewer in `mountTarget`, and returns the surface a host drives it
 // through. Called once per <gds-lens> that connects (see gds-lens.js).
 //
@@ -1670,7 +1699,7 @@ export function createViewer(mountTarget) {
     // of them, because there is no single deeper coordinate frame to offer. The
     // per-placement boxes (what selecting the row outlines) are the other side of
     // that same collapse -- see hierarchyBoxes.
-    function addHierarchyRows(container, nodes, depth, parentPath, parentXform) {
+    function addHierarchyRows(container, nodes, depth, parentPath, parentXform, parentCell = null) {
         for (const node of nodes) {
             const cell = hierarchyModel.cells[node.cell];
             if (!cell) continue;
@@ -1710,6 +1739,18 @@ export function createViewer(mountTarget) {
             // belongs to.
             const owner = slotOf(cell.slot);
             const alone = owner.root === cell.name || (owner.root === null && owner.topCells.length === 1);
+            // Hover-only, like Show as new top below.
+            const info = document.createElement("button");
+            info.type = "button";
+            info.className = "hier-info";
+            info.textContent = "ⓘ";
+            info.title = "Cell details";
+            info.setAttribute("aria-label", "Cell details");
+            info.addEventListener("click", (event) => {
+                event.stopPropagation();
+                openCellDetails(cell, node, depth, parentCell);
+            });
+            row.append(info);
             if (!(depth === 0 && alone)) {
                 const open = document.createElement("button");
                 open.type = "button";
@@ -1742,7 +1783,7 @@ export function createViewer(mountTarget) {
                 if (!expandable) return;
                 if (open && !built) {
                     built = true;
-                    addHierarchyRows(children, cell.refs, depth + 1, path, childXform);
+                    addHierarchyRows(children, cell.refs, depth + 1, path, childXform, cell);
                 }
                 children.classList.toggle("hidden", !open);
                 twisty.textContent = open ? "▾" : "▸";
@@ -2908,6 +2949,11 @@ export function createViewer(mountTarget) {
                       message.placements, "placements,", message.labels, "labels");
                 inspector.grid = message.grid;
                 const snapshot = message.snapshot;
+                // Hits name property lists by id (see property_json.hpp). The
+                // table stays here, where the card is drawn; the answering
+                // Worker never needs it.
+                inspector.propertyLists = parsePropertyJson(snapshot.propertyLists) || [];
+                snapshot.propertyLists = "";
                 const transfer = ["roots", "counts", "xy", "starts", "tagIndex", "tags", "placements", "labels",
                                   "text", "reps", "boxes"].map((name) => snapshot[name].buffer);
                 try {
@@ -3012,7 +3058,17 @@ export function createViewer(mountTarget) {
     function describeHit(Module, hit, index, count) {
         const layerRow = Module.getLayers().find((l) =>
             l.source === hit.slot.index && l.layer === hit.layer && l.datatype === hit.datatype);
-        const path = Array.from(hit.path, (step) => ({ cell: step.cell, placement: placementLabel(step) }));
+        // Hits name property lists by id into the table the index came with.
+        const lists = (hit.slot.inspector && hit.slot.inspector.propertyLists) || [];
+        const listOf = (id) => (id > 0 && lists[id - 1]) || null;
+        const path = Array.from(hit.path, (step) => {
+            const out = { cell: step.cell, placement: placementLabel(step) };
+            const cellProperties = listOf(step.cellProperties);
+            const referenceProperties = listOf(step.referenceProperties);
+            if (cellProperties) out.cellProperties = cellProperties;
+            if (referenceProperties) out.referenceProperties = referenceProperties;
+            return out;
+        });
         const common = {
             slot: hit.slot.id,
             layer: hit.layer,
@@ -3024,6 +3080,8 @@ export function createViewer(mountTarget) {
             path,
             pathText: path.map((step) => step.placement ? `${step.cell} ${step.placement}` : step.cell).join(" > ")
         };
+        const properties = listOf(hit.properties);
+        if (properties) common.properties = properties;
         const unit = hit.slot.inspector ? hit.slot.inspector.grid : 0.001;
         if (hit.kind === "label") {
             const x = hit.points[0], y = hit.points[1];
@@ -3160,6 +3218,59 @@ export function createViewer(mountTarget) {
         return lines;
     }
 
+    // "TOP > RING_MOD #2 > RING", with the last step -- the cell whose own
+    // geometry holds the shape -- drawn as a tag. With `short`, only that
+    // last step, after "… >" when there are steps above it. Details shows
+    // the whole path; the card shows the short one until it is clicked.
+    function pathWithOwner(info, short = false) {
+        const out = document.createDocumentFragment();
+        const last = info.path.length - 1;
+        if (short && last > 0) out.append("… > ");
+        info.path.forEach((step, i) => {
+            if (short && i < last) return;
+            if (i > 0 && !(short && i === last)) out.append(" > ");
+            if (i === last) {
+                const owner = document.createElement("span");
+                owner.className = "owner-cell";
+                owner.textContent = step.cell;
+                owner.title = `The cell that holds this ${info.kind === "label" ? "label" : "shape"}`;
+                out.append(owner);
+            } else {
+                out.append(step.cell);
+            }
+            if (step.placement) out.append(` ${step.placement}`);
+        });
+        return out;
+    }
+
+    // Whether the card shows the whole path to the cell. Kept from one
+    // selection to the next.
+    let cardFullPath = false;
+
+    // The card's Cell row: the cell alone, or, once clicked, the whole path
+    // down to it. A shape in the top cell has no path to show.
+    function cardCellValue(td, info) {
+        if (info.path.length < 2) {
+            td.append(pathWithOwner(info));
+            return;
+        }
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "path-toggle";
+        const fill = () => {
+            button.replaceChildren(pathWithOwner(info, !cardFullPath));
+            button.title = cardFullPath ? "Show only the cell" : "Show the full path";
+            button.setAttribute("aria-expanded", String(cardFullPath));
+        };
+        button.addEventListener("click", () => {
+            cardFullPath = !cardFullPath;
+            fill();
+            placeInspectCard(info);
+        });
+        fill();
+        td.append(button);
+    }
+
     function renderInspectCard() {
         if (!inspectCardEl) return;
         const info = selection;
@@ -3172,6 +3283,9 @@ export function createViewer(mountTarget) {
         const body = els.inspectTable.tBodies[0];
         body.replaceChildren();
         for (const [label, value] of lines.slice(1)) {
+            // The Cell row opens into the path (see cardCellValue); Copy
+            // keeps both rows.
+            if (label === "Path") continue;
             const tr = document.createElement("tr");
             const th = document.createElement("th");
             th.textContent = label;
@@ -3182,6 +3296,8 @@ export function createViewer(mountTarget) {
                 chip.className = `slot-chip slot-chip-${info.slot}`;
                 chip.textContent = info.slot.toUpperCase();
                 td.append(chip, " ", slotOf(info.slot).name || "");
+            } else if (label === "Cell") {
+                cardCellValue(td, info);
             } else {
                 td.textContent = value;
                 // A label's text as it is: its spaces kept, wrapped when long.
@@ -3197,10 +3313,53 @@ export function createViewer(mountTarget) {
         const isLabel = info.kind === "label";
         els.inspectTop.title = `Draw the cell that holds this ${isLabel ? "label" : "shape"} as the top cell`;
         els.inspectFrame.title = isLabel ? "Center the view on this label" : "Zoom the view to this shape";
+        renderCardProperties(info);
         els.inspectStatus.textContent = info.count > 1
             ? `${isLabel ? "Label" : "Shape"} ${info.index + 1} of ${info.count} here. Click again for the next one.`
             : "";
         placeInspectCard(info);
+    }
+
+    // How many properties the card lists before pointing at Details.
+    const CARD_PROPERTY_ROWS = 4;
+
+    function renderCardProperties(info) {
+        const propsEl = els.inspectProps;
+        if (!propsEl) return;
+        const list = info.properties || [];
+        propsEl.classList.toggle("hidden", list.length === 0);
+        const body = propsEl.querySelector("tbody");
+        body.replaceChildren();
+        if (list.length === 0) return;
+        els.inspectPropsHeading.textContent = `Properties (${list.length})`;
+        for (const entry of list.slice(0, CARD_PROPERTY_ROWS)) {
+            const { key, value, binary } = propertyPair(entry);
+            const tr = document.createElement("tr");
+            const th = document.createElement("th");
+            th.textContent = key;
+            th.title = key;
+            const td = document.createElement("td");
+            td.textContent = oneLine(value);
+            // The whole value on hover, up to a screenful.
+            td.title = value.length > 2000 ? `${value.slice(0, 2000)}...` : value;
+            if (binary) td.classList.add("prop-binary");
+            tr.append(th, td);
+            body.append(tr);
+        }
+        if (list.length > CARD_PROPERTY_ROWS) {
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.colSpan = 2;
+            td.className = "prop-more";
+            const more = document.createElement("button");
+            more.type = "button";
+            more.className = "prop-more-link";
+            more.textContent = `${list.length - CARD_PROPERTY_ROWS} more in Details`;
+            more.addEventListener("click", openShapeDetails);
+            td.append(more);
+            tr.append(td);
+            body.append(tr);
+        }
     }
 
     // Puts the card in whichever free corner of the canvas keeps it off the
@@ -3249,7 +3408,12 @@ export function createViewer(mountTarget) {
 
     function copySelection() {
         if (!selection) return;
-        const text = inspectLines(selection).map(([label, value]) => `${label}: ${value}`).join("\n");
+        const lines = inspectLines(selection);
+        for (const entry of selection.properties || []) {
+            const { key, value } = propertyPair(entry);
+            lines.push([`Property ${key}`, value]);
+        }
+        const text = lines.map(([label, value]) => `${label}: ${value}`).join("\n");
         const what = selection.kind === "label" ? "label" : "shape";
         copyText(text).then(
             () => showCopyToast(`Copied the ${what}'s details`),
@@ -3266,6 +3430,7 @@ export function createViewer(mountTarget) {
     if (inspectCardEl) {
         els.inspectClose?.addEventListener("click", clearShapeSelection);
         els.inspectCopy?.addEventListener("click", copySelection);
+        els.inspectDetails?.addEventListener("click", openShapeDetails);
         els.inspectFrame?.addEventListener("click", () => {
             if (!selection) return;
             // A label has no size in the layout to zoom to, so it is centered
@@ -3345,6 +3510,17 @@ export function createViewer(mountTarget) {
         // does nothing else, and the viewer's other keys are left alone.
         // Checked before hasKeyboard, since a host can open it on a viewer
         // the user has not clicked.
+        // The details dialog likewise; its filter box takes the typing.
+        if (detailsOpen()) {
+            if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                closeDetails();
+            } else if (event.key === "Tab") {
+                trapDetailsFocus(event);
+            }
+            return;
+        }
         if (shortcutsOpen()) {
             if (event.key === "Escape") {
                 event.preventDefault();
@@ -3627,6 +3803,310 @@ export function createViewer(mountTarget) {
             if (event.target === shortcutsOverlay) closeShortcuts();
         });
     }
+
+    // ---- Details dialog ----
+    // Everything the viewer knows about a shape, a cell or a library, with
+    // every property whole. The card and the hierarchy panel only have room
+    // for a summary; this is where a 400-character value or a cell with sixty
+    // properties is read. Modal, like the shortcuts dialog.
+    //
+    // A section is { heading, rows?, properties?, groups?, note? }: `rows` are
+    // [label, value] pairs, `properties` a property list (an empty one says
+    // so), and `groups` a list of { label, properties } shown under it.
+    const detailsOverlay = els.detailsOverlay;
+    const detailsDialog = els.detailsDialog;
+    let detailsReturnFocus = null;
+    let detailsSections = [];
+    // With more property rows than this, the dialog offers a filter.
+    const DETAILS_FILTER_FROM = 10;
+
+    const detailsOpen = () => !!detailsOverlay && !detailsOverlay.classList.contains("hidden");
+
+    function detailsTable(rows, isProperty) {
+        const table = document.createElement("table");
+        table.className = "details-table";
+        const body = document.createElement("tbody");
+        for (const row of rows) {
+            const tr = document.createElement("tr");
+            const th = document.createElement("th");
+            const td = document.createElement("td");
+            if (isProperty) {
+                const { key, value, binary } = propertyPair(row);
+                th.textContent = key;
+                td.textContent = value;
+                if (binary) {
+                    const badge = document.createElement("span");
+                    badge.className = "details-badge";
+                    badge.textContent = "not text";
+                    badge.title = "Bytes that are not text are shown as \\xNN";
+                    td.append(badge);
+                }
+                tr.dataset.filterText = `${key}\n${value}`.toLowerCase();
+            } else {
+                th.textContent = row[0];
+                // A row may draw its value itself; row[1] stays the text
+                // Copy all uses.
+                if (typeof row[2] === "function") td.append(row[2]());
+                else td.textContent = row[1];
+            }
+            tr.append(th, td);
+            body.append(tr);
+        }
+        table.append(body);
+        return table;
+    }
+
+    function detailsNote(text) {
+        const note = document.createElement("div");
+        note.className = "details-note";
+        note.textContent = text;
+        return note;
+    }
+
+    function renderDetailsSection(section) {
+        const block = document.createElement("div");
+        block.className = "details-section";
+        const heading = document.createElement("div");
+        heading.className = "details-heading";
+        heading.textContent = section.heading;
+        block.append(heading);
+        if (section.rows && section.rows.length) block.append(detailsTable(section.rows, false));
+        if (section.properties) {
+            block.append(section.properties.length
+                ? detailsTable(section.properties, true)
+                : detailsNote("No properties"));
+        }
+        for (const group of section.groups || []) {
+            const sub = document.createElement("div");
+            sub.className = "details-subheading";
+            sub.textContent = group.label;
+            block.append(sub);
+            block.append(group.properties && group.properties.length
+                ? detailsTable(group.properties, true)
+                : detailsNote("No properties"));
+        }
+        if (section.note) block.append(detailsNote(section.note));
+        return block;
+    }
+
+    function countPropertyRows(sections) {
+        let n = 0;
+        for (const section of sections) {
+            n += (section.properties || []).length;
+            for (const group of section.groups || []) n += (group.properties || []).length;
+        }
+        return n;
+    }
+
+    function openDetails(title, sections) {
+        if (!detailsOverlay) return;
+        if (!detailsOpen()) detailsReturnFocus = deepActiveElement();
+        detailsSections = sections;
+        els.detailsTitle.textContent = title;
+        els.detailsTitle.title = title;
+        els.detailsBody.replaceChildren(...sections.map(renderDetailsSection));
+        const filterable = countPropertyRows(sections) > DETAILS_FILTER_FROM;
+        els.detailsFilterRow.classList.toggle("hidden", !filterable);
+        els.detailsFilter.value = "";
+        els.detailsFilterNote.textContent = "";
+        hideCanvasMenu();
+        detailsOverlay.classList.remove("hidden");
+        els.detailsBody.scrollTop = 0;
+        if (filterable) els.detailsFilter.focus();
+        else detailsDialog.focus();
+    }
+
+    function closeDetails() {
+        if (!detailsOpen()) return;
+        detailsOverlay.classList.add("hidden");
+        els.detailsBody.replaceChildren();
+        detailsSections = [];
+        const target = detailsReturnFocus;
+        detailsReturnFocus = null;
+        if (target && target.isConnected && target !== document.body && typeof target.focus === "function") {
+            target.focus();
+        } else {
+            detailsDialog.blur();
+        }
+    }
+
+    function filterDetails() {
+        const query = els.detailsFilter.value.trim().toLowerCase();
+        let shown = 0, total = 0;
+        for (const tr of els.detailsBody.querySelectorAll("tr[data-filter-text]")) {
+            total++;
+            const match = !query || tr.dataset.filterText.includes(query);
+            tr.classList.toggle("filtered-out", !match);
+            if (match) shown++;
+        }
+        els.detailsFilterNote.textContent = query ? `${shown} of ${total} properties match` : "";
+    }
+
+    // The dialog as plain text, for Copy all: what it shows, filter aside.
+    function detailsText() {
+        const lines = [els.detailsTitle.textContent];
+        for (const section of detailsSections) {
+            lines.push("", `== ${section.heading} ==`);
+            for (const [label, value] of section.rows || []) lines.push(`${label}: ${value}`);
+            const props = (list) => {
+                if (!list || list.length === 0) {
+                    lines.push("(no properties)");
+                    return;
+                }
+                for (const entry of list) {
+                    const { key, value } = propertyPair(entry);
+                    lines.push(`${key}: ${value}`);
+                }
+            };
+            if (section.properties) props(section.properties);
+            for (const group of section.groups || []) {
+                lines.push(`-- ${group.label} --`);
+                props(group.properties);
+            }
+            if (section.note) lines.push(section.note);
+        }
+        return lines.join("\n");
+    }
+
+    // Keeps Tab inside the dialog while it is up.
+    function trapDetailsFocus(event) {
+        const focusable = [...detailsDialog.querySelectorAll("button, input")]
+            .filter((el) => el.offsetParent !== null);
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        const current = viewerRoot.activeElement;
+        if (event.shiftKey && (current === first || current === detailsDialog)) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && current === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    }
+
+    // The selected shape or label: the card's rows, its properties, and the
+    // cell and reference properties at every step of the path to it -- which
+    // instance it belongs to is often the thing being looked for.
+    function openShapeDetails() {
+        if (!selection) return;
+        const info = selection;
+        const isLabel = info.kind === "label";
+        const sections = [
+            // The path marks the owning cell, as on the card.
+            { heading: isLabel ? "Label" : "Shape",
+              rows: inspectLines(info).slice(1)
+                  .filter(([label]) => label !== "Cell")
+                  .map((row) => (row[0] === "Path" ? [row[0], row[1], () => pathWithOwner(info)] : row)) },
+            { heading: "Properties", properties: info.properties || [] }
+        ];
+        const steps = info.path.map((step, i) => ({ step, parent: i > 0 ? info.path[i - 1].cell : null }));
+        const withProperties = steps.filter(({ step }) => step.cellProperties || step.referenceProperties);
+        if (withProperties.length === 0) {
+            sections.push({ heading: "Hierarchy", note: `No cell or reference properties along ${info.pathText}` });
+        }
+        for (const { step, parent } of withProperties) {
+            const groups = [];
+            if (step.cellProperties) groups.push({ label: "Cell", properties: step.cellProperties });
+            if (step.referenceProperties) {
+                groups.push({ label: `Reference${step.placement ? ` ${step.placement}` : ""} in ${parent}`,
+                              properties: step.referenceProperties });
+            }
+            sections.push({ heading: parent ? `${step.cell} (in ${parent})` : `${step.cell} (top)`, groups });
+        }
+        openDetails(detailsTitleFor(info), sections);
+    }
+
+
+    // The card's title line, for the dialog's.
+    function detailsTitleFor(info) {
+        const title = inspectLines(info)[0][1];
+        return info.kind === "label" ? `Label "${oneLine(info.text)}" on ${title}` : `Shape on ${title}`;
+    }
+
+    // A row of the hierarchy panel: the cell, how it is placed in the parent
+    // the row sits under, its properties, and its ports.
+    function openCellDetails(cell, node, depth, parentCell) {
+        const rows = [["Name", cell.name]];
+        if (comparing()) {
+            const slot = slotOf(cell.slot);
+            rows.push(["Layout", `${slot.id.toUpperCase()}${slot.name ? ` (${slot.name})` : ""}`]);
+        }
+        rows.push(["Own shapes", String(cell.polygons)], ["Labels", String(cell.labels)],
+                  ["Child cells", String(cell.refs.length)]);
+        if (cell.bbox) {
+            const b = cell.bbox;
+            rows.push(["Bounding box", `(${fmtCoord(b.minX)}, ${fmtCoord(b.minY)})–(${fmtCoord(b.maxX)}, ` +
+                                       `${fmtCoord(b.maxY)}) µm, in its own frame`]);
+        }
+        if (depth > 0 && parentCell) rows.push(["Placements", `${node.count} in ${parentCell.name}`]);
+        const sections = [
+            { heading: "Cell", rows },
+            { heading: "Cell properties", properties: parsePropertyJson(cell.properties) || [] }
+        ];
+        if (depth > 0 && parentCell) {
+            const groups = (node.propertyGroups || []).map((group) => ({
+                label: `${group.count} placement${group.count === 1 ? "" : "s"}`,
+                properties: parsePropertyJson(group.properties) || []
+            }));
+            const section = { heading: `References in ${parentCell.name}`, groups };
+            if (groups.length === 0) section.properties = [];
+            if (node.ungroupedCount > 0) {
+                section.note = `${node.ungroupedCount} more placements carry other lists, not shown`;
+            }
+            sections.push(section);
+        }
+        if (cell.ports && cell.ports.length > 0) {
+            sections.push({
+                heading: `Ports (${cell.ports.length})`,
+                rows: cell.ports.map((p) => [p.name, `${p.type || "port"} at (${fmtCoord(p.x)}, ${fmtCoord(p.y)}) µm, ` +
+                                             `${p.angle}°, width ${fmtCoord(p.width)} µm, layer ${p.layer}/${p.datatype}`])
+            });
+        }
+        openDetails(`Cell ${cell.name}`, sections);
+    }
+
+    // Each loaded layout's library record.
+    function openLibraryDetails() {
+        const loaded = slots.filter((slot) => slot.loaded && slot.hierarchy);
+        if (loaded.length === 0) return;
+        const sections = [];
+        for (const slot of loaded) {
+            const library = slot.hierarchy.library || {};
+            const rows = [["Library name", library.name || "(none)"]];
+            if (slot.name) rows.push(["File", slot.name]);
+            if (library.precision > 0) {
+                // The reader rescales the user unit to 1 µm; the database
+                // unit (the coordinate step) is the file's own.
+                rows.push(["Database unit", `${Number((library.precision * 1e6).toPrecision(6))} µm`]);
+            }
+            rows.push(["Cells", String(slot.hierarchy.cellCount || 0)]);
+            if (slot.topCells.length) rows.push(["Top cells", slot.topCells.join(", ")]);
+            if (slot.hierarchy.kfactory) rows.push(["Ports", String(slot.hierarchy.portCount || 0)]);
+            sections.push(
+                { heading: comparing() ? `Layout ${slot.id.toUpperCase()}` : "Library", rows },
+                { heading: "Library properties", properties: parsePropertyJson(library.properties) || [] });
+        }
+        openDetails(loaded.length > 1 ? "Libraries" : `Library ${loaded[0].hierarchy.library?.name || ""}`.trim(),
+                    sections);
+    }
+
+    if (detailsOverlay) {
+        els.detailsClose?.addEventListener("click", closeDetails);
+        els.detailsFilter?.addEventListener("input", filterDetails);
+        els.detailsCopy?.addEventListener("click", () => {
+            copyText(detailsText()).then(
+                () => showCopyToast("Copied the details"),
+                (err) => {
+                    fail("[GDS] clipboard write failed for the details:", err);
+                    showCopyToast("Couldn't copy: select the text instead");
+                });
+        });
+        detailsOverlay.addEventListener("click", (event) => {
+            if (event.target === detailsOverlay) closeDetails();
+        });
+    }
+    els.hierarchyInfo?.addEventListener("click", openLibraryDetails);
 
     // ---- Keyboard context ----
     // A host that binds single keys (H, M, /) needs to know when a keystroke

@@ -227,8 +227,9 @@ shows:
 
 - the layer, by number and by its `.lyp` name, with its color;
 - the text, exactly as the layout stores it, spaces included;
-- the cell that holds the label and the path to it from the top cell drawn,
-  marked with the placement the click was in, as for a shape;
+- the cell that holds the label, which opens into the path to it from the top
+  cell drawn when clicked, marked with the placement the click was in, as for
+  a shape;
 - with two layouts loaded, which one it is from;
 - the anchor point in µm, with as many decimals as the file's database unit
   has;
@@ -244,13 +245,29 @@ The selected shape is outlined in the same dashed style as a selected hierarchy
 row, and a card describes it:
 
 - the layer, by number and by its `.lyp` name, with its color;
-- the cell whose own geometry holds the shape, and the path to it from the top
-  cell drawn, such as `TOP > ring_array > ring [2,1]`. A cell its parent places
+- the cell whose own geometry holds the shape, shown as a tag. Clicking it
+  shows the path to it from the top cell drawn, such as
+  `TOP > ring_array > ring [2,1]`, and the card keeps showing paths until it is
+  clicked again. **Details** always shows the whole path, and **Copy** includes
+  both a `Cell` and a `Path` line. A cell its parent places
   more than once is marked with the placement the click was in: `#2` for the
   second of several references to it, `[2,1]` for column 2, row 1 of an array;
 - its bounding box, width and height, area, perimeter and vertex count, in µm,
   with as many decimals as the file's database unit has;
-- with two layouts loaded, which one it is from.
+- with two layouts loaded, which one it is from;
+- its GDSII or OASIS properties, when it has any. The card lists the first
+  four, each cut to one line, and says how many more there are.
+
+The card's **Details** button opens a dialog with everything the card shows,
+every property in full, and the properties of each cell and reference on the
+path to the shape, which is where a generator records which instance a shape
+belongs to. With more than ten properties it has a filter box, and **Copy
+all** copies the dialog as text. In the hierarchy panel, a row's **ⓘ** button
+opens the same dialog for that cell (its properties, the properties of the
+references that place it, grouped by list, and its ports), and the one in the
+panel's header for the library (its name, file, database unit and
+properties). `ShapeInfo.properties` and each path step's `cellProperties` and
+`referenceProperties` carry the same lists.
 
 The card's **Show as new top** button calls `setTopCell` for the shape's cell,
 **Frame** zooms to the shape, and **Copy** puts the card's text on the

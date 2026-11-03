@@ -205,6 +205,29 @@
         #inspectTable .slot-chip { margin-left: 0; }
         /* A label's text exactly as the layout has it, runs of spaces included. */
         #inspectTable td.inspect-text { white-space: pre-wrap; }
+        /* Properties on the card: a fixed layout, so a value never widens the
+           card, and one line per value, cut with an ellipsis. Details has
+           them whole. */
+        #inspectProps { border-top: 1px solid var(--border); padding: 4px 0 2px; }
+        #inspectProps.hidden { display: none; }
+        #inspectPropsHeading { padding: 0 8px; color: var(--fg-dim); }
+        #inspectProps table { table-layout: fixed; border-collapse: collapse; width: 100%; margin: 2px 0; }
+        #inspectProps th { width: 34%; text-align: left; font-weight: normal; color: var(--fg-dim);
+                           padding: 1px 8px; }
+        #inspectProps td { padding: 1px 8px 1px 0; }
+        #inspectProps th, #inspectProps td { overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+        #inspectProps td.prop-more { color: var(--fg-faint); padding-left: 8px; }
+        #inspectProps button.prop-more-link { background: none; border: 0; padding: 0; font: inherit;
+                                              color: inherit; text-decoration: underline; cursor: pointer; }
+        .prop-binary { font-style: italic; }
+        /* The cell that holds the selected shape, at the end of its path. */
+        .owner-cell { display: inline-block; padding: 0 4px; border: 1px solid var(--border-strong);
+                      border-radius: 3px; font-weight: bold; line-height: 1.3; }
+        /* The card's Cell row, which opens into the full path when clicked. */
+        button.path-toggle { background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit;
+                             text-align: left; cursor: pointer; }
+        button.path-toggle:hover .owner-cell, button.path-toggle:focus-visible .owner-cell {
+            background: var(--panel-widget-hover); }
         #inspectStatus { padding: 0 8px 4px; color: var(--fg-faint); }
         #inspectStatus:empty { display: none; }
         #inspectActions { display: flex; gap: 6px; padding: 6px 8px; border-top: 1px solid var(--border); }
@@ -371,6 +394,9 @@
         #hierarchyHide { background: none; border: 0; font: inherit; color: inherit;
                          cursor: pointer; opacity: 0.7; padding: 0 2px; }
         #hierarchyHide:hover { opacity: 1; }
+        #hierarchyInfo { background: none; border: 0; font: inherit; color: inherit;
+                         cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        #hierarchyInfo:hover, #hierarchyInfo:focus-visible { opacity: 1; }
         #hierarchyTree { flex: 1; overflow: auto; padding: 4px 0 8px; }
         /* One row per node. The whole row frames its cell on click, so it's
            the click target; only the left indent varies with depth (set
@@ -397,10 +423,11 @@
         /* "Show as new top": on the row under the pointer, the selected row and a
            keyboard-focused one, and out of the way on the rest, so a tree of
            a thousand rows is not a column of buttons. */
-        .hier-open { flex: none; visibility: hidden; background: none; border: 0; font: inherit;
-                     color: inherit; cursor: pointer; opacity: 0.7; padding: 0 2px; }
-        .hier-row:hover .hier-open, .hier-row.hier-selected .hier-open, .hier-open:focus-visible { visibility: visible; }
-        .hier-open:hover { opacity: 1; }
+        .hier-open, .hier-info { flex: none; visibility: hidden; background: none; border: 0; font: inherit;
+                                 color: inherit; cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        .hier-row:hover .hier-open, .hier-row.hier-selected .hier-open, .hier-open:focus-visible,
+        .hier-row:hover .hier-info, .hier-row.hier-selected .hier-info, .hier-info:focus-visible { visibility: visible; }
+        .hier-open:hover, .hier-info:hover { opacity: 1; }
         #hierarchyCrumb { flex: none; padding: 4px 8px; border-bottom: 1px solid var(--border);
                           display: flex; flex-direction: column; gap: 3px; }
         #hierarchyCrumb.hidden { display: none; }
@@ -561,6 +588,51 @@
         #debugLog .err { color: var(--log-err); }
         #debugToggleBtn { position: absolute; bottom: 8px; left: 8px; z-index: 41; font-family: monospace; font-size: 10px; background: var(--surface); color: var(--fg-dim); border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 8px; cursor: pointer; opacity: 0.6; }
         #debugToggleBtn:hover { opacity: 1; }
+        /* Details dialog: a shape's, a cell's or a library's whole record,
+           every property in full. Modal like the shortcuts dialog, and laid
+           out the same way, but wider, since property values can be long. */
+        #detailsOverlay { position: absolute; inset: 0; z-index: 60; display: flex;
+                          align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.4); }
+        #detailsOverlay.hidden { display: none; }
+        #detailsDialog { box-sizing: border-box; width: min(640px, calc(100% - 32px)); max-height: calc(100% - 32px);
+                         display: flex; flex-direction: column; background: var(--panel-bg); color: var(--panel-fg);
+                         border: 1px solid var(--border-strong); border-radius: 4px;
+                         box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4); font-family: monospace; font-size: 11px;
+                         user-select: text; }
+        #detailsDialog:focus { outline: none; }
+        #detailsHeader { display: flex; align-items: center; gap: 8px; flex: none; padding: 6px 8px;
+                         background: var(--panel-title-bg); border-bottom: 1px solid var(--border); font-weight: bold; }
+        #detailsTitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #detailsClose { background: none; border: 0; font: inherit; color: inherit;
+                        cursor: pointer; opacity: 0.7; padding: 0 2px; }
+        #detailsClose:hover, #detailsClose:focus-visible { opacity: 1; }
+        #detailsFilterRow { flex: none; padding: 6px 8px 0; }
+        #detailsFilterRow.hidden { display: none; }
+        #detailsFilter { box-sizing: border-box; width: 100%; font: inherit; color: var(--panel-fg);
+                         background: var(--panel-widget); border: 1px solid var(--border-strong);
+                         border-radius: 3px; padding: 2px 6px; }
+        #detailsBody { flex: 1 1 auto; overflow: auto; padding: 4px 0 8px; }
+        .details-section { padding: 6px 8px 0; }
+        .details-heading { font-weight: bold; padding-bottom: 2px; }
+        .details-subheading { color: var(--fg-dim); padding: 4px 0 0; }
+        .details-note { color: var(--fg-faint); padding: 2px 0; }
+        .details-table { border-collapse: collapse; width: 100%; }
+        .details-table th { text-align: left; font-weight: normal; color: var(--fg-dim); padding: 2px 12px 2px 0;
+                            vertical-align: baseline; white-space: nowrap; max-width: 40%; }
+        /* Values whole: their own line breaks and spaces kept, and a long
+           unbroken one (a hash, a JSON blob) wrapped anywhere rather than
+           widening the dialog. */
+        .details-table td { width: 100%; padding: 2px 0; vertical-align: baseline;
+                            white-space: pre-wrap; overflow-wrap: anywhere; }
+        .details-table tr.filtered-out { display: none; }
+        .details-badge { display: inline-block; margin-left: 6px; padding: 0 4px; font-size: 10px;
+                         color: var(--fg-dim); border: 1px solid var(--border-strong); border-radius: 3px; }
+        #detailsFooter { display: flex; align-items: center; gap: 8px; flex: none; padding: 6px 8px;
+                         border-top: 1px solid var(--border); }
+        #detailsFilterNote { flex: 1; color: var(--fg-faint); }
+        #detailsCopy { font-family: inherit; font-size: 11px; background: var(--panel-widget); color: var(--panel-fg);
+                       border: 1px solid var(--border-strong); border-radius: 3px; padding: 2px 10px; cursor: pointer; }
+        #detailsCopy:hover { background: var(--panel-widget-hover); }
         /* Keyboard shortcuts dialog. Above everything else the viewer draws
            (the canvas menu is z 50), since it is modal. It uses the panel's
            palette, like the canvas menu: it is part of the controls, not a

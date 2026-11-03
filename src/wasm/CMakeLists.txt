@@ -78,6 +78,82 @@ set(GDSTK_SOURCES
     "${GDSTK_DIR}/src/utils.cpp"
     "${GDSTK_DIR}/external/clipper/clipper.cpp")
 
+# gdstk's GDSII reader attaches PROPATTR/PROPVALUE pairs to polygons, paths,
+# references and labels, and drops the ones a structure or the library itself
+# carries. The viewer shows those too, so library.cpp is compiled from an
+# edited copy in the build tree; the submodule is left as upstream has it.
+#
+# The edit tracks whether the reader is inside an element, so a property on an
+# element gdstk skips (a NODE, or a shape its layer filter dropped) is not
+# mistaken for the cell's. Each anchor must match exactly once, so a gdstk
+# update that moves the code fails the configure instead of silently reading
+# fewer properties.
+function(gds_lens_edit_source text anchor replacement out_var)
+    string(FIND "${text}" "${anchor}" first)
+    string(FIND "${text}" "${anchor}" last REVERSE)
+    if(first EQUAL -1 OR NOT first EQUAL last)
+        message(FATAL_ERROR "gdstk's library.cpp changed: the property-reading edit no longer applies. "
+                            "Anchor:\n${anchor}")
+    endif()
+    string(REPLACE "${anchor}" "${replacement}" text "${text}")
+    set(${out_var} "${text}" PARENT_SCOPE)
+endfunction()
+
+set(GDSTK_LIBRARY_SOURCE "${GDSTK_DIR}/src/library.cpp")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GDSTK_LIBRARY_SOURCE}")
+file(READ "${GDSTK_LIBRARY_SOURCE}" gdstk_library_text)
+gds_lens_edit_source("${gdstk_library_text}"
+[=[    int16_t key = 0;
+]=]
+[=[    int16_t key = 0;
+    bool gds_lens_in_element = false;
+]=]
+    gdstk_library_text)
+gds_lens_edit_source("${gdstk_library_text}"
+[=[        // putchar('\n');
+]=]
+[=[        // putchar('\n');
+
+        switch ((GdsiiRecord)buffer[2]) {
+            case GdsiiRecord::BOUNDARY:
+            case GdsiiRecord::PATH:
+            case GdsiiRecord::SREF:
+            case GdsiiRecord::AREF:
+            case GdsiiRecord::TEXT:
+            case GdsiiRecord::NODE:
+            case GdsiiRecord::BOX:
+                gds_lens_in_element = true;
+                break;
+            case GdsiiRecord::ENDEL:
+            case GdsiiRecord::ENDSTR:
+                gds_lens_in_element = false;
+                break;
+            default:
+                break;
+        }
+]=]
+    gdstk_library_text)
+gds_lens_edit_source("${gdstk_library_text}"
+[=[                } else if (label) {
+                    set_gds_property(label->properties, key, str, data_length);
+                }
+]=]
+[=[                } else if (label) {
+                    set_gds_property(label->properties, key, str, data_length);
+                } else if (!gds_lens_in_element) {
+                    set_gds_property(cell ? cell->properties : library.properties, key, str, data_length);
+                }
+]=]
+    gdstk_library_text)
+# Written through a temporary so an unchanged edit keeps its timestamp and a
+# re-configure does not recompile it.
+set(GDSTK_LIBRARY_EDITED "${CMAKE_CURRENT_BINARY_DIR}/gdstk_library.cpp")
+file(WRITE "${GDSTK_LIBRARY_EDITED}.tmp" "${gdstk_library_text}")
+file(COPY_FILE "${GDSTK_LIBRARY_EDITED}.tmp" "${GDSTK_LIBRARY_EDITED}" ONLY_IF_DIFFERENT)
+file(REMOVE "${GDSTK_LIBRARY_EDITED}.tmp")
+list(REMOVE_ITEM GDSTK_SOURCES "${GDSTK_LIBRARY_SOURCE}")
+list(APPEND GDSTK_SOURCES "${GDSTK_LIBRARY_EDITED}")
+
 set(QHULL_SOURCES
     "${QHULL_DIR}/src/libqhull_r/geom2_r.c"
     "${QHULL_DIR}/src/libqhull_r/geom_r.c"
@@ -97,7 +173,7 @@ set(QHULL_SOURCES
     "${QHULL_DIR}/src/libqhull_r/userprintf_r.c"
     "${QHULL_DIR}/src/libqhull_r/userprintf_rbox_r.c")
 
-add_executable(gdstk_wasm renderer.cpp lyp_util.cpp stroke_font.cpp kfactory_ports.cpp inspect.cpp
+add_executable(gdstk_wasm renderer.cpp lyp_util.cpp stroke_font.cpp kfactory_ports.cpp inspect.cpp property_json.cpp
     ${GDSTK_SOURCES} ${QHULL_SOURCES})
 
 target_include_directories(gdstk_wasm PRIVATE
