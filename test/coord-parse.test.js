@@ -42,6 +42,11 @@ test("rejects anything that isn't a pair", () => {
     // Leftover words on either side, likewise.
     assert.strictEqual(parseCoordinatePair("cell TOP at 1, 2"), null);
     assert.strictEqual(parseCoordinatePair("1, 2 in metal1"), null);
+    // ...and between the two numbers, so a pasted rule or sentence with two
+    // numbers in it isn't read as a pair.
+    assert.strictEqual(parseCoordinatePair("12.5 to 40"), null);
+    assert.strictEqual(parseCoordinatePair("0.15 < 0.2"), null);
+    assert.strictEqual(parseCoordinatePair("1 cell 2"), null);
 });
 
 test("state doesn't leak between calls", () => {

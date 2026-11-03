@@ -22,8 +22,8 @@ const COORD_UNITS = {
     mm: 1e3
 };
 // One number plus an optional unit; the parse takes the first two matches and
-// requires the rest of the string to be separators, so "1 2 3" is rejected
-// rather than silently read as "1 2".
+// requires the rest of the string (before, between and after them) to be
+// separators, so "1 2 3" is rejected rather than silently read as "1 2".
 const COORD_TOKEN = /(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*(nm|um|µm|μm|mm)?/gi;
 // What may surround the two numbers -- punctuation, plus a bare x/y label,
 // since "x=12.5, y=40" is a shape real reports print. Anything else means the
@@ -33,17 +33,18 @@ const COORD_FILLER = /^[\s(),;:=xy]*$/i;
 // Returns {x, y} in microns, or null if the text isn't a coordinate pair.
 function parseCoordinatePair(text) {
     const numbers = [];
-    let start = 0;
-    let end = 0;
+    // [start, end) of each number token, so the text around and between the
+    // two can be checked.
+    const spans = [];
     COORD_TOKEN.lastIndex = 0;
     for (let match = COORD_TOKEN.exec(text); match; match = COORD_TOKEN.exec(text)) {
         numbers.push(parseFloat(match[1]) * (match[2] ? COORD_UNITS[match[2].toLowerCase()] : 1));
-        if (numbers.length === 1) start = match.index;
-        end = COORD_TOKEN.lastIndex;
+        spans.push([match.index, COORD_TOKEN.lastIndex]);
         if (numbers.length === 2) break;
     }
     if (numbers.length !== 2 || !numbers.every(Number.isFinite)) return null;
-    if (!COORD_FILLER.test(text.slice(0, start)) || !COORD_FILLER.test(text.slice(end))) return null;
+    const gaps = [text.slice(0, spans[0][0]), text.slice(spans[0][1], spans[1][0]), text.slice(spans[1][1])];
+    if (!gaps.every((gap) => COORD_FILLER.test(gap))) return null;
     return { x: numbers[0], y: numbers[1] };
 }
 
