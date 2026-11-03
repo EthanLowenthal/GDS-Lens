@@ -9,8 +9,24 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+### Added
+
+- GDSII and OASIS properties. The inspect card lists a selected shape's or
+  label's properties, a few rows of one line each, and a new **Details**
+  button opens the whole record: every property in full, and the properties
+  of each cell and reference on the path to the shape. The hierarchy panel's
+  rows and header have an **ⓘ** button for a cell's and the library's
+  details. `ShapeInfo.properties` and the path steps' `cellProperties` and
+  `referenceProperties` expose them. Properties a GDSII file sets on a
+  structure or on the library are read too; gdstk alone drops them. Thanks to
+  Nik Luhrs, whose request and prototype this follows.
+
 ### Changed
 
+- The inspect card shows the cell that holds the selection, as a tag, in
+  place of the full path. Clicking it shows the path from the top cell, and
+  the card keeps showing paths until it is clicked again. Details shows the
+  whole path, and Copy still writes both a `Cell` and a `Path` line.
 - The inspect card's Frame button is now called Center. It does the same
   thing: centers the view on a label, or zooms to fit a shape.
 

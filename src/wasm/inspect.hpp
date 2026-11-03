@@ -37,6 +37,8 @@
 
 #include <gdstk/gdstk.hpp>
 
+#include "property_json.hpp"
+
 namespace inspect {
 
 // A 2x3 affine, column vector convention: (a b; c d) then (tx, ty).
@@ -62,6 +64,10 @@ struct PathStep {
     int64_t copies = 0;
     int64_t column = -1;
     int64_t row = -1;
+    // Property lists (ids into the index's table, 0 for none): the cell's own,
+    // and the reference's that placed it. The top step has no reference.
+    uint32_t cell_properties = 0;
+    uint32_t reference_properties = 0;
 };
 
 struct Hit {
@@ -95,6 +101,10 @@ struct Hit {
     float box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     double rotation = 0.0;
     double magnification = 1.0;
+
+    // The shape's or label's property list (an id into the index's table, 0
+    // for none). A path's outline carries the path's.
+    uint32_t properties = 0;
 };
 
 // One reference, without the per-copy expansion an array would need.
@@ -151,6 +161,16 @@ struct Snapshot {
     std::vector<double> reps;
     // 10 per node: own box, subtree box, then own and subtree label reach.
     std::vector<double> boxes;
+    // Property lists. Each node's own list id, then (index, id) pairs for the
+    // polygons, labels and placements that carry one, by their position in
+    // the shared arrays. Most files have none, so the pairs cost nothing
+    // there. `property_lists` is the table the ids point into, as JSON (see
+    // property_json.hpp); only the viewer reads it.
+    std::vector<uint32_t> node_properties;
+    std::vector<uint32_t> polygon_properties;
+    std::vector<uint32_t> label_properties;
+    std::vector<uint32_t> placement_properties;
+    std::string property_lists;
 };
 
 struct QueryResult {
@@ -249,6 +269,7 @@ class Index {
         std::vector<gdstk::Repetition> reps;
         // How many of this cell's references place each child.
         std::unordered_map<uint32_t, uint32_t> sibling_counts;
+        uint32_t properties = 0;
         Box own;
         Box subtree;
         bool grid_built = false;
@@ -269,8 +290,10 @@ class Index {
 
     uint32_t node_for(gdstk::Cell* cell, std::vector<gdstk::Cell*>& pending);
     void convert(gdstk::Cell* cell, uint32_t index, std::vector<gdstk::Cell*>& pending);
-    void append_polygon(Node& node, const gdstk::Polygon* poly, double dx, double dy);
-    void append_label(Node& node, const gdstk::Label* label, double dx, double dy);
+    void append_polygon(Node& node, const gdstk::Polygon* poly, double dx, double dy, uint32_t properties);
+    void append_label(Node& node, const gdstk::Label* label, double dx, double dy, uint32_t properties);
+    // The id stored for item `index` in one of the (index, id) pair lists.
+    static uint32_t find_properties(const std::vector<uint32_t>& pairs, size_t index);
     // Polygon i of a node, as a range of vertex indices into xy_.
     size_t poly_first(const Node& node, size_t i) const { return node.xy_begin + starts_[node.poly_begin + i]; }
     size_t poly_end(const Node& node, size_t i) const {
@@ -304,6 +327,10 @@ class Index {
     std::unordered_map<gdstk::Tag, uint32_t> tag_slots_;
     double grid_ = 0.001;
     std::string root_;
+    property_json::Table property_table_;
+    std::vector<uint32_t> polygon_properties_;
+    std::vector<uint32_t> label_properties_;
+    std::vector<uint32_t> placement_properties_;
 };
 
 }  // namespace inspect

@@ -126,9 +126,26 @@ export interface ShortcutRow {
 }
 
 /** One step of a `ShapeInfo` path, from the drawn top cell down. */
+/**
+ * One GDSII or OASIS property. A GDSII property (PROPATTR/PROPVALUE) has
+ * `attr` and `value`; an OASIS one has `name` and `values`. Bytes that are not
+ * text are written as `\xNN`, and `binary` is then `true`. GDSII's NUL padding
+ * is dropped.
+ */
+export type LayoutProperty =
+    | { attr: number; value: string; binary?: boolean }
+    | { name: string; values: (string | number | null)[]; binary?: boolean };
+
 export interface ShapePathStep {
     /** The cell's name. */
     cell: string;
+    /** The cell's own properties. Absent when it has none. */
+    cellProperties?: LayoutProperty[];
+    /**
+     * The properties of the reference that placed this cell in the previous
+     * step's cell. Absent for the top cell, and when the reference has none.
+     */
+    referenceProperties?: LayoutProperty[];
     /**
      * Which placement of this cell the shape is in, when its parent places it
      * more than once: `"#2"` for the second of several references to it,
@@ -184,6 +201,11 @@ export interface ShapeInfo {
     count: number;
     /** The layout's database unit in µm, the step its coordinates sit on. */
     unit: number;
+    /**
+     * The shape's or label's properties, in file order. A path's outline
+     * carries the path's. Absent when it has none.
+     */
+    properties?: LayoutProperty[];
     /** A label's text, exactly as the layout stores it. Present when `kind` is `"label"`. */
     text?: string;
     /** The point a label is placed at, in world µm. Present when `kind` is `"label"`. */

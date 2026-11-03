@@ -29,6 +29,7 @@ const BOUNDARY = 0x0800, PATH = 0x0900, SREF = 0x0A00, AREF = 0x0B00;
 const LAYER = 0x0D02, DATATYPE = 0x0E02, WIDTH = 0x0F03, XY = 0x1003, ENDEL = 0x1100;
 const SNAME = 0x1206, COLROW = 0x1302, STRANS = 0x1A01, MAG = 0x1B05, ANGLE = 0x1C05;
 const TEXT = 0x0C00, TEXTTYPE = 0x1602, PRESENTATION = 0x1701, STRING = 0x1906;
+const PROPATTR = 0x2B02, PROPVALUE = 0x2C06;
 
 const NM = 1000;
 
@@ -69,27 +70,36 @@ const int4 = (...values) => {
 };
 const ascii = (s) => Buffer.from(s.length % 2 ? s + "\0" : s, "latin1");
 
-export function box(layer, datatype, x0, y0, x1, y1) {
+// PROPATTR/PROPVALUE records for `props`, a list of [attribute, text] pairs.
+// Every builder below takes one; the records go where GDSII puts them, after
+// the element's other records (or right after the name, for a structure or the
+// library).
+export function propertyRecords(props = []) {
+    return props.flatMap(([attr, value]) =>
+        [record(PROPATTR, int2(attr)), record(PROPVALUE, ascii(String(value)))]);
+}
+
+export function box(layer, datatype, x0, y0, x1, y1, props = []) {
     return [
         record(BOUNDARY), record(LAYER, int2(layer)), record(DATATYPE, int2(datatype)),
-        record(XY, int4(x0, y0, x1, y0, x1, y1, x0, y1, x0, y0)), record(ENDEL)
+        record(XY, int4(x0, y0, x1, y0, x1, y1, x0, y1, x0, y0)), ...propertyRecords(props), record(ENDEL)
     ];
 }
 
-export function sref(name, x, y, { angle = 0, mirror = false, mag = 1 } = {}) {
+export function sref(name, x, y, { angle = 0, mirror = false, mag = 1, props = [] } = {}) {
     const out = [record(SREF), record(SNAME, ascii(name))];
     if (angle || mirror || mag !== 1) {
         out.push(record(STRANS, int2(mirror ? -0x8000 : 0)));
         if (mag !== 1) out.push(record(MAG, real8(mag)));
         if (angle) out.push(record(ANGLE, real8(angle)));
     }
-    out.push(record(XY, int4(x, y)), record(ENDEL));
+    out.push(record(XY, int4(x, y)), ...propertyRecords(props), record(ENDEL));
     return out;
 }
 
 // A TEXT element. `anchor` is the PRESENTATION bits: vertical edge (0 top,
 // 1 middle, 2 bottom) times 4 plus horizontal (0 left, 1 center, 2 right).
-export function text(layer, texttype, x, y, string, { anchor = 5, angle = 0, mag = 1 } = {}) {
+export function text(layer, texttype, x, y, string, { anchor = 5, angle = 0, mag = 1, props = [] } = {}) {
     const out = [record(TEXT), record(LAYER, int2(layer)), record(TEXTTYPE, int2(texttype)),
                  record(PRESENTATION, int2(anchor))];
     if (angle || mag !== 1) {
@@ -97,13 +107,14 @@ export function text(layer, texttype, x, y, string, { anchor = 5, angle = 0, mag
         if (mag !== 1) out.push(record(MAG, real8(mag)));
         if (angle) out.push(record(ANGLE, real8(angle)));
     }
-    out.push(record(XY, int4(x, y)), record(STRING, ascii(string)), record(ENDEL));
+    out.push(record(XY, int4(x, y)), record(STRING, ascii(string)), ...propertyRecords(props), record(ENDEL));
     return out;
 }
 
-export function structure(name, elements) {
+export function structure(name, elements, props = []) {
     const stamp = int2(2026, 1, 1, 0, 0, 0, 2026, 1, 1, 0, 0, 0);
-    return [record(BGNSTR, stamp), record(STRNAME, ascii(name)), ...elements.flat(), record(ENDSTR)];
+    return [record(BGNSTR, stamp), record(STRNAME, ascii(name)), ...propertyRecords(props), ...elements.flat(),
+            record(ENDSTR)];
 }
 
 // A rectangular array of `name`, `columns` x `rows` copies `dx` and `dy` apart.
@@ -115,11 +126,11 @@ export function aref(name, x, y, columns, rows, dx, dy) {
 }
 
 // A whole library from structures (see `structure`), children first.
-export function library(structures) {
+export function library(structures, { name = "INSPECT", props = [] } = {}) {
     const stamp = int2(2026, 1, 1, 0, 0, 0, 2026, 1, 1, 0, 0, 0);
     return Buffer.concat([
-        record(HEADER, int2(600)), record(BGNLIB, stamp), record(LIBNAME, ascii("INSPECT")),
-        record(UNITS, Buffer.concat([real8(1 / NM), real8(1e-9)])),
+        record(HEADER, int2(600)), record(BGNLIB, stamp), record(LIBNAME, ascii(name)),
+        record(UNITS, Buffer.concat([real8(1 / NM), real8(1e-9)])), ...propertyRecords(props),
         ...structures.flat(), record(ENDLIB)
     ]);
 }

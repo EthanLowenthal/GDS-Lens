@@ -67,6 +67,7 @@ const card = (page) => page.evaluate(() => {
         rows[tr.querySelector("th").textContent] = tr.querySelector("td").textContent;
     }
     return { title: root.getElementById("inspectTitle").textContent, rows,
+             owner: root.querySelector("#inspectTable .owner-cell")?.textContent ?? null,
              status: root.getElementById("inspectStatus").textContent };
 });
 
@@ -93,9 +94,9 @@ test("a click selects the nearest shape and describes it", { skip }, async () =>
         await clickAt(page, 15, 15);
         await waitForCard(page, "4/0", "36 µm²");
         const shown = await card(page);
+        // The cell alone; in the top cell there is no path above it.
         assert.deepStrictEqual(shown.rows, {
             Cell: "TOP",
-            Path: "TOP",
             "Bounding box": "(12, 12)–(18, 18) µm",
             Size: "6 × 6 µm",
             Area: "36 µm²",
@@ -111,8 +112,14 @@ test("a click selects the nearest shape and describes it", { skip }, async () =>
         await clickAt(page, 21, 105.5);
         await waitForCard(page, "1/0", "2 µm²");
         const ring = await card(page);
-        assert.strictEqual(ring.rows.Cell, "RING");
-        assert.strictEqual(ring.rows.Path, "TOP > ARR > RING [2,1]");
+        assert.strictEqual(ring.owner, "RING");
+        assert.strictEqual(ring.rows.Cell, "… > RING [2,1]");
+        assert.strictEqual(ring.rows.Path, undefined, "the Cell row stands in for Path");
+        // Clicked, the row shows the whole path, and stays open for the next selection.
+        await page.locator("gds-lens #inspectTable .path-toggle").click();
+        assert.strictEqual((await card(page)).rows.Cell, "TOP > ARR > RING [2,1]");
+        await page.locator("gds-lens #inspectTable .path-toggle").click();
+        assert.strictEqual((await card(page)).rows.Cell, "… > RING [2,1]");
         assert.strictEqual(ring.rows["Bounding box"], "(20, 105)–(22, 106) µm");
         // One layout loaded: no Layout row.
         assert.strictEqual(ring.rows.Layout, undefined);
@@ -135,7 +142,7 @@ test("clicking the same spot again steps down through the shapes there", { skip 
         // the third of TOP's three references to it.
         await clickAt(page, 62, 61);
         await waitForCard(page, "1/0", "8 µm²");
-        assert.strictEqual((await card(page)).rows.Path, "TOP > RING #3");
+        assert.strictEqual((await card(page)).rows.Cell, "… > RING #3");
     });
 });
 
@@ -233,7 +240,7 @@ test("the card's buttons frame, copy, and show the cell as the top", { skip }, a
         // RING drawn alone at its own origin: a click there finds it as the top.
         await clickAt(page, 1, 0.5);
         await waitForCard(page, "1/0", "2 µm²");
-        assert.strictEqual((await card(page)).rows.Path, "RING");
+        assert.strictEqual((await card(page)).rows.Cell, "RING");
         assert.strictEqual(await page.evaluate(() => document.querySelector("gds-lens")
             .shadowRoot.getElementById("inspectTop").disabled), true);
     });
@@ -335,7 +342,6 @@ test("with Text on, clicking a label's text selects the label", { skip }, async 
         assert.deepStrictEqual(shown.rows, {
             Text: "PAD  A",
             Cell: "TOP",
-            Path: "TOP",
             Anchor: "(25, 40) µm"
         });
         assert.match(shown.status, /Label 1 of 2 here/);
@@ -396,7 +402,7 @@ test("a label's card copies, frames, and shows its cell as the top", { skip }, a
         // The label in the array copy at column 2, row 1, clicked on its anchor.
         await clickAt(page, 21, 105.5);
         await waitForLabelCard(page, "ring");
-        assert.strictEqual((await card(page)).rows.Path, "TOP > ARR > RING [2,1]");
+        assert.strictEqual((await card(page)).rows.Cell, "… > RING [2,1]");
         const zoom = (await page.evaluate(() => document.querySelector("gds-lens").getCamera())).zoom;
         await page.locator("gds-lens #inspectFrame").click();
         await page.waitForFunction(async () => {
@@ -414,7 +420,7 @@ test("a label's card copies, frames, and shows its cell as the top", { skip }, a
         // RING drawn alone: its label is at its own (1, 0.5), with RING as the path.
         await clickAt(page, 1, 0.5);
         await waitForLabelCard(page, "ring");
-        assert.strictEqual((await card(page)).rows.Path, "RING");
+        assert.strictEqual((await card(page)).rows.Cell, "RING");
     });
 });
 
