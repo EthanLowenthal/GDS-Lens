@@ -9,6 +9,11 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+### Changed
+
+- The inspect card's Frame button is now called Center. It does the same
+  thing: centers the view on a label, or zooms to fit a shape.
+
 ### Fixed
 
 - Copy coordinate, Copy on the inspect card, and the debug log's Copy button

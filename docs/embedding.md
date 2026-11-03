@@ -236,7 +236,7 @@ shows:
   Both combine the label's own values with the placements above it. The viewer
   draws the text upright and at the same size whatever they are.
 
-**Show as new top** shows the label's cell as the top, **Frame** centers the
+**Show as new top** shows the label's cell as the top, **Center** centers the
 view on the anchor at the current zoom, as a label search does, and **Copy**
 puts the card's text on the clipboard.
 
@@ -253,7 +253,7 @@ row, and a card describes it:
 - with two layouts loaded, which one it is from.
 
 The card's **Show as new top** button calls `setTopCell` for the shape's cell,
-**Frame** zooms to the shape, and **Copy** puts the card's text on the
+**Center** zooms to the shape, and **Copy** puts the card's text on the
 clipboard. Where the host blocks the clipboard, the card's text can be
 selected and copied instead.
 
