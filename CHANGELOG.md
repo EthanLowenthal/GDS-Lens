@@ -9,6 +9,15 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+### Fixed
+
+- Copy coordinate, Copy on the inspect card, and the debug log's Copy button
+  work on embedding pages that block the async clipboard API: a cross-origin
+  iframe without `allow="clipboard-write"`, a page served over plain http, or
+  a document without focus. The viewer now falls back to
+  `document.execCommand("copy")` when `navigator.clipboard` is missing or
+  refuses.
+
 ## [1.7.0] - 2026-10-12
 
 ### Added

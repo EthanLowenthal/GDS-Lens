@@ -294,6 +294,38 @@ test("the canvas menu copies the coordinate it is showing", { skip }, async () =
     });
 });
 
+test("copy falls back when the page blocks the async clipboard", { skip }, async () => {
+    await withLoadedViewer(async (page) => {
+        // An embedding page can refuse navigator.clipboard (a cross-origin
+        // iframe without allow="clipboard-write", a plain-http page, an
+        // unfocused document). Copy coordinate used to give up there. Stub the
+        // async API to refuse, and record what execCommand("copy") is handed.
+        await page.evaluate(() => {
+            window.__copied = [];
+            navigator.clipboard.writeText = () =>
+                Promise.reject(new DOMException("blocked", "NotAllowedError"));
+            const original = document.execCommand.bind(document);
+            document.execCommand = (cmd, ...rest) => {
+                if (cmd === "copy") window.__copied.push(document.activeElement?.value);
+                return original(cmd, ...rest);
+            };
+        });
+
+        const canvas = page.locator("#glCanvas");
+        const box = await canvas.boundingBox();
+        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: "right" });
+        const shown = (await page.locator("#canvasMenu .menu-value").textContent()).trim();
+        await page.locator("#canvasMenuCopy").click({ timeout: 5000 });
+
+        const toast = page.locator("#copyToast");
+        await toast.waitFor({ state: "visible", timeout: 2000 });
+        assert.deepEqual(await page.evaluate(() => window.__copied), [shown],
+                         "execCommand did not copy the coordinate");
+        assert.ok((await toast.textContent()).startsWith("Copied"),
+                  `the toast reported a failure: ${await toast.textContent()}`);
+    });
+});
+
 // ---- A reload leaves the GL state a frame can be drawn from ----
 
 test("a reload draws a clean frame, background grid included", { skip }, async () => {

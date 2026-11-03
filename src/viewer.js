@@ -96,6 +96,47 @@ function reportGlobalFailure(...args) {
     }
 }
 
+// Puts `text` on the clipboard. Resolves when it got there, rejects when it
+// did not.
+//
+// navigator.clipboard alone fails on several embedding pages: a cross-origin
+// iframe without allow="clipboard-write", a page served over plain http (where
+// navigator.clipboard is undefined), and a document that does not have focus.
+// document.execCommand("copy") is not subject to those checks, only to the
+// click that triggered it, so it is tried whenever the async API is missing or
+// refuses.
+function copyText(text) {
+    const legacyCopy = () => {
+        // Outside the viewer's shadow root: a selection inside a shadow tree is
+        // not what execCommand copies in every browser.
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;";
+        const previousFocus = document.activeElement;
+        document.body.appendChild(area);
+        area.select();
+        let ok;
+        try {
+            ok = document.execCommand("copy");
+        } catch {
+            ok = false;
+        }
+        area.remove();
+        if (previousFocus && typeof previousFocus.focus === "function") {
+            previousFocus.focus({ preventScroll: true });
+        }
+        return ok;
+    };
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        return legacyCopy() ? Promise.resolve() : Promise.reject(new Error("clipboard unavailable"));
+    }
+    return navigator.clipboard.writeText(text).catch((err) => {
+        if (legacyCopy()) return;
+        throw err;
+    });
+}
+
 // Builds a viewer in `mountTarget`, and returns the surface a host drives it
 // through. Called once per <gds-lens> that connects (see gds-lens.js).
 //
@@ -266,7 +307,7 @@ export function createViewer(mountTarget) {
     if (debugCopyBtn) {
         debugCopyBtn.addEventListener("click", () => {
             const text = debugLogEl ? debugLogEl.innerText : "";
-            navigator.clipboard.writeText(text).then(
+            copyText(text).then(
                 () => trace("[GDS] debug log copied to clipboard"),
                 (err) => {
                     // Clipboard API can be blocked in a sandboxed webview -- fall back
@@ -2740,7 +2781,7 @@ export function createViewer(mountTarget) {
         canvasMenuCopyEl.addEventListener("click", () => {
             const text = canvasMenuText;
             hideCanvasMenu();
-            navigator.clipboard.writeText(text).then(
+            copyText(text).then(
                 () => showCopyToast("Copied \u2014 " + text),
                 (err) => {
                     // Same failure the debug log's Copy button guards against -- the
@@ -3210,7 +3251,7 @@ export function createViewer(mountTarget) {
         if (!selection) return;
         const text = inspectLines(selection).map(([label, value]) => `${label}: ${value}`).join("\n");
         const what = selection.kind === "label" ? "label" : "shape";
-        navigator.clipboard.writeText(text).then(
+        copyText(text).then(
             () => showCopyToast(`Copied the ${what}'s details`),
             (err) => {
                 // Blocked in some sandboxed webviews, as for Copy coordinate.
