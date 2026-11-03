@@ -17,6 +17,9 @@ version. Before that, `0.x` releases changed it freely.
   a document without focus. The viewer now falls back to
   `document.execCommand("copy")` when `navigator.clipboard` is missing or
   refuses.
+- `parseCoordinatePair` checked the text before and after the two numbers but
+  not between them, so "12.5 to 40" or "0.15 < 0.2" was read as a coordinate
+  pair. Words between the numbers are now rejected like words on either side.
 
 ## [1.7.0] - 2026-10-12
 
