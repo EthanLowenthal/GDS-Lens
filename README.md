@@ -13,6 +13,8 @@ starts with. Nothing is uploaded, and there is nothing to install. The page is
 built from the published package, so it is also the quickest way to check what
 a given release does.
 
+Used in the [GDS Lens VS Code extension](https://marketplace.visualstudio.com/items?itemName=ethml.GDS-Lens).
+
 ![The viewer: a cell hierarchy tree, a rendered photonic layout, and the layer and display controls](https://raw.githubusercontent.com/EthanLowenthal/GDS-Lens/main/images/example.png)
 
 ## Quick start
