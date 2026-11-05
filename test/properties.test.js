@@ -110,7 +110,7 @@ test("the card crops properties and Details shows them whole", { skip }, async (
         assert.deepEqual(details.Properties, [
             "1: net=VDD", `2: ${LONG}`, "3: two\nlines", "4: four", "5: five", "6: six", "7: seven"
         ]);
-        assert.deepEqual(details["TOP (top)"], ["Cell", "2: design=demo"]);
+        assert.deepEqual(details["TOP (top)"], ["2: design=demo"]);
 
         await page.keyboard.press("Escape");
         assert.equal(await dialog(page), null, "Escape did not close the dialog");

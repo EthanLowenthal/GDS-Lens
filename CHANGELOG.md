@@ -9,6 +9,19 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+### Changed
+
+- Cell metadata stored as `META('key')=value` strings shows one row per
+  entry rather than one comma-joined value. The key is the entry's name, and
+  the value is laid out as `key: value` lines, with nested dictionaries
+  indented, `#l500` numbers as `500`, and `[trans:r180 0,0]` as `r180 0,0`.
+  This applies to the inspect card, Details and Copy, for OASIS files and for
+  GDSII ones, where long strings split across several properties are joined
+  back up first.
+- In a shape's Details, a cell on the path that has properties but whose
+  reference has none lists them straight under the cell's heading, without
+  a separate "Cell" label.
+
 ## [1.7.1] - 2026-11-03
 
 ### Added

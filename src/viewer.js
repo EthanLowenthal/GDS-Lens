@@ -2,6 +2,7 @@ import { rankCellMatches, cellPathToTarget } from "./cell-search.js";
 import { parseMarkerFile, flattenMarkerModel } from "./marker-parsers.js";
 import { describeLoadFailure, describeDecodeFailure } from "./load-errors.js";
 import { decodeLayoutBytes, looksGzipped } from "./layout-bytes.js";
+import { propertyRows, oneLine } from "./property-format.js";
 import { scanGdsTags, planShards, shardCount, mergeShardResults, packTag } from "./parse-split.js";
 // Resolved by the build to engine-source.js (the served payloads) or
 // engine-source.esm.js (the bundled module). A bare specifier because
@@ -138,9 +139,8 @@ function copyText(text) {
 }
 
 // ---- Layout properties ----
-// The engine hands property lists over as JSON (see property_json.hpp): a
-// GDSII property is {attr, value}, an OASIS one {name, values}, and either
-// has binary: true when its bytes were not text.
+// The engine hands property lists over as JSON (see property_json.hpp);
+// property-format.js turns a list into the rows the viewer shows.
 
 function parsePropertyJson(text) {
     if (!text) return null;
@@ -150,20 +150,6 @@ function parsePropertyJson(text) {
     } catch {
         return null;
     }
-}
-
-// A property as one key and one value string.
-function propertyPair(entry) {
-    if (entry.attr !== undefined) {
-        return { key: String(entry.attr), value: entry.value ?? "", binary: !!entry.binary };
-    }
-    const values = (entry.values || []).map((v) => (v === null ? "null" : String(v)));
-    return { key: entry.name || "(unnamed)", value: values.join(", "), binary: !!entry.binary };
-}
-
-// A value squeezed onto one line, for a cell that cannot wrap.
-function oneLine(text) {
-    return text.replace(/\r\n|\r|\n/g, " \u21b5 ").replace(/\t/g, " ");
 }
 
 // Builds a viewer in `mountTarget`, and returns the surface a host drives it
@@ -3326,20 +3312,19 @@ export function createViewer(mountTarget) {
     function renderCardProperties(info) {
         const propsEl = els.inspectProps;
         if (!propsEl) return;
-        const list = info.properties || [];
+        const list = propertyRows(info.properties);
         propsEl.classList.toggle("hidden", list.length === 0);
         const body = propsEl.querySelector("tbody");
         body.replaceChildren();
         if (list.length === 0) return;
         els.inspectPropsHeading.textContent = `Properties (${list.length})`;
-        for (const entry of list.slice(0, CARD_PROPERTY_ROWS)) {
-            const { key, value, binary } = propertyPair(entry);
+        for (const { key, value, line, binary } of list.slice(0, CARD_PROPERTY_ROWS)) {
             const tr = document.createElement("tr");
             const th = document.createElement("th");
             th.textContent = key;
             th.title = key;
             const td = document.createElement("td");
-            td.textContent = oneLine(value);
+            td.textContent = line;
             // The whole value on hover, up to a screenful.
             td.title = value.length > 2000 ? `${value.slice(0, 2000)}...` : value;
             if (binary) td.classList.add("prop-binary");
@@ -3409,8 +3394,7 @@ export function createViewer(mountTarget) {
     function copySelection() {
         if (!selection) return;
         const lines = inspectLines(selection);
-        for (const entry of selection.properties || []) {
-            const { key, value } = propertyPair(entry);
+        for (const { key, value } of propertyRows(selection.properties)) {
             lines.push([`Property ${key}`, value]);
         }
         const text = lines.map(([label, value]) => `${label}: ${value}`).join("\n");
@@ -3826,12 +3810,12 @@ export function createViewer(mountTarget) {
         const table = document.createElement("table");
         table.className = "details-table";
         const body = document.createElement("tbody");
-        for (const row of rows) {
+        for (const row of isProperty ? propertyRows(rows) : rows) {
             const tr = document.createElement("tr");
             const th = document.createElement("th");
             const td = document.createElement("td");
             if (isProperty) {
-                const { key, value, binary } = propertyPair(row);
+                const { key, value, binary } = row;
                 th.textContent = key;
                 td.textContent = value;
                 if (binary) {
@@ -3892,8 +3876,8 @@ export function createViewer(mountTarget) {
     function countPropertyRows(sections) {
         let n = 0;
         for (const section of sections) {
-            n += (section.properties || []).length;
-            for (const group of section.groups || []) n += (group.properties || []).length;
+            n += propertyRows(section.properties).length;
+            for (const group of section.groups || []) n += propertyRows(group.properties).length;
         }
         return n;
     }
@@ -3953,8 +3937,7 @@ export function createViewer(mountTarget) {
                     lines.push("(no properties)");
                     return;
                 }
-                for (const entry of list) {
-                    const { key, value } = propertyPair(entry);
+                for (const { key, value } of propertyRows(list)) {
                     lines.push(`${key}: ${value}`);
                 }
             };
@@ -4012,7 +3995,14 @@ export function createViewer(mountTarget) {
                 groups.push({ label: `Reference${step.placement ? ` ${step.placement}` : ""} in ${parent}`,
                               properties: step.referenceProperties });
             }
-            sections.push({ heading: parent ? `${step.cell} (in ${parent})` : `${step.cell} (top)`, groups });
+            const heading = parent ? `${step.cell} (in ${parent})` : `${step.cell} (top)`;
+            // Cell properties alone need no "Cell" label under the cell's own
+            // heading; the label only tells them apart from the reference's.
+            if (groups.length === 1 && !step.referenceProperties) {
+                sections.push({ heading, properties: step.cellProperties });
+            } else {
+                sections.push({ heading, groups });
+            }
         }
         openDetails(detailsTitleFor(info), sections);
     }
