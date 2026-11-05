@@ -9,6 +9,8 @@ version. Before that, `0.x` releases changed it freely.
 
 ## [Unreleased]
 
+## [1.7.2] - 2026-11-04
+
 ### Changed
 
 - Cell metadata stored as `META('key')=value` strings shows one row per
@@ -811,7 +813,8 @@ web page rather than for a webview.
   worker-loading route and shipped unsubstituted. The `createWorker` host hook
   replaces it.
 
-[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.7.1...HEAD
+[Unreleased]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.7.2...HEAD
+[1.7.2]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.7.1...v1.7.2
 [1.7.1]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/EthanLowenthal/GDS-Lens/compare/v1.5.0...v1.6.0
